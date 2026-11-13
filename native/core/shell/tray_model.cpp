@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <string>
 
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "version.lib")
@@ -231,6 +232,7 @@ std::vector<Record> ReadRecords(bool& ordered)
 struct Program {
     std::vector<std::wstring> titles; // of its visible windows
     std::vector<HWND> windows;        // all its top-level and message-only windows
+    std::vector<DWORD> pids;          // parallel to `windows`: the owning process of each
 };
 
 // Running programs by path (lower case).
@@ -271,6 +273,7 @@ std::map<std::wstring, Program> RunningPrograms()
             return TRUE;
         Program& p = (*c->out)[it->second];
         p.windows.push_back(h);
+        p.pids.push_back(pid);
         wchar_t title[256];
         if (c->titles && IsWindowVisible(h) && InternalGetWindowText(h, title, 256) > 0) // sends no message (a hung window)
             p.titles.push_back(title);
@@ -299,13 +302,52 @@ bool HasIcon(const std::vector<HWND>& windows, UINT uid, RECT* bounds = nullptr)
     return false;
 }
 
-bool LiveIcon(const Record& record, const Program& program, RECT& bounds)
+// The window of a running program that owns the tray icon `guid` now. The shell
+// answers for any window of the owning process, so an unowned lookup (hwnd NULL)
+// says only that the icon exists somewhere, never whose it is; scanning the
+// program's own windows proves ownership. First hit wins.
+HWND GuidIconOwner(const GUID& guid, const std::vector<HWND>& windows)
+{
+    for (HWND h : windows) {
+        NOTIFYICONIDENTIFIER id{sizeof(id), h, 0, guid};
+        RECT r{};
+        if (SUCCEEDED(Shell_NotifyIconGetRect(&id, &r)))
+            return h;
+    }
+    return nullptr;
+}
+
+// Whether one of a program's windows owns the icon now, with its live rectangle.
+bool LiveIcon(const Record& record, const Program& program, RECT& bounds, HWND* owner = nullptr, DWORD* pid = nullptr)
 {
     if (record.guid != GUID_NULL) {
-        NOTIFYICONIDENTIFIER id{sizeof(id), nullptr, 0, record.guid};
-        return SUCCEEDED(Shell_NotifyIconGetRect(&id, &bounds));
+        NOTIFYICONIDENTIFIER unowned{sizeof(unowned), nullptr, 0, record.guid};
+        if (FAILED(Shell_NotifyIconGetRect(&unowned, &bounds))) // the icon is not there at all
+            return false;
+        HWND h = GuidIconOwner(record.guid, program.windows);
+        if (!h)
+            return false;
+        if (owner)
+            *owner = h;
+        if (pid)
+            GetWindowThreadProcessId(h, pid);
+        return true;
     }
-    return record.hasUid && HasIcon(program.windows, record.uid, &bounds);
+    if (!record.hasUid)
+        return false;
+    for (size_t i = 0; i < program.windows.size(); ++i) {
+        NOTIFYICONIDENTIFIER id{sizeof(id), program.windows[i], record.uid, GUID_NULL};
+        RECT r{};
+        if (SUCCEEDED(Shell_NotifyIconGetRect(&id, &r))) {
+            bounds = r;
+            if (owner)
+                *owner = program.windows[i];
+            if (pid && i < program.pids.size())
+                *pid = program.pids[i];
+            return true;
+        }
+    }
+    return false;
 }
 
 // How well a tooltip names a program: 0 none .. 100 exactly.
@@ -337,7 +379,31 @@ struct Found {
     int index;
     RECT bounds{};
     std::wstring recordId;
+    bool placed = false; // an icon was seen in this button's cell, or its owner matched it
+    std::vector<DWORD> pids; // processes owning windows over this button (empty when unknown)
 };
+
+// Which processes own a window over the button's rectangle. The tray hosts its
+// buttons in one or two of its own windows; which window answers for a button is
+// not exposed, so every process behind the host whose window overlaps the cell is
+// remembered, and the icon's owner decides among them. No overlap means no owner.
+std::vector<DWORD> overlappingPids(HWND host, const RECT& cell)
+{
+    std::vector<DWORD> pids;
+    for (HWND top = GetAncestor(host, GA_ROOTOWNER); top; top = GetWindow(top, GW_HWNDNEXT)) {
+        RECT hr{};
+        if (!GetWindowRect(top, &hr) || hr.right <= hr.left || hr.bottom <= hr.top)
+            continue;
+        RECT both{};
+        if (top != host && !IntersectRect(&both, &hr, &cell))
+            continue;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(top, &pid);
+        if (pid && std::find(pids.begin(), pids.end(), pid) == pids.end())
+            pids.push_back(pid);
+    }
+    return pids;
+}
 
 // The tray buttons in the taskbar and in the overflow window, in order.
 std::vector<Found> FindButtons(IUIAutomation* uia, bool& available)
@@ -373,6 +439,8 @@ std::vector<Found> FindButtons(IUIAutomation* uia, bool& available)
             f.index = int(std::count_if(out.begin(), out.end(), [&](const Found& o) { return o.promoted == promoted; }));
             if (f.element)
                 f.element->get_CurrentBoundingRectangle(&f.bounds);
+            for (DWORD pid : overlappingPids(host, f.bounds))
+                f.pids.push_back(pid);
             out.push_back(std::move(f));
         }
     };
@@ -409,6 +477,10 @@ std::vector<Found> FindButtons(IUIAutomation* uia, bool& available)
             f.index = int(std::count_if(out.begin(), out.end(), [&](const Found& o) { return o.promoted == promoted; }));
             f.element->get_CurrentBoundingRectangle(&f.bounds);
             f.toolbar = toolbar;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(toolbar, &pid);
+            if (pid)
+                f.pids.push_back(pid); // the whole toolbar belongs to Explorer
             out.push_back(std::move(f));
         }
     };
@@ -468,12 +540,19 @@ struct Candidate {
         size_t firstTitle;
         RECT bounds{};
         bool live = false;
+        HWND owner = nullptr; // the window whose tray icon is live (its process owns the icon)
+        DWORD pid = 0;        // the owning process, when identified
+        int cell = -1;        // the UIA button holding the icon now, once known
 };
 
-std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vector<Record>& records,
-                              const std::vector<Candidate>& candidates, bool ordered)
+// `how`, when given, receives one letter per button: o owner, g geometry,
+// n name, p persisted record, s saved order, r running program, l live without
+// a button yet, - unmatched.
+std::vector<int> MatchRecords(std::vector<Found>& buttons, const std::vector<Record>& records,
+                              std::vector<Candidate>& candidates, bool ordered, std::string* how = nullptr)
 {
-    // Name and live geometry establish identity before the shell's potentially stale ordering.
+    // Ownership, then name and live geometry, establish identity before the
+    // shell's potentially stale ordering.
     // How well button b's tooltip names candidate c: 0 .. 105.
     auto score = [&](size_t b, size_t c) {
         std::wstring key = Key(TrayModel::Title(buttons[b].tip));
@@ -490,28 +569,130 @@ std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vect
     };
     std::vector<int> match(buttons.size(), -1);
     std::set<int> used;
-    for (size_t b = 0; b < buttons.size(); ++b) {
-        const RECT& cell = buttons[b].bounds;
-        if (cell.right <= cell.left || cell.bottom <= cell.top) continue;
-        int record = -1;
-        for (const auto& c : candidates) {
-            const RECT& icon = c.bounds;
-            POINT center{(icon.left + icon.right) / 2, (icon.top + icon.bottom) / 2};
-            if (icon.right <= icon.left || icon.bottom <= icon.top || !PtInRect(&cell, center) || used.contains(int(c.record))) continue;
-            if (record >= 0) { record = -1; break; } // ambiguous geometry: keep the name/order path
-            record = int(c.record);
+    if (how)
+        *how = std::string(buttons.size(), '-');
+    auto note = [&](size_t b, char c) { if (how && (*how)[b] == '-') (*how)[b] = c; };
+    // A live icon belongs to exactly one process. When that process owns the
+    // windows under a single button, the icon is that button's: identity by
+    // ownership, which no stale or empty UI Automation rectangle can disturb.
+    for (auto& c : candidates) {
+        if (!c.owner || used.contains(int(c.record))) continue;
+        int holder = -1;
+        for (size_t b = 0; b < buttons.size(); ++b)
+            if (std::find(buttons[b].pids.begin(), buttons[b].pids.end(), c.pid) != buttons[b].pids.end()) {
+                if (holder >= 0) { holder = -1; break; } // two buttons of one process: geometry decides
+                holder = int(b);
+            }
+        if (holder >= 0 && c.pid) {
+            match[holder] = int(c.record);
+            used.insert(int(c.record));
+            buttons[holder].placed = true;
+            c.cell = holder;
+            note(size_t(holder), 'o');
         }
-        if (record >= 0) match[b] = record, used.insert(record);
     }
-    // Exact program names must not be displaced by an obsolete saved ordering or promotion setting.
-    for (size_t b = 0; b < buttons.size(); ++b) {
-        if (match[b] >= 0) continue;
-        int best = 99, record = -1;
-        for (size_t c = 0; c < candidates.size(); ++c) {
-            int r = int(candidates[c].record), sc = score(b, c);
-            if (!used.contains(r) && sc > best) best = sc, record = r;
+    // A button whose windows belong to one process can only hold that
+    // process's icons: geometry must not let another program displace its
+    // owner, which is how several wrong pairs appeared at once before.
+    auto buttonOwner = [&](size_t b) {
+        std::set<DWORD> owners;
+        for (DWORD pid : buttons[b].pids) {
+            bool hasIcon = false;
+            for (const auto& c : candidates)
+                if (c.owner && c.pid == pid) { hasIcon = true; break; }
+            if (hasIcon)
+                owners.insert(pid); // its windows are here and it owns a tray icon
         }
-        if (record >= 0) match[b] = record, used.insert(record);
+        return owners.size() == 1 ? *owners.begin() : DWORD(0);
+    };
+    // Where an icon's live rectangle lies inside one button's cell confirms the
+    // pairing; overflow cells often report empty rectangles, so this only adds
+    // placements and never displaces an owner or a name match.
+    for (auto& c : candidates) {
+        if (!c.live || c.cell >= 0 || used.contains(int(c.record))) continue;
+        if (c.bounds.right <= c.bounds.left || c.bounds.bottom <= c.bounds.top) continue;
+        const POINT center{(c.bounds.left + c.bounds.right) / 2, (c.bounds.top + c.bounds.bottom) / 2};
+        int found = -1;
+        for (size_t b = 0; b < buttons.size(); ++b) {
+            const RECT& cell = buttons[b].bounds;
+            if (cell.right <= cell.left || cell.bottom <= cell.top) continue;
+            if (PtInRect(&cell, center)) {
+                if (found >= 0) { found = -1; break; } // ambiguous geometry: keep the name/order path
+                found = int(b);
+            }
+        }
+        if (found < 0) continue;
+        DWORD ownerPid = buttonOwner(found);
+        if (ownerPid && c.pid && ownerPid != c.pid)
+            continue; // the cell belongs to another process: its name may still match below
+        if (match[found] >= 0 && records[size_t(match[found])].exe == records[c.record].exe)
+            continue; // two icons of one program in one cell: names and order decide
+        if (match[found] < 0) {
+            match[found] = int(c.record);
+            used.insert(int(c.record));
+            buttons[found].placed = true;
+            c.cell = found;
+            note(size_t(found), 'g');
+        } else if (!buttons[found].placed) {
+            // The cell already holds an unplaced guess; an observed icon wins.
+            used.erase(match[found]);
+            match[found] = int(c.record);
+            used.insert(int(c.record));
+            buttons[found].placed = true;
+            c.cell = found;
+            note(size_t(found), 'g');
+        }
+    }
+    // Exact program names must not be displaced by an obsolete saved ordering,
+    // a promotion setting, or a weak geometric guess. A button whose own
+    // process is known only accepts that process's records here; the order
+    // pass below can still place them.
+    struct Named {
+        int sc, button, cand;
+    };
+    std::vector<Named> named;
+    for (size_t b = 0; b < buttons.size(); ++b) {
+        DWORD ownerPid = buttonOwner(b);
+        for (size_t c = 0; c < candidates.size(); ++c) {
+            const int r = int(candidates[c].record);
+            const int sc = score(b, c);
+            if (sc < 100) continue;
+            // Another process's icon cannot claim these windows; icons of the
+            // very same process compete by name, as several can share one pid.
+            if (ownerPid && candidates[c].pid && ownerPid != candidates[c].pid) continue;
+            named.push_back({sc + (buttons[b].placed ? 0 : 1), int(b), int(c)}); // a placed cell keeps its icon
+        }
+    }
+    std::stable_sort(named.begin(), named.end(), [](const Named& a, const Named& b) { return a.sc > b.sc; });
+    // How many cells one program may win by name alone: at most as many as it
+    // has live records. Beyond that, names would only be spreading one wrong
+    // picture over the tray. Cells already placed by ownership or geometry do
+    // not count against the quota again.
+    std::map<std::wstring, int> quota;
+    for (const auto& c : candidates)
+        if (c.live)
+            quota[records[c.record].exe]++;
+    std::map<std::wstring, int> claimed;
+    for (const auto& n : named) {
+        const int r = int(candidates[n.cand].record);
+        if (used.contains(r)) continue;
+        const std::wstring& exe = records[r].exe;
+        int already = claimed[exe];
+        for (size_t b = 0; b < buttons.size(); ++b)
+            if (match[b] == r && buttons[b].placed) ++already;
+        if (already >= quota[exe]) continue;
+        claimed[exe] = already + (buttons[n.button].placed ? 0 : 1);
+        if (match[n.button] >= 0) {
+            used.erase(match[n.button]); // a weaker guess gives way to its real owner's name
+            buttons[n.button].placed = false;
+            for (auto& c : candidates)
+                if (c.cell == n.button) c.cell = -1;
+        }
+        match[n.button] = r;
+        used.insert(r);
+        buttons[n.button].placed = true;
+        candidates[n.cand].cell = n.button;
+        note(size_t(n.button), 'n');
     }
     // Only after live identities: a service-owned icon can use its cached artwork without a main process.
     for (size_t b = 0; b < buttons.size(); ++b) {
@@ -519,7 +700,7 @@ std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vect
         if (match[b] >= 0 || key.empty()) continue;
         for (size_t r = 0; r < records.size(); ++r)
             if (!used.contains(int(r)) && Key(TrayModel::Title(records[r].tip)) == key) {
-                match[b] = int(r); used.insert(int(r)); break;
+                match[b] = int(r); used.insert(int(r)); note(b, 'p'); break;
             }
     }
     if (ordered) {
@@ -539,12 +720,18 @@ std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vect
                              [&](size_t a, size_t b) { return records[candidates[a].record].order < records[candidates[b].record].order; });
             const size_t n = bs.size(), m = cs.size();
             std::vector<std::vector<int>> w(n, std::vector<int>(m)), dp(n + 1, std::vector<int>(m + 1, 0));
+            const size_t span = candidates.size();
+            auto keyOf = [span](size_t b, size_t c) { return b * span + c; };
+            std::map<size_t, char> pairHow;
             for (size_t i = 0; i < n; ++i)
                 for (size_t j = 0; j < m; ++j) {
                     int sc = score(bs[i], cs[j]);
                     // In place, the name agreeing; a named button whose name
-                    // fits nothing of the program's counts for less.
-                    w[i][j] = 10 + sc - (sc == 0 && !TrayModel::Title(buttons[bs[i]].tip).empty() ? 6 : 0);
+                    // fits nothing of the program's counts for less. An icon
+                    // seen in this very cell counts as strongly as its name.
+                    int geo = candidates[cs[j]].cell == int(bs[i]) ? 40 : 0;
+                    pairHow[keyOf(bs[i], cs[j])] = geo > sc ? 'g' : 's';
+                    w[i][j] = 10 + std::max(sc, geo) - (sc == 0 && geo == 0 && !TrayModel::Title(buttons[bs[i]].tip).empty() ? 6 : 0);
                 }
             for (size_t i = 1; i <= n; ++i)
                 for (size_t j = 1; j <= m; ++j)
@@ -555,6 +742,8 @@ std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vect
                     --j;
                 else if (dp[i][j] == dp[i - 1][j - 1] + w[i - 1][j - 1]) {
                     match[bs[i - 1]] = int(candidates[cs[j - 1]].record);
+                    auto it = pairHow.find(keyOf(bs[i - 1], cs[j - 1]));
+                    note(bs[i - 1], it == pairHow.end() ? 's' : it->second);
                     --i;
                     --j;
                 } else
@@ -580,6 +769,7 @@ std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vect
                 match[p.button] = int(candidates[p.candidate].record);
                 usedCandidate.insert(p.candidate);
                 usedExe.insert(records[candidates[p.candidate].record].exe);
+                note(p.button, 'n');
             }
     }
     // Explorer's saved order can lag behind its live buttons. A clearly named,
@@ -592,13 +782,17 @@ std::vector<int> MatchRecords(const std::vector<Found>& buttons, const std::vect
             int r = int(candidates[c].record), sc = score(b, c);
             if (!used.contains(r) && sc > best) best = sc, record = r;
         }
-        if (record >= 0) match[b] = record, used.insert(record);
+        if (record >= 0) {
+            match[b] = record;
+            used.insert(record);
+            note(b, 'n');
+        }
     }
     return match;
 }
 
 std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& records, bool& ordered,
-                             const std::vector<PinnedApp>& apps = {})
+                             const std::vector<PinnedApp>& apps = {}, std::string* how = nullptr)
 {
     records = ReadRecords(ordered);
     auto running = RunningPrograms();
@@ -615,7 +809,9 @@ std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& 
         if (run == running.end()) run = running.find(L"|" + Lower(PathFindFileNameW(records[r].exe.c_str())));
         if (run == running.end()) continue;
         RECT bounds{};
-        bool live = LiveIcon(records[r], run->second, bounds);
+        HWND owner = nullptr;
+        DWORD pid = 0;
+        bool live = LiveIcon(records[r], run->second, bounds, &owner, &pid);
         if ((records[r].hasUid || records[r].guid != GUID_NULL) && !live) continue;
         auto [at, fresh] = version.try_emplace(records[r].exe);
         auto& v = at->second;
@@ -624,7 +820,7 @@ std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& 
         std::wstring stem = PathFindFileNameW(records[r].exe.c_str());
         PathRemoveExtensionW(stem.data());
         stem.resize(wcslen(stem.c_str()));
-        Candidate c{r, {records[r].tip, v.first, v.second, stem}, 0, bounds, live};
+        Candidate c{r, {records[r].tip, v.first, v.second, stem}, 0, bounds, live, owner, pid, -1};
         if (auto names = labels.find(records[r].exe); names != labels.end())
             c.names.insert(c.names.end(), names->second.begin(), names->second.end());
         c.firstTitle = c.names.size();
@@ -633,7 +829,7 @@ std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& 
     }
     // Explorer's overflow buttons are there once it has been opened: then every icon it shows is.
     const bool overflowRead = std::any_of(buttons.begin(), buttons.end(), [](const Found& f) { return !f.promoted && f.element; });
-    auto match = MatchRecords(buttons, records, candidates, ordered);
+    auto match = MatchRecords(buttons, records, candidates, ordered, how);
     // Programs Windows keeps no record for (Windows 10 keeps none of these): a running program
     // whose description, product or file name is the name of a button left unmatched still owns
     // it, its picture then the program's own. After the records, and only on a clear name.
@@ -672,6 +868,8 @@ std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& 
             records.push_back(std::move(r));
             match[b] = int(records.size() - 1);
             taken.insert(owner);
+            if (how)
+                (*how)[b] = 'r'; // a running program matched by name, without a Windows record
         }
     }
     std::set<int> used(match.begin(), match.end());
@@ -714,8 +912,13 @@ std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& 
         f.index = int(std::count_if(buttons.begin(), buttons.end(), [&](const Found& b) { return b.promoted == f.promoted; }));
         f.bounds = c.bounds;
         f.recordId = r.id;
+        f.placed = true;
+        if (c.pid)
+            f.pids.push_back(c.pid);
         buttons.push_back(std::move(f));
         match.push_back(int(c.record));
+        if (how)
+            *how += 'l'; // a live shell identity with no UIA button yet
     }
     for (size_t b = 0; b < buttons.size(); ++b)
         if (match[b] >= 0) buttons[b].recordId = records[size_t(match[b])].id;
@@ -924,7 +1127,8 @@ void TrayModel::Worker()
             bool ordered = false;
             std::vector<Record> records;
             const ULONGLONG readStart = GetTickCount64() - readMs; // FindButtons included
-            std::vector<int> match = MatchButtons(buttons, records, ordered, appNames);
+            std::string how;
+            std::vector<int> match = MatchButtons(buttons, records, ordered, appNames, &how);
 
             std::vector<TrayIcon> icons;
             std::set<std::wstring> livePictures;
@@ -979,7 +1183,8 @@ void TrayModel::Worker()
                     GetTickCount64() - readStart, available ? L"" : L", the shell's tray was not found");
                 for (size_t b = 0; b < buttons.size(); ++b) {
                     std::wstring exe = match[b] >= 0 ? std::wstring(PathFindFileNameW(records[size_t(match[b])].exe.c_str())) : L"-";
-                    Log(L"tray:   %zu '%s' -> %s", b, Title(buttons[b].tip).substr(0, 24).c_str(), exe.c_str());
+                    Log(L"tray:   %zu '%s' -> %s [%hs]", b, Title(buttons[b].tip).substr(0, 24).c_str(), exe.c_str(),
+                        b < how.size() ? std::string(1, how[b]).c_str() : "?");
                 }
                 PostMessageW(notify_, msg_, 0, 0);
             }
