@@ -138,10 +138,10 @@ float sdTail(float2 px)
     return inside ? -distance : distance;
 }
 
-float ShapeDistance(float2 px, bool edge)
+float ShapeDistance(float2 px, bool edge, bool basic)
 {
     // A C3 bump stretches the glass upwards while keeping its bottom fixed.
-    if (Wave.z > 0) {
+    if (!basic && Wave.z > 0) {
         float x = (px.x - Wave.x) / max(Wave.y, 1);
         float w = saturate(1 - x * x);
         float lift = Wave.z * w * w * w * w;
@@ -150,12 +150,12 @@ float ShapeDistance(float2 px, bool edge)
     }
     // C3 metric fields are used while shapes merge. The isolated outline
     // uses the exact implicit equation below; a blend needs a smooth field.
-    edge = edge && PartCount < 0.5;
+    edge = edge && (basic || PartCount < 0.5);
     float2 c = px - (Shape.xy + Shape.zw) * 0.5;
     float2 b = max((Shape.zw - Shape.xy) * 0.5, 1);
     float r = min(Radius, min(b.x, b.y));
     float d = sdRoundRect(c, b, r, edge);
-    if (PartCount > 0.5) {
+    if (!basic && PartCount > 0.5) {
         float card = d;
         d = 1e6;
         [unroll] for (int i = 0; i < 6; ++i) {
@@ -167,12 +167,12 @@ float ShapeDistance(float2 px, bool edge)
         }
         d = lerp(d, card, PartMix);
     }
-    if (Tail.z > 0)
+    if (!basic && Tail.z > 0)
         d = min(d, sdTail(px));
     return d;
 }
 
-float Dist(float2 px) { return ShapeDistance(px, false); }
+float Dist(float2 px, bool basic) { return ShapeDistance(px, false, basic); }
 
 float3 bg(float2 px, float lod)
 {
@@ -191,20 +191,20 @@ float3 blurred(float2 px)
     return c;
 }
 
-float4 PS(VSOut i) : SV_Target
+float4 PSImpl(VSOut i, bool basic)
 {
     float2 px = i.uv * Size;
-    float d = Dist(px);
+    float d = Dist(px, basic);
 
     // Soft drop shadow outside the shape.
-    float ds = Dist(px - float2(0, Inset * 0.25));
+    float ds = Dist(px - float2(0, Inset * 0.25), basic);
     float shadowA = Shadow * exp(-max(ds, 0) / max(Inset * 0.35, 1)) * step(0, d);
 
     // The implicit edge distance is exact only near the outline: where a corner
     // meets a straight side, deep inside, it jumps by hundreds of px between
     // neighbours, and fwidth would leave a half-covered line there. Past 2 px in
     // the shape is plainly covered.
-    float edgeDistance = ShapeDistance(px, true);
+    float edgeDistance = ShapeDistance(px, true, basic);
     float aa = max(fwidth(edgeDistance), 1e-3);
     float cov = d < -2 ? 1 : saturate(0.5 - edgeDistance / aa);
     float keep = saturate(1 - Fade);
@@ -213,7 +213,8 @@ float4 PS(VSOut i) : SV_Target
         return float4(0, 0, 0, shadowA);
 
     float e = 1.0;
-    float2 g = float2(Dist(px + float2(e, 0)) - Dist(px - float2(e, 0)), Dist(px + float2(0, e)) - Dist(px - float2(0, e)));
+    float2 g = float2(Dist(px + float2(e, 0), basic) - Dist(px - float2(e, 0), basic),
+                      Dist(px + float2(0, e), basic) - Dist(px - float2(0, e), basic));
     float gl = length(g);
     float2 n = gl > 1e-5 ? g / gl : float2(0, 0);
 
@@ -269,3 +270,6 @@ float4 PS(VSOut i) : SV_Target
     float4 glass = float4(saturate(col) * cov, cov) * keep;
     return glass + (1 - cov) * float4(0, 0, 0, shadowA);
 }
+
+float4 PS(VSOut i) : SV_Target { return PSImpl(i, false); }
+float4 PSBasic(VSOut i) : SV_Target { return PSImpl(i, true); }

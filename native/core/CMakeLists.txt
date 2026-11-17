@@ -21,6 +21,7 @@ function(atrium_shader source profile entry variable header)
 endfunction()
 atrium_shader(glass.hlsl vs_5_0 VS g_GlassVS glass_vs.h)
 atrium_shader(glass.hlsl ps_5_0 PS g_GlassPS glass_ps.h)
+atrium_shader(glass.hlsl ps_5_0 PSBasic g_GlassBasicPS glass_basic_ps.h)
 atrium_shader(compare.hlsl cs_5_0 CS g_CompareCS compare_cs.h)
 atrium_shader(backdrop_edge.hlsl ps_5_0 PS g_BackdropEdgePS backdrop_edge_ps.h)
 

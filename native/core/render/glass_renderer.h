@@ -121,7 +121,7 @@ private:
     winrt::com_ptr<IDCompositionTarget> target_;
     winrt::com_ptr<IDCompositionVisual> visual_;
     winrt::com_ptr<ID3D11VertexShader> vs_;
-    winrt::com_ptr<ID3D11PixelShader> ps_;
+    winrt::com_ptr<ID3D11PixelShader> ps_, basicPs_;
     winrt::com_ptr<ID3D11PixelShader> edgePs_;
     winrt::com_ptr<ID3D11Buffer> edgeCb_;
     winrt::com_ptr<ID3D11RenderTargetView> roiRtv_;

@@ -3,6 +3,7 @@
 
 #include "compare_cs.h"
 #include "glass_ps.h"
+#include "glass_basic_ps.h"
 #include "glass_vs.h"
 #include "backdrop_edge_ps.h"
 #include "../motion.h"
@@ -81,6 +82,7 @@ GlassRenderer::GlassRenderer(const Gpu& gpu, HWND hwnd, int width, int height, b
     auto* dev = gpu_.device.get();
     Check(dev->CreateVertexShader(g_GlassVS, sizeof(g_GlassVS), nullptr, vs_.put()));
     Check(dev->CreatePixelShader(g_GlassPS, sizeof(g_GlassPS), nullptr, ps_.put()));
+    Check(dev->CreatePixelShader(g_GlassBasicPS, sizeof(g_GlassBasicPS), nullptr, basicPs_.put()));
     Check(dev->CreatePixelShader(g_BackdropEdgePS, sizeof(g_BackdropEdgePS), nullptr, edgePs_.put()));
     Check(dev->CreateComputeShader(g_CompareCS, sizeof(g_CompareCS), nullptr, cs_.put()));
 
@@ -460,7 +462,6 @@ bool GlassRenderer::Present(const std::vector<GlassParams>& shapes, const std::f
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->IASetInputLayout(nullptr);
     ctx->VSSetShader(vs_.get(), nullptr, 0);
-    ctx->PSSetShader(ps_.get(), nullptr, 0);
     ID3D11Buffer* cb = cb_.get();
     ctx->PSSetConstantBuffers(0, 1, &cb);
     ID3D11ShaderResourceView* srv = roiSrv_.get();
@@ -469,6 +470,8 @@ bool GlassRenderer::Present(const std::vector<GlassParams>& shapes, const std::f
     ctx->PSSetSamplers(0, 1, &s);
     for (size_t k = 0; k < shapes.size(); ++k) {
         GlassParams p = shapes[k];
+        bool basic = p.partCount < 0.5f && p.tailHeight <= 0 && p.waveHeight <= 0;
+        ctx->PSSetShader(basic ? basicPs_.get() : ps_.get(), nullptr, 0);
         p.sizeX = float(w_);
         p.sizeY = float(h_);
         p.roiOriginX = float(roiOrigin_.x);
