@@ -65,6 +65,8 @@ add_executable(atrium_core WIN32
     ui/control_center.cpp
     ui/desktop_widgets.cpp
     ui/glass_menu.cpp
+    ui/ime_bubble.cpp
+    ui/ime_bubble_model.cpp
     ui/stage_manager.cpp
     ui/window_snapshot.cpp
     shell/weather.cpp

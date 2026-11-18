@@ -14,6 +14,7 @@
 #include "shell/app_catalog.h"
 #include "shell/shell_taskbar.h"
 #include "shell/app_registration.h"
+#include "shell/displays.h"
 #include "shell/update_checker.h"
 #include "shell/task_model.h"
 #include "shell/notification_listener.h"
@@ -32,6 +33,7 @@
 #include "ui/control_center.h"
 #include "ui/desktop_widgets.h"
 #include "ui/glass_menu.h"
+#include "ui/ime_bubble.h"
 #include "ui/window_preview.h"
 #include "ui/notifications.h"
 #include "ui/stage_manager.h"
@@ -123,6 +125,7 @@ struct App {
     std::unique_ptr<WinKey> winKey;
     std::unique_ptr<ImeWatcher> imeWatcher; // the events that may change the input method (issue #56)
     ImeWatch imeWatch;                     // what announces (a foreground change only reseeds it)
+    std::unique_ptr<ImeBubble> ime;        // the bubble that announces while the bar is hidden
     bool imeOn = true;                     // the "show the input language" setting, as last applied
     HANDLE guard = nullptr; // the guard process (EnsureGuard)
     bool winKeyStart = false, winNumbers = false; // what it watches
@@ -147,9 +150,32 @@ template<class Action> void ForBars(Action action)
         action(*bar);
 }
 
-// A finished read from the watcher's worker thread: the glyph of the window in front goes to every
-// bar's input method entry. The case is CapsLock's latch from the keyboard hook; a Shift held for a
-// capital is typing, not a state.
+// A settled change also shows in the bottom bubble, but only while the bar on
+// that display is hidden — its input method entry already shows the glyph
+// otherwise. A fullscreen window in front (a game, a video: it covers the
+// screen, not just its work area) keeps the bubble quiet.
+void ShowImeBubble(HWND foreground, const ImeStatus& status)
+{
+    if (!g_app.barOn.value_or(true) || !g_app.ime)
+        return; // the bar is off with Windows' taskbar back: it shows its own
+    const HMONITOR monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+    Bar* bar = g_app.bar && g_app.bar->Monitor() == monitor ? g_app.bar.get() : nullptr;
+    if (!bar)
+        for (const auto& secondary : g_app.secondaryBars)
+            if (secondary->Monitor() == monitor) {
+                bar = secondary.get();
+                break;
+            }
+    if (bar && bar->ShownOnScreen())
+        return;
+    MONITORINFO info{sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info))
+        return;
+    if (FullScreenInFront(monitor))
+        return; // nothing is typed over a fullscreen window
+    g_app.ime->Show(status, info.rcWork, int(info.rcMonitor.bottom));
+    Log(L"ime: %s (layout %08lX) as the bubble", ImeGlyph(status).c_str(), status.layout);
+}
 void OnImeSample(ImeWatcher::Sample& sample)
 {
     if (!g_app.imeOn || !g_app.imeWatcher)
@@ -162,8 +188,10 @@ void OnImeSample(ImeWatcher::Sample& sample)
         return;
     const std::wstring glyph = ImeGlyph(shown);
     ForBars([&](Bar& bar) { bar.SetIme(glyph); });
-    if (changed)
+    if (changed) {
         Log(L"ime: %s (layout %08lX)", glyph.c_str(), shown.layout);
+        ShowImeBubble(sample.foreground, shown);
+    }
 }
 
 void ConfigureBar(Bar& bar);
@@ -593,6 +621,8 @@ void ApplySettings(const Settings& s)
         g_app.imeWatcher.reset();
         g_app.imeWatch.reset();
         ForBars([](Bar& bar) { bar.SetIme(L""); });
+        if (g_app.ime)
+            g_app.ime->Cancel(); // a bubble already on screen goes with the setting, not when its life ends
     }
     g_app.desktopDisplay = s.desktopDisplay;
     g_app.displaySettings = s;
@@ -1802,6 +1832,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int)
     };
     // Pointer on an app with windows: its windows, previewed above it (as the Windows taskbar).
     g_app.preview = std::make_unique<WindowPreview>(instance);
+    g_app.ime = std::make_unique<ImeBubble>(instance); // the bubble that announces while the bar is hidden
     ConfigureBar(*g_app.bar);
     g_app.displaysReady = true;
     ApplySettings(settings);
@@ -1881,6 +1912,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int)
     g_app.menu.reset();
     g_app.preview.reset();
     g_app.stage.reset();
+    g_app.ime.reset();
     Surface::SetGlassHost(nullptr);
     g_app.catalog.reset();
     g_app.tasks.reset();

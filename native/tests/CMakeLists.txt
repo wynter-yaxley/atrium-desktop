@@ -122,3 +122,10 @@ target_include_directories(ime_status_tests PRIVATE ../core)
 target_compile_definitions(ime_status_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(ime_status_tests PRIVATE user32 imm32)
 add_test(NAME ime_status COMMAND ime_status_tests)
+
+# The bubble's model is pure: no window, no device. The check builds only it
+# and the test, so it runs anywhere.
+add_executable(ime_bubble_tests ime_bubble.cpp ../core/ui/ime_bubble_model.cpp)
+target_include_directories(ime_bubble_tests PRIVATE ../core)
+target_compile_definitions(ime_bubble_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+add_test(NAME ime_bubble COMMAND ime_bubble_tests)
