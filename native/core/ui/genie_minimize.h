@@ -19,9 +19,87 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace atrium {
+
+// Ref-counted DWM transition-disable lease so nested holds/flights preserve the prior DWM state.
+class GenieTransitionLeases {
+public:
+    template<class QueryFn, class SetFn> void Acquire(HWND window, QueryFn&& queryDisabled, SetFn&& setDisabled)
+    {
+        if (!window)
+            return;
+        Lease& lease = leases_[window];
+        if (lease.count++ == 0) {
+            BOOL prior = FALSE;
+            if (!std::forward<QueryFn>(queryDisabled)(window, prior))
+                prior = FALSE;
+            lease.priorDisabled = prior;
+            std::forward<SetFn>(setDisabled)(window, true);
+        }
+    }
+
+    template<class IsValidFn, class SetFn> void Release(HWND window, bool restoreAttribute, IsValidFn&& isValid, SetFn&& setDisabled)
+    {
+        if (!window)
+            return;
+        const auto it = leases_.find(window);
+        if (it == leases_.end())
+            return;
+        if (--it->second.count > 0)
+            return;
+        const BOOL priorDisabled = it->second.priorDisabled;
+        leases_.erase(it);
+        if (restoreAttribute && std::forward<IsValidFn>(isValid)(window))
+            std::forward<SetFn>(setDisabled)(window, priorDisabled != FALSE);
+    }
+
+    template<class SkipFn, class IsValidFn, class SetFn> void Clear(SkipFn&& skip, IsValidFn&& isValid, SetFn&& setDisabled)
+    {
+        for (const auto& [window, lease] : leases_)
+            if (!skip(window) && isValid(window))
+                setDisabled(window, lease.priorDisabled != FALSE);
+        leases_.clear();
+    }
+
+    bool Contains(HWND window) const { return leases_.contains(window); }
+    int Count(HWND window) const
+    {
+        const auto it = leases_.find(window);
+        return it == leases_.end() ? 0 : it->second.count;
+    }
+    bool Empty() const { return leases_.empty(); }
+
+private:
+    struct Lease {
+        int count = 0;
+        BOOL priorDisabled = FALSE;
+    };
+    std::unordered_map<HWND, Lease> leases_;
+};
+
+// Drains pending restore callbacks and flight transition leases once before clearing flights.
+template<class FlightRange, class IsValidFn, class ForgetFn, class ReleaseLeaseFn>
+std::vector<std::function<void()>> DrainGenieShutdownRestores(FlightRange& flights, IsValidFn&& isValid, ForgetFn&& forgetImage, ReleaseLeaseFn&& releaseLease)
+{
+    std::vector<std::function<void()>> restores;
+    for (auto& f : flights) {
+        forgetImage(f.key);
+        if (f.restore) {
+            std::function<void()> restore = std::exchange(f.restore, nullptr);
+            if (f.window && isValid(f.window))
+                restores.push_back(std::move(restore));
+        }
+        if (f.restoreTransitions) {
+            f.restoreTransitions = false;
+            releaseLease(f.window);
+        }
+    }
+    flights.clear();
+    return restores;
+}
 
 class GenieMinimize {
 public:
@@ -38,6 +116,8 @@ public:
     // hand; `restore` runs when the window has poured back out of its icon. False: not for the genie.
     bool Minimize(HWND window, std::function<void()> minimize);
     bool Restore(HWND window, std::function<void()> restore);
+    void SignalSnapshotStop() { snapshots_.SignalStop(); }
+    bool WaitSnapshotStop(DWORD timeoutMs) const { return snapshots_.WaitStop(timeoutMs); }
 
 private:
     struct Picture {
@@ -58,6 +138,8 @@ private:
     void Watch();                                              // kWatchTimer: the window in front, its picture, its animations
     void Release(HWND window, bool restoreTransitions = true); // its own animations back (unless another owner took it)
     void Hold(HWND window);                                    // its own animations off
+    void AcquireTransitions(HWND window);
+    void ReleaseTransitions(HWND window, bool restoreAttribute);
     RECT FlightBounds(const RECT& fallback) const;
     void Arm(const RECT& frame); // the layer on the flights' monitor(s), empty, for a while
     void Shutdown();
@@ -81,6 +163,7 @@ private:
     unsigned flightGen_ = 0;
     HWND pending_ = nullptr; // the bar's minimize, waiting for its picture
     std::function<void()> pendingMinimize_;
+    GenieTransitionLeases transitionLeases_;
     double eventMs_ = 0; // when the last minimize came, for the log
 };
 

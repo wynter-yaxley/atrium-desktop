@@ -258,14 +258,14 @@ public sealed partial class MainWindow
 
     private async void OnAddPin(object sender, RoutedEventArgs e)
     {
-        var file = await PickProgramAsync();
-        if (file == null) return;
+        string? path = await PickProgramAsync();
+        if (path == null) return;
         if (_pinVms.Count >= SettingsSession.MaxPins)
         {
             ShowMessage(InfoBarSeverity.Warning, Loc.T("Pinned apps limit reached"), Loc.T("You can pin at most 64 apps."));
             return;
         }
-        var vm = new PinVm(this, new PinnedApp(Path.GetFileNameWithoutExtension(file.Path), file.Path, "", ""));
+        var vm = new PinVm(this, new PinnedApp(Path.GetFileNameWithoutExtension(path), path, "", ""));
         _pinVms.Add(vm);
         _ = LoadIconAsync(vm);
         SyncPins();

@@ -1,11 +1,8 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
-using Windows.Storage;
-using Windows.Storage.Pickers;
 using Windows.UI;
 
 namespace Atrium.Settings;
@@ -299,22 +296,9 @@ public sealed partial class MainWindow
         finally { _dialog = null; }
     }
 
-    // An app (.exe or .lnk) the user picks; null when cancelled. Windows shows no picker to an
-    // unpackaged app run as administrator.
-    private async Task<StorageFile?> PickProgramAsync()
-    {
-        var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.ComputerFolder };
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
-        picker.FileTypeFilter.Add(".exe");
-        picker.FileTypeFilter.Add(".lnk");
-        try { return await picker.PickSingleFileAsync(); }
-        catch (COMException)
-        {
-            ShowMessage(InfoBarSeverity.Warning, Loc.T("The file picker is unavailable"),
-                Loc.T("Windows does not show it to apps run as administrator. Open the settings without administrator rights."));
-            return null;
-        }
-    }
+    // An app (.exe or .lnk) the user picks; null when cancelled.
+    private Task<string?> PickProgramAsync() =>
+        Task.FromResult(NativeFileDialog.PickProgram(WinRT.Interop.WindowNative.GetWindowHandle(this), Loc.T("Apps"), App.LogCrash));
 
     // Follow the process exit event rather than polling the pipe while the settings window is idle.
     private void WatchCore()

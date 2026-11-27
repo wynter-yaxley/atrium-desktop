@@ -1480,6 +1480,54 @@ finally
         Require(adminStart.UseShellExecute && adminStart.Verb == "runas" && adminStart.Arguments.Contains("--replace"),
             "Elevated CoreStartInfo must set UseShellExecute, Verb=runas, and --replace in Arguments.");
     }
+
+    // 10. NativeFileDialog: FOS preset flags, filters, and cancel HRESULT handling
+    {
+        var programFlags = NativeFileDialog.OptionsFor(NativeFileDialogPreset.Program);
+        const NativeFileDialogOptions ExpectedProgram =
+            NativeFileDialogOptions.ForceFileSystem | NativeFileDialogOptions.FileMustExist |
+            NativeFileDialogOptions.NoDereferenceLinks | NativeFileDialogOptions.NoChangeDir;
+        Require(programFlags == ExpectedProgram && (uint)programFlags == (0x40u | 0x1000u | 0x100000u | 0x8u) &&
+                programFlags.HasFlag(NativeFileDialogOptions.NoDereferenceLinks) &&
+                !programFlags.HasFlag(NativeFileDialogOptions.PickFolders) &&
+                !programFlags.HasFlag(NativeFileDialogOptions.AllowMultiselect),
+            "Program preset must require existing filesystem files, keep .lnk paths, and avoid chdir.");
+        var programFilters = NativeFileDialog.FiltersFor(NativeFileDialogPreset.Program);
+        Require(programFilters.Length == 1 && programFilters[0].Spec == "*.exe;*.lnk",
+            "Program preset must filter to *.exe;*.lnk.");
+
+        var filesFlags = NativeFileDialog.OptionsFor(NativeFileDialogPreset.Files);
+        const NativeFileDialogOptions ExpectedFiles =
+            NativeFileDialogOptions.ForceFileSystem | NativeFileDialogOptions.FileMustExist |
+            NativeFileDialogOptions.AllowMultiselect | NativeFileDialogOptions.NoChangeDir;
+        Require(filesFlags == ExpectedFiles && (uint)filesFlags == (0x40u | 0x1000u | 0x200u | 0x8u) &&
+                filesFlags.HasFlag(NativeFileDialogOptions.AllowMultiselect) &&
+                !filesFlags.HasFlag(NativeFileDialogOptions.NoDereferenceLinks) &&
+                !filesFlags.HasFlag(NativeFileDialogOptions.PickFolders),
+            "Files preset must allow multiselect of existing filesystem files without FOS_NODEREFERENCELINKS.");
+        var filesFilters = NativeFileDialog.FiltersFor(NativeFileDialogPreset.Files);
+        Require(filesFilters.Length == 1 && filesFilters[0].Spec == "*.*",
+            "Files preset must filter to *.*.");
+
+        var folderFlags = NativeFileDialog.OptionsFor(NativeFileDialogPreset.Folder);
+        const NativeFileDialogOptions ExpectedFolder =
+            NativeFileDialogOptions.PickFolders | NativeFileDialogOptions.ForceFileSystem |
+            NativeFileDialogOptions.PathMustExist | NativeFileDialogOptions.NoChangeDir;
+        Require(folderFlags == ExpectedFolder && (uint)folderFlags == (0x20u | 0x40u | 0x800u | 0x8u) &&
+                folderFlags.HasFlag(NativeFileDialogOptions.PickFolders | NativeFileDialogOptions.PathMustExist) &&
+                !folderFlags.HasFlag(NativeFileDialogOptions.NoDereferenceLinks) &&
+                !folderFlags.HasFlag(NativeFileDialogOptions.AllowMultiselect),
+            "Folder preset must pick existing filesystem folders without FOS_NODEREFERENCELINKS.");
+        Require(NativeFileDialog.FiltersFor(NativeFileDialogPreset.Folder).Length == 0,
+            "Folder preset must not specify file extension filters.");
+
+        Require(NativeFileDialog.IsCancelledHResult(unchecked((int)0x800704C7)),
+            "ERROR_CANCELLED HRESULT (0x800704C7) must be recognized as cancellation.");
+        Require(!NativeFileDialog.IsCancelledHResult(0) &&
+                !NativeFileDialog.IsCancelledHResult(1) &&
+                !NativeFileDialog.IsCancelledHResult(unchecked((int)0x80004005)),
+            "S_OK, S_FALSE, and E_FAIL must not be treated as cancellation.");
+    }
 }
 Console.WriteLine("Hardening regression checks passed.");
 

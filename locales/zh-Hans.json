@@ -597,8 +597,6 @@
   "Move down": "下移",
   "Remove": "移除",
   "Pinned apps limit reached": "固定的应用已达上限",
-  "The file picker is unavailable": "无法打开文件选择器",
-  "Windows does not show it to apps run as administrator. Open the settings without administrator rights.": "Windows 不会向以管理员身份运行的应用显示它。请不以管理员身份打开设置。",
   "You can pin at most 64 apps.": "最多可以固定 64 个应用。",
   "Import Windows taskbar pins?": "导入系统任务栏固定项？",
   "The current pinned list will be replaced by the apps pinned to the Windows taskbar.": "当前的固定列表将被 Windows 任务栏上固定的应用替换。",

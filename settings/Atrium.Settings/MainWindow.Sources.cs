@@ -240,10 +240,10 @@ public sealed partial class MainWindow
 
     private async void OnAddExcluded(object sender, RoutedEventArgs e)
     {
-        var file = await PickProgramAsync();
-        if (file == null) return;
+        string? path = await PickProgramAsync();
+        if (path == null) return;
         // By its program's file name: still the same app after it updates into another folder.
-        string exe = ShellIcons.ExecutablePath(file.Path);
+        string exe = ShellIcons.ExecutablePath(path);
         if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
         string entry = Path.GetFileName(exe).ToLowerInvariant();
         if (CurrentSettings.StageExcluded.Contains(entry, StringComparer.OrdinalIgnoreCase)) return;

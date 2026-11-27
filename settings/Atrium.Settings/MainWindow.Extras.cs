@@ -1,10 +1,8 @@
-using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
-using Windows.Storage.Pickers;
 using Windows.UI;
 
 namespace Atrium.Settings;
@@ -27,7 +25,6 @@ public sealed partial class MainWindow
     private SegmentTrack? _lpLayout, _lpMaterial, _npMotion, _npRhythm, _stLayout, _stMax;
     private StackPanel? _stList, _stFileList;
     private TextBlock? _stCount, _stFileCount;
-    private bool _pickingStack;
 
     private StackPanel ExtrasPage(int page)
     {
@@ -497,41 +494,22 @@ public sealed partial class MainWindow
         Changed();
     }
 
-    private async Task PickStackAsync(bool isFile)
+    private Task PickStackAsync(bool isFile)
     {
-        if (_pickingStack || _updatesClosed) return;
-        _pickingStack = true;
-        try
+        if (_updatesClosed) return Task.CompletedTask;
+        nint hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        if (isFile)
         {
-            nint hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
-            if (isFile)
-            {
-                var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
-                WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
-                picker.FileTypeFilter.Add("*");
-                if (await picker.PickMultipleFilesAsync() is { Count: > 0 } picked && !_updatesClosed)
-                    AddStackPaths(picked.Select(f => f.Path), isFile: true);
-            }
-            else
-            {
-                var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.ComputerFolder };
-                WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
-                picker.FileTypeFilter.Add("*");
-                if (await picker.PickSingleFolderAsync() is { } folder && !_updatesClosed)
-                    AddStackPaths([folder.Path], isFile: false);
-            }
+            string[] picked = NativeFileDialog.PickFiles(hwnd, Loc.T("Files"), App.LogCrash);
+            if (picked.Length > 0 && !_updatesClosed)
+                AddStackPaths(picked, isFile: true);
         }
-        catch (COMException)
+        else
         {
-            if (!_updatesClosed)
-            {
-                ShowMessage(InfoBarSeverity.Warning, Loc.T("The file picker is unavailable"),
-                    Loc.T("Windows does not show it to apps run as administrator. Open the settings without administrator rights."));
-            }
+            string? folder = NativeFileDialog.PickFolder(hwnd, App.LogCrash);
+            if (folder != null && !_updatesClosed)
+                AddStackPaths([folder], isFile: false);
         }
-        finally
-        {
-            _pickingStack = false;
-        }
+        return Task.CompletedTask;
     }
 }

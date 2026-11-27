@@ -597,8 +597,6 @@
   "Move down": "Aşağı taşı",
   "Remove": "Kaldır",
   "Pinned apps limit reached": "Sabitlenen uygulama sınırına ulaşıldı",
-  "The file picker is unavailable": "Dosya seçici kullanılamıyor",
-  "Windows does not show it to apps run as administrator. Open the settings without administrator rights.": "Windows, yönetici olarak çalıştırılan uygulamalara dosya seçiciyi göstermez. Ayarları yönetici hakları olmadan açın.",
   "You can pin at most 64 apps.": "En fazla 64 uygulama sabitleyebilirsiniz.",
   "Import Windows taskbar pins?": "Windows görev çubuğu sabitlemeleri içe aktarılsın mı?",
   "The current pinned list will be replaced by the apps pinned to the Windows taskbar.": "Mevcut sabitlenmiş liste Windows görev çubuğuna sabitlenen uygulamalarla değiştirilecektir.",

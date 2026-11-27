@@ -36,9 +36,15 @@ void CALLBACK OnMinimizeStart(HWINEVENTHOOK, DWORD, HWND h, LONG object, LONG, D
         g_genie->Minimizing(h);
 }
 
-void Transitions(HWND h, bool on)
+bool QueryTransitionsDisabled(HWND h, BOOL& disabled)
 {
-    const BOOL off = on ? FALSE : TRUE;
+    disabled = FALSE;
+    return SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_TRANSITIONS_FORCEDISABLED, &disabled, sizeof(disabled)));
+}
+
+void SetTransitionsDisabled(HWND h, bool disabled)
+{
+    const BOOL off = disabled ? TRUE : FALSE;
     DwmSetWindowAttribute(h, DWMWA_TRANSITIONS_FORCEDISABLED, &off, sizeof(off));
 }
 
@@ -124,17 +130,17 @@ void GenieMinimize::Shutdown()
     KillTimer(surface_.Hwnd(), kWatchTimer);
     KillTimer(surface_.Hwnd(), kIdleTimer);
     RunPending();
-    Release(held_, !(skip_ && skip_(held_)));
-    for (const Flight& f : flights_) {
-        surface_.ForgetImage(f.key);
-        if (f.window && f.window != held_ && !(skip_ && skip_(f.window)) && IsWindow(f.window))
-            Transitions(f.window, true);
-    }
-    flights_.clear();
+    Release(held_, !held_ || !(skip_ && skip_(held_)));
+    std::vector<std::function<void()>> pendingRestores = DrainGenieShutdownRestores(
+        flights_, [](HWND h) { return IsWindow(h) != FALSE; }, [this](const std::wstring& key) { surface_.ForgetImage(key); },
+        [this](HWND h) { ReleaseTransitions(h, !(skip_ && skip_(h))); });
+    transitionLeases_.Clear([this](HWND h) { return skip_ && skip_(h); }, [](HWND h) { return IsWindow(h) != FALSE; }, SetTransitionsDisabled);
     pictures_.clear();
     front_ = nullptr;
     surface_.SetRegionNone();
     surface_.Hide(false);
+    for (const auto& restore : pendingRestores)
+        restore();
 }
 
 void GenieMinimize::SetEnabled(bool on)
@@ -153,12 +159,18 @@ void GenieMinimize::SetEnabled(bool on)
     Log(L"genie: %s", on ? L"on" : L"off");
 }
 
+void GenieMinimize::AcquireTransitions(HWND window) { transitionLeases_.Acquire(window, QueryTransitionsDisabled, SetTransitionsDisabled); }
+
+void GenieMinimize::ReleaseTransitions(HWND window, bool restoreAttribute)
+{
+    transitionLeases_.Release(window, restoreAttribute, [](HWND h) { return IsWindow(h) != FALSE; }, SetTransitionsDisabled);
+}
+
 void GenieMinimize::Release(HWND window, bool restoreTransitions)
 {
     if (window && window == held_) {
-        if (restoreTransitions && IsWindow(window))
-            Transitions(window, true);
         held_ = nullptr;
+        ReleaseTransitions(window, restoreTransitions);
     }
 }
 
@@ -166,9 +178,11 @@ void GenieMinimize::Hold(HWND window)
 {
     if (window == held_)
         return;
-    Release(held_);
-    Transitions(window, false);
-    held_ = window;
+    Release(held_, !held_ || !(skip_ && skip_(held_)));
+    if (window && IsWindow(window)) {
+        AcquireTransitions(window);
+        held_ = window;
+    }
 }
 
 RECT GenieMinimize::FlightBounds(const RECT& fallback) const
@@ -349,29 +363,30 @@ void GenieMinimize::Launch(Flight f)
 // Out of the icon and landed: the window comes back under its picture, without an animation of its own.
 void GenieMinimize::RunRestores()
 {
-    struct Due {
-        HWND window = nullptr;
-        std::function<void()> restore;
-    };
-    std::vector<Due> due;
+    std::vector<std::function<void()>> due;
     for (Flight& f : flights_)
         if (f.restoreDue && f.restore) {
-            f.restoreTransitions = true;
-            due.push_back({f.window, std::exchange(f.restore, nullptr)});
+            std::function<void()> restore = std::exchange(f.restore, nullptr);
+            if (f.window && IsWindow(f.window)) {
+                if (!f.restoreTransitions) {
+                    AcquireTransitions(f.window);
+                    f.restoreTransitions = true;
+                }
+                due.push_back(std::move(restore));
+            }
         }
-    for (Due& d : due) {
-        if (IsWindow(d.window))
-            Transitions(d.window, false);
-        d.restore();
-    }
+    for (const auto& restore : due)
+        restore();
 }
 
 void GenieMinimize::Paint(Canvas& c)
 {
     for (auto it = flights_.begin(); it != flights_.end();) {
         if (PaintOne(c, *it)) {
-            if (it->restoreTransitions && it->window != held_ && !(skip_ && skip_(it->window)) && IsWindow(it->window))
-                Transitions(it->window, true);
+            if (it->restoreTransitions) {
+                it->restoreTransitions = false;
+                ReleaseTransitions(it->window, !(skip_ && skip_(it->window)));
+            }
             surface_.ForgetImage(it->key);
             it = flights_.erase(it);
         } else {

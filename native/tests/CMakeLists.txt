@@ -224,3 +224,7 @@ add_test(NAME stage_watch COMMAND stage_watch_tests)
 add_executable(app_catalog_rules_tests app_catalog_rules.cpp)
 target_link_libraries(app_catalog_rules_tests PRIVATE atrium_core_lib)
 add_test(NAME app_catalog_rules COMMAND app_catalog_rules_tests)
+
+add_executable(genie_quad_tests genie_quad.cpp)
+target_link_libraries(genie_quad_tests PRIVATE atrium_core_lib)
+add_test(NAME genie_quad COMMAND genie_quad_tests)

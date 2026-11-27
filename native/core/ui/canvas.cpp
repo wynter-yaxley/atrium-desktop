@@ -6,6 +6,7 @@
 #include "render/round_stroke.h"
 #include "render/ui_font.h"
 #include "render/wifi_glyph.h"
+#include "ui/quad_sampling.h"
 
 #include <d2d1effects.h>
 
@@ -380,7 +381,8 @@ void Canvas::ImageQuad(const std::wstring& key, const IconImage& image, D2D1_REC
     const D2D1_RECT_F dest = D2D1::RectF(0, 0, w, ht);
     // A slice pours into a few pixels near the icon: bilinear alone picks single source rows and
     // the picture breaks into stripes. Multi-sample averages four, which the fade then hides.
-    d2d_->DrawBitmap(b, &dest, opacity * alpha_, D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR, &source, &m);
+    const D2D1_INTERPOLATION_MODE mode = NeedsMultiSampleQuad(w, ht, p.data()) ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR : D2D1_INTERPOLATION_MODE_LINEAR;
+    d2d_->DrawBitmap(b, &dest, opacity * alpha_, mode, &source, &m);
 }
 
 bool Canvas::Cached(const std::wstring& key) const

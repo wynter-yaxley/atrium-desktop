@@ -421,6 +421,8 @@ void ShutdownApp(HANDLE mutex, std::thread& startupThread)
         g_app.chrome->RestoreForExit();
     g_app.stage->RestoreAll();
     g_app.stage->SignalSnapshotStop();
+    if (g_app.genie)
+        g_app.genie->SignalSnapshotStop();
     g_app.winKey.reset(), g_app.imeWatcher.reset(), g_app.status.reset();
     g_app.preview->Close();
     std::vector<Bar*> stopBars;
@@ -439,11 +441,18 @@ void ShutdownApp(HANDLE mutex, std::thread& startupThread)
     g_app.trayPanel.reset(), g_app.tray.reset(), g_app.start.reset();
     g_app.menu.reset(), g_app.preview.reset();
     TaskModel::SetWindowSteps({}, {});
-    g_app.genie.reset();
-    if (g_app.stage && !g_app.stage->WaitSnapshotStop(400)) {
+    if (g_app.genie)
+        g_app.genie->SetEnabled(false);
+    const ULONGLONG snapshotDeadline = GetTickCount64() + 400;
+    auto remainingSnapshotMs = [snapshotDeadline]() -> DWORD {
+        const ULONGLONG now = GetTickCount64();
+        return now < snapshotDeadline ? static_cast<DWORD>(snapshotDeadline - now) : 0;
+    };
+    if ((g_app.stage && !g_app.stage->WaitSnapshotStop(remainingSnapshotMs())) || (g_app.genie && !g_app.genie->WaitSnapshotStop(remainingSnapshotMs()))) {
         AbortStuckShutdown(mutex, L"core: exited (snapshot worker stuck)");
         return;
     }
+    g_app.genie.reset();
     g_app.stage.reset(), g_app.ime.reset();
     Surface::SetGlassHost(nullptr);
     g_app.extras.reset(), g_app.catalog.reset();
