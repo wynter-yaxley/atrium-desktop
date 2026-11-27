@@ -1,5 +1,7 @@
 #include "shell/win_key.h"
 
+#include "shell/process_integrity.h"
+
 #include <iostream>
 
 using namespace atrium;
@@ -41,6 +43,11 @@ int main()
     ok &= Check(a.swallow && !s.used && s.lastDownMs == 1033, "33ms repeat not fresh");
     a = StepWinKey(s, VK_LWIN, 0x5B, true, true, 3100, false, false, false, true, true);
     ok &= Check(a.swallow && s.lastDownMs == 3100, ">2000ms resets");
+    ok &=
+        Check(!IsHigherIntegrityRid(SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_HIGH_RID), "same high integrity is not higher (UAC off / elevated Atrium)");
+    ok &= Check(IsHigherIntegrityRid(SECURITY_MANDATORY_MEDIUM_RID, SECURITY_MANDATORY_HIGH_RID), "high integrity is higher than medium");
+    ok &= Check(IsHigherIntegrityRid(SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_SYSTEM_RID), "system integrity is higher than high");
+    ok &= Check(!IsHigherIntegrityRid(SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_MEDIUM_RID), "medium integrity is not higher than high");
     if (!ok)
         return 1;
     std::cout << "win key checks passed\n";

@@ -14,4 +14,10 @@ bool ShouldIgnoreTopmostCover(std::wstring_view cls, LONG_PTR style, LONG_PTR ex
 // True when a window's visual bounds overlap the bar's resting overlap zone.
 bool WindowOverlapsBar(const RECT& windowBounds, const RECT& barZone);
 
+// True when a topmost non-click-through horizontal bar overlaps `barZone` in meeting toolbar dimensions.
+bool IsMeetingShareToolbarBounds(LONG_PTR exStyle, const RECT& bounds, const RECT& barZone, float scale);
+
+// True when an executable stem belongs to a meeting/screen-share app with a floating share toolbar.
+bool IsMeetingShareExeStem(std::wstring_view exeStem);
+
 } // namespace atrium

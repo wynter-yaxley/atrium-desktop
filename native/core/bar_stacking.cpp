@@ -4,13 +4,17 @@
 #include "bar.h"
 #include "bar_stacking.h"
 
+#include "desktop_helpers.h"
 #include "log.h"
 #include "shell/games.h"
 #include "shell/shell_taskbar.h"
+#include "win32_path.h"
 
 #include <dwmapi.h>
 #include <shellapi.h>
 
+#include <algorithm>
+#include <array>
 #include <cwchar>
 #include <iterator>
 #include <map>
@@ -183,6 +187,63 @@ bool WindowOverlapsBar(const RECT& windowBounds, const RECT& barZone)
     return IntersectRect(&overlap, &windowBounds, &barZone) != FALSE && overlap.right > overlap.left && overlap.bottom > overlap.top;
 }
 
+bool IsMeetingShareToolbarBounds(LONG_PTR exStyle, const RECT& bounds, const RECT& barZone, float scale)
+{
+    if (!(exStyle & WS_EX_TOPMOST) || ((exStyle & WS_EX_TRANSPARENT) && (exStyle & WS_EX_LAYERED)))
+        return false;
+    if (!WindowOverlapsBar(bounds, barZone))
+        return false;
+    const LONG w = bounds.right - bounds.left, h = bounds.bottom - bounds.top;
+    const float s = std::max(scale, 0.5f);
+    return w >= LONG(100.f * s) && h >= LONG(20.f * s) && h <= LONG(140.f * s) && w > h;
+}
+
+bool IsMeetingShareExeStem(std::wstring_view exeStem)
+{
+    if (exeStem.empty())
+        return false;
+    const std::wstring stem = FoldCase(std::wstring(exeStem));
+    static constexpr std::array<std::wstring_view, 9> kStems = {L"feishu",   L"lark",   L"wemeetapp", L"wemeet",  L"zoom",
+                                                                L"dingtalk", L"wxwork", L"teams",     L"ms-teams"};
+    return std::ranges::find(kStems, std::wstring_view(stem)) != kStems.end();
+}
+
+namespace {
+
+bool IsWindowMeetingToolbar(HWND window, LONG_PTR ex, const RECT& bounds, const RECT& barZone, float scale)
+{
+    if (!IsMeetingShareToolbarBounds(ex, bounds, barZone, scale))
+        return false;
+    const std::wstring program = ProgramOf(window);
+    if (program.empty())
+        return false;
+    std::wstring file = program.substr(program.find_last_of(L"\\/") + 1);
+    if (file.size() > 4 && FoldCase(file.substr(file.size() - 4)) == L".exe")
+        file.resize(file.size() - 4);
+    return IsMeetingShareExeStem(file);
+}
+
+bool ShouldSkipForegroundOverlapCandidate(HWND window, RECT& boundsOut)
+{
+    if (!IsWindowVisible(window) || IsIconic(window))
+        return true;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == GetCurrentProcessId())
+        return true;
+    BOOL cloaked = FALSE;
+    DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (cloaked)
+        return true;
+    wchar_t cls[64] = {};
+    GetClassNameW(window, cls, 64);
+    if (wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 || wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0)
+        return true;
+    return FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &boundsOut, sizeof(boundsOut))) && !GetWindowRect(window, &boundsOut);
+}
+
+} // namespace
+
 RECT Bar::BarOverlapZone() const
 {
     const LONG barLeft = LONG(scene_.bar.left), barTop = LONG(scene_.bar.top), barRight = LONG(scene_.bar.right);
@@ -194,33 +255,36 @@ RECT Bar::BarOverlapZone() const
     return frame.ToArea(RECT{barLeft, barTop, barRight, outer});
 }
 
+bool Bar::MonitorCoveredByMeetingToolbar() const
+{
+    const RECT zone = BarOverlapZone();
+    if (zone.right <= zone.left || zone.bottom <= zone.top)
+        return false;
+    for (HWND window = GetTopWindow(nullptr); window; window = GetWindow(window, GW_HWNDNEXT)) {
+        RECT bounds{};
+        if (ShouldSkipForegroundOverlapCandidate(window, bounds))
+            continue;
+        if (IsWindowMeetingToolbar(window, GetWindowLongPtrW(window, GWL_EXSTYLE), bounds, zone, scale_))
+            return true;
+    }
+    return false;
+}
+
 bool Bar::MonitorOverlappedByApp() const
 {
     const RECT zone = BarOverlapZone();
     if (zone.right <= zone.left || zone.bottom <= zone.top)
         return false;
     for (HWND window = GetTopWindow(nullptr); window; window = GetWindow(window, GW_HWNDNEXT)) {
-        if (!IsWindowVisible(window) || IsIconic(window))
-            continue;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(window, &pid);
-        if (pid == GetCurrentProcessId())
+        RECT bounds{};
+        if (ShouldSkipForegroundOverlapCandidate(window, bounds))
             continue;
         const LONG_PTR ex = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if (IsWindowMeetingToolbar(window, ex, bounds, zone, scale_))
+            return true;
         if (!(ex & WS_EX_APPWINDOW) && ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || GetWindow(window, GW_OWNER)))
             continue;
         if ((ex & WS_EX_TRANSPARENT) && (ex & WS_EX_LAYERED))
-            continue;
-        BOOL cloaked = FALSE;
-        DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-        if (cloaked)
-            continue;
-        wchar_t cls[64] = {};
-        GetClassNameW(window, cls, 64);
-        if (wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 || wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0)
-            continue;
-        RECT bounds{};
-        if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))) && !GetWindowRect(window, &bounds))
             continue;
         if (WindowOverlapsBar(bounds, zone))
             return true;
@@ -251,14 +315,14 @@ void Bar::UpdateCover()
         covered = knownFullScreen || (dodge && MonitorOverlappedByApp());
     } else if (mode == L"never") {
         knownFullScreen = FullScreenInFront(hmonitor_);
-        covered = knownFullScreen || (dodge && MonitorOverlappedByApp());
+        covered = knownFullScreen || MonitorCoveredByMeetingToolbar() || (dodge && MonitorOverlappedByApp());
     } else if (mode == L"always") {
         knownFullScreen = GameInFront(hmonitor_);
         covered = true;
     } else {
         const bool game = GameInFront(hmonitor_);
         knownFullScreen = game;
-        covered = (dodge && MonitorOverlappedByApp()) || MonitorCoveredByApp() || game || expected;
+        covered = (dodge && MonitorOverlappedByApp()) || MonitorCoveredByApp() || MonitorCoveredByMeetingToolbar() || game || expected;
     }
     if (covered == covered_)
         return;

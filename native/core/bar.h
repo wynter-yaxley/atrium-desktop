@@ -257,6 +257,7 @@ private:
     RECT BarOverlapZone() const;
     bool MonitorCoveredByApp() const;
     bool MonitorOverlappedByApp() const;
+    bool MonitorCoveredByMeetingToolbar() const;
     void UpdateCover();    // this monitor's top app is maximized or full screen, regardless of focus
     void UpdateAutoHide(); // tucks the bar away or brings it up
     void WatchPointer();   // while covered: the screen's bottom edge brings the bar up, leaving it lets it go

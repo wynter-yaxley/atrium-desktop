@@ -2,32 +2,11 @@
 
 #include "log.h"
 #include "shell/keyboard_hook.h"
+#include "shell/process_integrity.h"
 
 namespace atrium {
 
 namespace {
-
-// The window in front runs elevated: keys Atrium sends would not reach it.
-bool ForegroundElevated()
-{
-    DWORD pid = 0;
-    HWND fg = GetForegroundWindow();
-    if (!fg || !GetWindowThreadProcessId(fg, &pid) || !pid || pid == GetCurrentProcessId())
-        return false;
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process)
-        return true;
-    bool elevated = true; // its token closed to us: elevated (or protected)
-    HANDLE token = nullptr;
-    if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
-        TOKEN_ELEVATION e{};
-        DWORD size = 0;
-        elevated = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &size) && e.TokenIsElevated;
-        CloseHandle(token);
-    }
-    CloseHandle(process);
-    return elevated;
-}
 
 INPUT Key(DWORD vk, DWORD scan, bool extended)
 {
@@ -68,7 +47,7 @@ bool WinKey::OnKey(void* context, DWORD vk, DWORD scan, bool extended, bool down
     const bool willReset = s.held && s.passed && (vk != s.key || down) && !winAsync;
     const bool freshWin = win && down && (!s.held || willReset || (!s.passed && now - s.lastDownMs > 2000));
     const bool startOpen = self->startMenuOpen_.load(std::memory_order_acquire);
-    const bool elevated = (freshWin && !startOpen) ? ForegroundElevated() : false;
+    const bool elevated = (freshWin && !startOpen) ? WindowHasHigherIntegrity(GetForegroundWindow()) : false;
     const bool mod =
         !win && down && s.held && !s.passed && ((GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU)) & 0x8000) != 0;
     const WinKeyAction action = StepWinKey(s, vk, scan, extended, down, now, winAsync, elevated, mod, self->alone_, self->numbers_);
