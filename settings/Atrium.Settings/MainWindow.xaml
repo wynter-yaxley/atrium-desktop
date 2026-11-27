@@ -37,11 +37,14 @@
         </Border>
 
         <!-- ============ Sidebar ============ -->
-        <Grid Grid.Row="1" Padding="12,16,12,18">
-            <Grid.RowDefinitions><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+        <Grid x:Name="Sidebar" Grid.Row="1" Padding="12,16,12,18">
+            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+            <AutoSuggestBox x:Name="SettingsSearch" PlaceholderText="Search settings" QueryIcon="Find" Margin="4,0,4,10"
+                            TextChanged="OnSettingsSearch" SuggestionChosen="OnSettingsSuggestionChosen" />
 
-            <ListView x:Name="Nav" SelectionMode="Single" SelectionChanged="OnNavChanged"
-                      AutomationProperties.Name="Navigation" VerticalAlignment="Top" ItemContainerStyle="{StaticResource NavItemStyle}">
+            <ListView x:Name="Nav" Grid.Row="1" SelectionMode="Single" SelectionChanged="OnNavChanged"
+                      AutomationProperties.Name="Navigation" VerticalAlignment="Top" ItemContainerStyle="{StaticResource NavItemStyle}"
+                      ScrollViewer.VerticalScrollBarVisibility="Hidden">
                 <ListViewItem Tag="0" AutomationProperties.Name="Material"><local:NavLabel Glyph="&#xE790;" Text="Material" /></ListViewItem>
                 <ListViewItem Tag="1" AutomationProperties.Name="Shape"><local:NavLabel Glyph="&#xE7C9;" Text="Shape" /></ListViewItem>
                 <ListViewItem Tag="2" AutomationProperties.Name="Taskbar"><local:NavLabel Glyph="&#xE718;" Text="Taskbar" /></ListViewItem>
@@ -52,9 +55,7 @@
                 </ListViewItem>
                 <ListViewItem Tag="12" AutomationProperties.Name="Status bar"><local:NavLabel Glyph="&#xE701;" Text="Status bar" Sub="True" /></ListViewItem>
                 <ListViewItem Tag="13" AutomationProperties.Name="Time"><local:NavLabel Glyph="&#xE823;" Text="Time" Sub="True" /></ListViewItem>
-                <ListViewItem Tag="3" AutomationProperties.Name="Notifications">
-                    <local:NavLabel Glyph="&#xEA8F;" Text="Notifications" Sub="True" />
-                </ListViewItem>
+                <ListViewItem Tag="3"><local:NavLabel Glyph="&#xEA8F;" Text="Notifications" Sub="True" /></ListViewItem>
                 <ListViewItem Tag="4" AutomationProperties.Name="Widgets"><local:NavLabel Glyph="&#xE8A9;" Text="Widgets" /></ListViewItem>
                 <ListViewItem Tag="5" AutomationProperties.Name="Stage Manager"><local:NavLabel Glyph="&#xE7C4;" Text="Stage Manager" /></ListViewItem>
                 <ListViewItem Tag="6" AutomationProperties.Name="Displays"><local:NavLabel Glyph="&#xE7F4;" Text="Displays" /></ListViewItem>
@@ -64,8 +65,7 @@
                 </ListViewItem>
                 <ListViewItem Tag="9" AutomationProperties.Name="About"><local:NavLabel Glyph="&#xE946;" Text="About" /></ListViewItem>
             </ListView>
-
-            <StackPanel Grid.Row="1" Spacing="4" Margin="10,0,6,0">
+            <StackPanel Grid.Row="2" Spacing="4" Margin="10,0,6,0">
                 <Button x:Name="UpdateAvailableButton" Content="Update available" Visibility="Collapsed"
                         HorizontalAlignment="Stretch" Margin="0,0,0,12"
                         Style="{StaticResource PrimaryButtonStyle}" Click="OnOpenUpdate"
@@ -1086,8 +1086,8 @@
                     </StackPanel>
                 </ScrollViewer>
             </Grid>
-            <!-- Errors: a quiet banner over the workspace's top -->
-            <InfoBar x:Name="Status" IsOpen="False" IsClosable="True" MaxWidth="760" Margin="32,12,32,0" VerticalAlignment="Top" />
+            <!-- Errors: a quiet banner over the workspace's top (MainWindow.Status.cs) -->
+            <Grid x:Name="StatusHost" MaxWidth="760" Margin="32,12,32,0" VerticalAlignment="Top" />
         </Grid>
     </Grid>
 </Window>

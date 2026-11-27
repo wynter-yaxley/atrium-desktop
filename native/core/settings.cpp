@@ -49,6 +49,8 @@ void ReadBarSettingsJson(const json::JsonObject& o, Settings& s)
     num(L"dispersion", s.dispersion);
     num(L"highlight", s.highlight);
     num(L"shadow", s.shadow);
+    num(L"edgeSoftness", s.edgeSoftness);
+    num(L"edgeLightBoost", s.edgeLightBoost);
     num(L"width", s.width);
     num(L"height", s.height);
     num(L"margin", s.margin);
@@ -180,6 +182,8 @@ void ReadExtrasSettingsJson(const json::JsonObject& o, Settings& s)
     ReadStringArrayJson(o, L"nowPlayingApps", s.nowPlayingApps);
     flag(L"showFolderStacks", s.showFolderStacks);
     str(L"folderStackLayout", s.folderStackLayout);
+    str(L"folderStackIcon", s.folderStackIcon);
+    flag(L"folderStackPinned", s.folderStackPinned);
     if (o.HasKey(L"folderStackMax") && o.GetNamedValue(L"folderStackMax").ValueType() == json::JsonValueType::Number) {
         const double raw = o.GetNamedNumber(L"folderStackMax");
         if (raw == raw)
@@ -290,6 +294,8 @@ void WriteBarJson(const json::JsonObject& o, const Settings& s)
     num(L"dispersion", s.dispersion);
     num(L"highlight", s.highlight);
     num(L"shadow", s.shadow);
+    num(L"edgeSoftness", s.edgeSoftness);
+    num(L"edgeLightBoost", s.edgeLightBoost);
     str(L"tint", tintText);
     num(L"width", s.width);
     num(L"height", s.height);
@@ -332,6 +338,8 @@ void WriteExtrasJson(const json::JsonObject& o, const Settings& s)
     WriteStringArrayJson(o, L"nowPlayingApps", s.nowPlayingApps);
     flag(L"showFolderStacks", s.showFolderStacks);
     str(L"folderStackLayout", s.folderStackLayout);
+    str(L"folderStackIcon", s.folderStackIcon);
+    flag(L"folderStackPinned", s.folderStackPinned);
     o.SetNamedValue(L"folderStackMax", json::JsonValue::CreateNumberValue(s.folderStackMax));
     WriteStringArrayJson(o, L"folderStacks", s.folderStacks);
     WriteStringArrayJson(o, L"folderStackFiles", s.folderStackFiles);
@@ -435,6 +443,8 @@ void Settings::Clamp()
     c(dispersion, 0, 0.5, d.dispersion);
     c(highlight, 0, 1, d.highlight);
     c(shadow, 0, 1, d.shadow);
+    c(edgeSoftness, 0.8, 3.0, d.edgeSoftness);
+    c(edgeLightBoost, 0, 1.5, d.edgeLightBoost);
     c(width, 200, 4000, d.width);
     c(height, 32, 160, d.height);
     c(margin, 0, 400, d.margin);
@@ -483,6 +493,8 @@ void Settings::Clamp()
         nowPlayingAppMode = L"all";
     if (folderStackLayout != L"column")
         folderStackLayout = L"fan";
+    if (folderStackIcon != L"color")
+        folderStackIcon = L"mono";
     folderStackMax = std::clamp(folderStackMax, 4, 24);
     NormalizeStringList(stageExcluded);
     NormalizeStringList(nowPlayingApps, 64);

@@ -12,6 +12,7 @@
     <Compile Include="../../settings/Atrium.Settings/DesktopDisplay.cs" Link="DesktopDisplay.cs" />
     <Compile Include="../../settings/Atrium.Settings/GameFinder.Parsers.cs" Link="GameFinder.Parsers.cs" />
     <Compile Include="../../settings/Atrium.Settings/LocalizationValidation.cs" Link="LocalizationValidation.cs" />
+    <Compile Include="../../settings/Atrium.Settings/PinnedApp.cs" Link="PinnedApp.cs" />
     <Compile Include="../../settings/Atrium.Settings/ReleaseInfo.cs" Link="ReleaseInfo.cs" />
     <Compile Include="../../settings/Atrium.Settings/ReleaseInstaller.cs" Link="ReleaseInstaller.cs" />
     <Compile Include="../../settings/Atrium.Settings/ReleaseValidation.cs" Link="ReleaseValidation.cs" />

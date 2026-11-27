@@ -12,11 +12,13 @@
 | `preset` | string | `liquid` / `frosted` / `custom` | `liquid` | 仅用于界面显示 |
 | `transparency` | number | 0–1 | 0.95 | 1 = 完全不染色；着色混合 = 1 − transparency |
 | `blur` | number | 0–1 | 0.50 | 模糊强度：主要决定 mip 级别（1 + 4.5 × blur），低值时与清晰采样混合 |
-| `refraction` | number | 0–60 DIP | 30 | 边缘最大采样偏移 |
-| `edge` | number | 1–80 DIP | 24 | 发生折射的边缘宽度 |
+| `refraction` | number | 0–60 DIP | 39 | 边缘最大采样偏移 |
+| `edge` | number | 1–80 DIP | 10 | 发生折射的边缘宽度 |
 | `dispersion` | number | 0–0.5 | 0.30 | 通道分离比例 |
-| `highlight` | number | 0–1 | 0.80 | 边缘高光与玻璃下内容的鲜艳度 |
-| `shadow` | number | 0–1 | 0.30 | 投影浓度 |
+| `highlight` | number | 0–1 | 0.60 | 边缘高光与玻璃下内容的鲜艳度 |
+| `edgeSoftness` | number | 0.8–3.0 | 2.0 | 边缘柔和度（材质页滑块，百分比 ÷ 100）：着色器取其平方的一半作为过渡宽度，200% 对应 2 px，100% 约 0.5 px，300% 约 4.5 px |
+| `edgeLightBoost` | number | 0–1.5 | 0.8 | 亮背景额外加宽：背后是白色或浅色时，过渡在 `edgeSoftness` 上再加宽多少，用来消除阴影边上的台阶（材质页“亮处边缘加宽”） |
+| `shadow` | number | 0–1 | 0.10 | 投影浓度 |
 | `tint` | string | `#RRGGBB` | `#FFFFFF` | 染色 |
 | `cornerRadius` | number | 0–200 DIP | 30 | 绘制时不超过高度的一半 |
 | `width` | number | 200–4000 DIP | 1200 | 最大宽度，不超过工作区；`autoWidth` 关闭时为固定宽度 |
@@ -63,6 +65,8 @@
 | `nowPlayingApps` | string[] | 最多 64 项 | `[]` | 正在播放过滤列表（AUMID 或可执行文件名），每项去除首尾空白并丢弃空项 |
 | `showFolderStacks` | bool | | false | 托盘左侧的文件夹叠放入口 |
 | `folderStackLayout` | string | `fan` / `column` | `fan` | 文件夹叠放的展开样式：扇形（`fan`）或列表（`column`） |
+| `folderStackIcon` | string | `color` / `mono` | `mono` | 文件夹叠放入口的图标：单色（栏字色的单层轮廓，与其他入口一致）或彩色（macOS 蓝的文件夹，与应用图标同大） |
+| `folderStackPinned` | bool | | false | 展开的文件夹叠放在点击别处（失焦）时保持展开，只有再次单击堆栈入口才收起；关闭时失焦即收起，与其他弹层一致 |
 | `folderStackMax` | number | 4–24 | 8 | 文件夹叠放一次最多显示的项目数量（整数，超出范围截断） |
 | `folderStacks` | string[] | 最多 32 项 | `[]` | 文件夹叠放包含的文件夹路径列表，每项去除首尾 ASCII 空白并丢弃空项 |
 | `folderStackFiles` | string[] | 最多 32 项 | `[]` | 文件夹叠放包含的文件路径列表，每项去除首尾 ASCII 空白并丢弃空项 |
@@ -80,14 +84,14 @@
 | `notifyFullscreen` | bool | | false | 全屏应用在前（例如全屏视频、浏览器 F11）时也弹出通知卡片；游戏在前时不弹出 |
 | `notifyListener` | bool | | true | 通过 UserNotificationListener 把其他应用的 Windows 通知显示为 Atrium 卡片（系统横幅仍会出现，除非用户在 Windows 里关闭该应用的横幅）；微信、QQ、飞书、企业微信、钉钉的通知由各自的开关决定 |
 | `notifyWeChat` | bool | | true | 读取微信的会话列表（UI 自动化，只读），非免打扰会话有新的未读消息时显示卡片；窗口打开过一次后，关到托盘也能读到会话名与摘要；读不到时，微信为消息闪烁即显示“微信 · 新消息” |
-| `wechatBlockOfficial` | bool | | false | 屏蔽微信公众号通知（设置里微信那一行开关旁的“屏蔽公众号”，微信通知打开时才可勾选）：会话列表里“公众号”“订阅号”“服务号”这几行有新消息时不显示卡片。微信的界面只给出会话的显示名，单独列成一个会话的服务号仍按普通会话提醒 |
+| `wechatBlockOfficial` | bool | | false | 屏蔽微信公众号通知（设置里微信那一行开关旁的“屏蔽公众号”，微信通知打开时才可勾选）：会话列表里“公众号”“订阅号”“服务号”这几行有新消息时不显示卡片。微信的界面只给出会话的显示名，单独列成一个会话的服务号仍按普通会话提醒。任务栏角标不受此开关影响：角标始终只计普通会话，不含这几行 |
 | `notifyFeishu` | bool | | true | 读取飞书自己的消息弹窗里的文字（UI 自动化，只读），同时显示为 Atrium 卡片 |
 | `notifyQQ` | bool | | true | QQ 的消息：它的 Windows 通知；QQ 缩在托盘里闪烁却没有通知时，显示一张“QQ · 新消息”卡片 |
 | `notifyWeCom` | bool | | true | 企业微信的消息：它的窗口或托盘图标闪烁时，显示一张“企业微信 · 新消息”卡片 |
 | `notifyDingTalk` | bool | | true | 钉钉的消息：同上，“钉钉 · 新消息” |
 | `attentionLight` | bool | | true | 应用请求注意（窗口或托盘图标闪烁，例如新消息）时，任务栏图标底板亮白色、运行圆点变白，直到切到该应用；指针停在该图标上或放大波及它时暂时隐藏 |
 | `attentionBounce` | bool | | false | 应用开始请求注意时，任务栏图标跳动三下（与启动时的跳动相同）；指针停在该图标上时不跳 |
-| `barBadges` | bool | | true | 在任务栏图标右上角显示未读消息角标（微信、网页应用及在标题中给出未读数的邮件和聊天软件） |
+| `barBadges` | bool | | true | 在任务栏图标右上角显示未读消息角标（微信、网页应用及在标题中给出未读数的邮件和聊天软件）。微信的角标只计普通会话，服务号、公众号与订阅号的未读不计入 |
 | `bar` | bool | | true | 玻璃任务栏模块：关闭时栏的窗口隐藏，开始菜单、托盘、控制中心、日历与通知中心随之关闭，通知来源停止接收（Windows 自己的横幅照常出现），`hideTaskbar` 与 `hideBanners` 不再生效；渲染线程继续为小组件与菜单绘制玻璃。与 `widgets`、`stageManager` 互不依赖 |
 | `widgets` | bool | | true | 桌面小组件；布局由 Core 存于 `widgets.json`（D35）。中号时钟和中号数字时钟的世界时钟城市可在小组件右键菜单“更改城市…”里逐个换，存为该小组件的 `cities`（城市名数组，按显示顺序；没有这一项时用北京、东京、伦敦、纽约，数字时钟用后三个） |
 | `widgetsOnRight` | bool | | false | 小组件逻辑网格从右侧排布；切换时镜像现有列，不改写 `widgets.json` |

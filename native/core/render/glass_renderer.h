@@ -38,7 +38,10 @@ struct GlassParams {
     float tailX, tailHalfWidth, tailHeight, tailInset; // optional Dock label pointer
     float waveX, waveWidth, waveHeight, wavePad; // optional upward Dock hover wave
     D2D1_MATRIX_3X2_F fromArea{1, 0, 0, 1, 0, 0}; // window px to layout px (EdgeFrame::FromAreaMatrix)
-    float fromAreaPad[2]{};
+    // The rim's coverage transition in px (edgeSoftness), and how much wider it grows over light
+    // content, where the shadow is the only rim signal (edgeLightBoost).
+    float edgeSoftness = 2.0f;
+    float edgeLightBoost = 0.8f;
 };
 static_assert(sizeof(GlassParams) == 528);
 constexpr int kMaxGlassParts = 10;

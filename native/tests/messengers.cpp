@@ -135,14 +135,12 @@ void CheckWeChatDiff()
     Require(sat.size() == 1 && sat[0].unread && sat[0].body == L"m2", "99+ new summary");
 
     std::vector<std::pair<std::wstring, WeChatRow>> rows{
-        {L"a", {L"Alice", L"hi", 3, false, false, false}},
-        {L"m", {L"Muted", L"hi", 5, true, false, false}},
-        {L"c", {L"Collapsed", L"hi", 4, false, true, false}},
-        {L"o", {L"公众号", L"news", 2, false, false, true}},
+        {L"a", {L"Alice", L"hi", 3, false, false, false}},     {L"m", {L"Muted", L"hi", 5, true, false, false}},
+        {L"c", {L"Collapsed", L"hi", 4, false, true, false}},  {L"o", {L"公众号", L"news", 2, false, false, true}},
+        {L"s", {L"服务号", L"news", 349, false, false, true}},
     };
-    Require(SumWeChatUnread(rows, false) == 5, "sum excludes muted and collapsed");
-    Require(SumWeChatUnread(rows, true) == 3, "sum excludes official when blocked");
-    Require(SumWeChatUnread({}, true) == 0, "empty rows sum to 0");
+    Require(SumWeChatUnread(rows) == 3, "the badge counts chats only: never the official accounts' rows");
+    Require(SumWeChatUnread({}) == 0, "empty rows sum to 0");
 
     // Unmuting a previously muted chat alerts again (no sticky lastMuted).
     std::map<std::wstring, WeChatChatState> muteStates;

@@ -233,12 +233,19 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
         JsonNode.Parse("""{"folderStackFiles":[" C:\\Docs\\Plan.pdf ","c:/docs/plan.pdf","","D:\\Notes.txt"]}""")!.AsObject(), new());
     Require(stackFiles.FolderStackFiles.SequenceEqual([@"C:\Docs\Plan.pdf", @"D:\Notes.txt"]),
         "Folder stack files must deduplicate paths case-insensitively.");
+    Require(BarSettings.FromJson(JsonNode.Parse("""{"folderStackIcon":"bad"}""")!.AsObject(), new()).FolderStackIcon == "mono",
+        "An unknown stack icon must fall back to the bar's ink outline.");
+    var rim = BarSettings.FromJson(JsonNode.Parse("""{"edgeSoftness":9,"edgeLightBoost":-1}""")!.AsObject(), new());
+    Require(rim.EdgeSoftness == 3.0 && rim.EdgeLightBoost == 0.0 &&
+            new BarSettings().EdgeSoftness == 2.0 && new BarSettings().EdgeLightBoost == 0.8,
+        "The rim's softness must clamp to 0.8..3 and the light boost to 0..1.5.");
     var extrasDefault = new BarSettings();
     Require(extrasDefault.ShowLaunchpad && extrasDefault.LaunchpadMaterial == "bar" &&
             extrasDefault.LaunchpadLayout == "window" && extrasDefault.ShowNowPlaying && extrasDefault.NowPlayingShowPaused &&
             extrasDefault.NowPlayingMotion == "normal" && extrasDefault.NowPlayingRhythm == "live" && extrasDefault.NowPlayingAppMode == "all" &&
             extrasDefault.NowPlayingApps.Count == 0 &&
-            !extrasDefault.ShowFolderStacks && extrasDefault.FolderStackLayout == "fan" &&
+            !extrasDefault.ShowFolderStacks && extrasDefault.FolderStackLayout == "fan" && extrasDefault.FolderStackIcon == "mono" &&
+            !extrasDefault.FolderStackPinned &&
             extrasDefault.FolderStackMax == 8 && extrasDefault.FolderStacks.Count == 0 && extrasDefault.FolderStackFiles.Count == 0,
         "Extras settings must have expected defaults.");
     var extrasCustom = new BarSettings
@@ -254,6 +261,8 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
         NowPlayingApps = ["spotify.exe"],
         ShowFolderStacks = true,
         FolderStackLayout = "column",
+        FolderStackIcon = "color",
+        FolderStackPinned = true,
         FolderStackMax = 24,
         FolderStacks = [@"C:\Users\Demo\Desktop"],
         FolderStackFiles = [@"C:\Users\Demo\Notes.pdf"],
@@ -267,6 +276,8 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
         s => s.NowPlayingMotion = "subtle", s => s.NowPlayingRhythm = "loop", s => s.NowPlayingAppMode = "allow",
         s => s.NowPlayingApps = ["a.exe"],
         s => s.ShowFolderStacks = true, s => s.FolderStackLayout = "column",
+        s => s.FolderStackIcon = "color",
+        s => s.FolderStackPinned = true,
         s => s.FolderStackMax = 10, s => s.FolderStacks = [@"D:\Work"], s => s.FolderStackFiles = [@"D:\Notes.pdf"],
     })
     {
@@ -488,7 +499,8 @@ for (int i = 0; i < cases.Count; i++)
     if (label == "v2:no-migration") Require(!cs["notifyListener"]!.GetValue<bool>(), "v2 must apply notifyListener=false.");
 }
 
-string xamlCs = File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "MainWindow.xaml.cs"));
+string xamlCs = File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "MainWindow.xaml.cs")) +
+                File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "MainWindow.Sliders.cs"));
 var sliderMatches = SliderRegex().Matches(xamlCs);
 var schemaSliders = schemaKeys.Where(kv => kv.Value!["sliderProp"] != null)
     .ToDictionary(kv => kv.Value!["sliderProp"]!.GetValue<string>(), kv => (kv.Key, Spec: kv.Value!.AsObject()));
@@ -777,6 +789,12 @@ finally
 }
 {
     // 1. SettingsSession: edit during reconnect GetAsync() await must survive
+    var importSession = new SettingsSession();
+    importSession.ApplyInitialState(new BarSettings { Height = 60 }, new BarSettings { Height = 60 }, "inst-9", 1);
+    importSession.Import(new BarSettings { Height = 90, FolderStackPinned = true });
+    Require(importSession.Draft.Height == 90 && importSession.Draft.FolderStackPinned &&
+            importSession.Saved.Height == 60 && importSession.HasUnsavedChanges,
+        "An imported file must replace the draft and read as unsaved.");
     var session = new SettingsSession();
     session.ApplyInitialState(new BarSettings { Height = 60, Margin = 10 }, new BarSettings { Height = 60, Margin = 10 }, "inst-1", 1);
     long draftBeforeReconnect = session.DraftVersion;

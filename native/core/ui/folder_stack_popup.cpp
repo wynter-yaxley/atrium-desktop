@@ -314,7 +314,7 @@ bool FolderStackPopup::Message(UINT m, WPARAM w, LPARAM l, LRESULT&)
         surface_.Hide(false); // the fan has gathered: nothing left to animate
         return true;
     case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE)
+        if (LOWORD(w) == WA_INACTIVE && !pinned_)
             Close();
         return false;
     case WM_MOUSEMOVE: {

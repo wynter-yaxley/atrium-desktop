@@ -38,7 +38,7 @@ void AddRoundedSquare(ID2D1GeometrySink* sink, D2D1_RECT_F r, const float (&radi
 } // namespace
 
 bool BarExtrasPainter::Draw(const std::wstring& key, ID2D1DeviceContext2* d2d, D2D1_RECT_F r, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink, float opacity,
-                            const MusicBars& bars)
+                            const MusicBars& bars, bool folderStackColor)
 {
     D2D1_COLOR_F faded = ink;
     faded.a *= opacity;
@@ -48,9 +48,11 @@ bool BarExtrasPainter::Draw(const std::wstring& key, ID2D1DeviceContext2* d2d, D
         DrawLaunchpad(d2d, r, brush, faded);
     else if (key == L"#music")
         DrawMusic(d2d, r, bars, brush, faded);
-    else if (key == L"#stacks")
+    else if (key == L"#stacks") {
+        if (!folderStackColor)
+            return false; // the ink outline is the settings' own folder glyph, drawn by the glyph path
         DrawStacks(d2d, r, brush, faded);
-    else
+    } else
         return false;
     return true;
 }
@@ -128,53 +130,47 @@ void BarExtrasPainter::DrawMusic(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, const 
 
 void BarExtrasPainter::DrawStacks(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink)
 {
+    // The reference logo's folder, filled in macOS blue and as large as the apps beside it.
+    const D2D1_RECT_F box = Square(r, 1.f);
+    const float s = box.right - box.left;
+    auto at = [&](float u, float v) { return D2D1::Point2F(box.left + u * s, box.top + v * s); };
     winrt::com_ptr<ID2D1Factory> factory;
     d2d->GetFactory(factory.put());
-    const D2D1_RECT_F box = Square(r, 0.74f);
-    const float s = box.right - box.left, stroke = std::max(1.f, s * 0.075f);
-    auto at = [&](float u, float v) { return D2D1::Point2F(box.left + u * s, box.top + v * s); };
-    // The front folder: a body with a tab rising at its top left, rounded at every corner.
     winrt::com_ptr<ID2D1PathGeometry> folder;
     winrt::com_ptr<ID2D1GeometrySink> sink;
-    if (FAILED(factory->CreatePathGeometry(folder.put())) || FAILED(folder->Open(sink.put())))
+    if (!factory || FAILED(factory->CreatePathGeometry(folder.put())) || FAILED(folder->Open(sink.put())))
         return;
-    const float rr = 0.07f;
-    sink->BeginFigure(at(0.f, 0.34f + rr), D2D1_FIGURE_BEGIN_FILLED);
-    sink->AddLine(at(0.f, 1.f - rr));
-    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.f, 1.f), at(rr, 1.f)));
-    sink->AddLine(at(0.86f - rr, 1.f));
-    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.86f, 1.f), at(0.86f, 1.f - rr)));
-    sink->AddLine(at(0.86f, 0.42f + rr));
-    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.86f, 0.42f), at(0.86f - rr, 0.42f)));
-    sink->AddLine(at(0.43f, 0.42f));
-    sink->AddLine(at(0.34f, 0.26f));
-    sink->AddLine(at(rr, 0.26f));
-    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.f, 0.26f), at(0.f, 0.26f + rr)));
+    const float rt = 0.07f, rb = 0.12f; // the tab's and body's corners, as the reference logo
+    sink->BeginFigure(at(0.02f, 0.12f + rt), D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.02f, 0.12f), at(0.02f + rt, 0.12f)));
+    sink->AddLine(at(0.44f - rt, 0.12f));
+    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.44f, 0.12f), at(0.44f, 0.12f + rt)));
+    sink->AddLine(at(0.44f, 0.26f));
+    sink->AddLine(at(0.98f - rb, 0.26f));
+    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.98f, 0.26f), at(0.98f, 0.26f + rb)));
+    sink->AddLine(at(0.98f, 0.92f - rb));
+    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.98f, 0.92f), at(0.98f - rb, 0.92f)));
+    sink->AddLine(at(0.02f + rb, 0.92f));
+    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(0.02f, 0.92f), at(0.02f, 0.92f - rb)));
     sink->EndFigure(D2D1_FIGURE_END_CLOSED);
     if (FAILED(sink->Close()))
         return;
-    // The folder behind: only its top and right edges show, up and to the right of the front one.
-    winrt::com_ptr<ID2D1PathGeometry> behind;
-    sink = nullptr;
-    if (FAILED(factory->CreatePathGeometry(behind.put())) || FAILED(behind->Open(sink.put())))
-        return;
-    sink->BeginFigure(at(0.30f, 0.12f), D2D1_FIGURE_BEGIN_HOLLOW);
-    sink->AddLine(at(1.f - rr, 0.12f));
-    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(at(1.f, 0.12f), at(1.f, 0.12f + rr)));
-    sink->AddLine(at(1.f, 0.84f));
-    sink->EndFigure(D2D1_FIGURE_END_OPEN);
-    if (FAILED(sink->Close()))
-        return;
-    winrt::com_ptr<ID2D1StrokeStyle> round;
-    const auto props = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
-    if (FAILED(factory->CreateStrokeStyle(props, nullptr, 0, round.put())))
-        return;
-    brush->SetColor(ink);
-    d2d->DrawGeometry(folder.get(), brush, stroke, round.get());
-    D2D1_COLOR_F back = ink;
-    back.a *= 0.55f;
-    brush->SetColor(back);
-    d2d->DrawGeometry(behind.get(), brush, stroke, round.get());
+    if (!folderBlue_) {
+        D2D1_GRADIENT_STOP stops[] = {{0.f, D2D1::ColorF(0x8FD3FF)}, {0.55f, D2D1::ColorF(0x4A9BF5)}, {1.f, D2D1::ColorF(0x1F6FE0)}};
+        winrt::com_ptr<ID2D1GradientStopCollection> coll;
+        if (FAILED(d2d->CreateGradientStopCollection(stops, 3, coll.put())) ||
+            FAILED(d2d->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({}, {}), coll.get(), folderBlue_.put())))
+            return;
+    }
+    ID2D1LinearGradientBrush* grad = folderBlue_.get();
+    grad->SetStartPoint(at(0.06f, 0.20f));
+    grad->SetEndPoint(at(0.94f, 0.92f));
+    grad->SetOpacity(std::clamp(ink.a, 0.f, 1.f));
+    d2d->FillGeometry(folder.get(), grad);
+    // A lit top edge, as the apps' icons have on the glass.
+    brush->SetColor(D2D1::ColorF(1, 1, 1, 0.20f * std::clamp(ink.a, 0.f, 1.f)));
+    const float x0 = at(0.06f, 0).x, x1 = at(0.94f, 0).x, y0 = at(0, 0.28f).y, y1 = at(0, 0.36f).y;
+    d2d->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y0, x1, y1), (y1 - y0) / 2, (y1 - y0) / 2), brush);
 }
 
 } // namespace atrium

@@ -388,7 +388,7 @@ void Bar::BuildLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m)
                                      {kStatusKey, m.statusW, L"", m.showStatus},
                                      {kImeKey, m.plate, L"", m.showIme},
                                      {kTrayKey, m.plate, L"\uE70E", m.showTray},
-                                     {kStacksKey, m.plate, L"", m.showStacks}}};
+                                     {kStacksKey, m.plate, L"\uE8B7", m.showStacks}}}; // the settings' own folder symbol
     for (auto& e : right)
         e.left = rightSlot(e.width, e.shown);
     const int rightLeft = m.rightCount ? cursor + m.gap : m.insetX + m.barW - m.pad;
@@ -443,6 +443,7 @@ void Bar::BuildLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m)
     scene.separatorX = m.rightCount ? float(rightLeft - m.sepGap) : -1;
     scene.status = status_;
     scene.statusIcons = settings_.statusStyle == L"icons";
+    scene.folderStackColor = settings_.folderStackIcon != L"mono";
     PlaceRight(scene, right, EntryMetrics{m.plate, m.gap, m.icon, hitTop, hitBottom, m.insetX + m.barW, plateTop, iconTop}, m.timePx, m.datePx);
     if (!scene.hoverKey.empty() && std::ranges::none_of(hits_, [&](const Hit& h) { return h.key == scene.hoverKey; }))
         scene.hoverKey.clear(); // the hovered app went away

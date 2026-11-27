@@ -274,11 +274,13 @@ std::vector<Notice> DiffWeChatRows(const std::vector<std::pair<std::wstring, WeC
     return events;
 }
 
-int SumWeChatUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, bool blockOfficial)
+int SumWeChatUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows)
 {
     int total = 0;
+    // Official accounts publish in bulk (a service account may hold 349 at once): that is not the
+    // user's mail, so the badge never counts them however the card switch is set.
     for (const auto& [key, r] : rows) {
-        if (!r.muted && !r.collapsed && !(blockOfficial && r.official) && r.unread > 0)
+        if (!r.muted && !r.collapsed && !r.official && r.unread > 0)
             total += r.unread;
     }
     return total;
@@ -714,7 +716,7 @@ void WeChatSource::Run()
                     state = fromHeld ? 3 : 2;
                     reading_ = true;
                     UpdateUnread(rows, baseline, blockOfficial_, postCards_, exe, notify_, msg_, states);
-                    const int total = SumWeChatUnread(rows, blockOfficial_);
+                    const int total = SumWeChatUnread(rows);
                     if (unread_.exchange(total) != total && badgeMsg_)
                         PostMessageW(notify_, badgeMsg_, WPARAM(total), 0);
                     baseline = true;

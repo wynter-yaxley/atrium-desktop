@@ -105,6 +105,8 @@ GlassParams ParamsFor(const Settings& s, float scale, float insetDip)
     p.tintA = 1;
     p.highlight = float(s.highlight);
     p.shadow = float(s.shadow);
+    p.edgeSoftness = float(s.edgeSoftness);
+    p.edgeLightBoost = float(s.edgeLightBoost);
     p.lightX = -0.6f;
     p.lightY = -0.8f;
     p.inset = insetDip * scale;

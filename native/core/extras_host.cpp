@@ -140,6 +140,7 @@ void ExtrasHost::Apply(const Settings& s, float radius)
     lastFolderStacks_ = s.folderStacks;
     lastFolderStackFiles_ = s.folderStackFiles;
     stacks_.SetOptions(s.folderStackLayout != L"column", size_t(s.folderStackMax));
+    stacks_.SetPinned(s.folderStackPinned);
     if (stacksChanged)
         stackModel_.SetFolders(stacksOn_ ? s.folderStacks : std::vector<std::wstring>{}, stacksOn_ ? s.folderStackFiles : std::vector<std::wstring>{},
                                96); // read once at a size every scale draws from

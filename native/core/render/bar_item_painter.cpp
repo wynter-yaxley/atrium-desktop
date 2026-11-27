@@ -314,9 +314,12 @@ void BarPainter::DrawItem(ID2D1DeviceContext2* d2d, const BarScene& scene, const
         d2d->SetTransform(D2D1::Matrix3x2F::Identity());
         return;
     }
-    if (extras_.Draw(it.key, d2d, iconArea, brush, ink, m.appear, music_)) {
+    if (extras_.Draw(it.key, d2d, iconArea, brush, ink, m.appear, music_, scene.folderStackColor)) {
     } else if (!it.glyph.empty()) {
-        if (IDWriteTextFormat* f = Format(size * 0.62f, DWRITE_FONT_WEIGHT_NORMAL, IconFontFamily())) {
+        // The stack's folder is the settings' own symbol, drawn as large as an app icon; the other
+        // entries keep the smaller bar size.
+        const float glyphSize = size * (it.key == L"#stacks" ? 0.95f : 0.62f);
+        if (IDWriteTextFormat* f = Format(glyphSize, DWRITE_FONT_WEIGHT_NORMAL, IconFontFamily())) {
             brush->SetColor(ink);
             d2d->DrawText(it.glyph.c_str(), UINT32(it.glyph.size()), f, iconArea, brush);
         }

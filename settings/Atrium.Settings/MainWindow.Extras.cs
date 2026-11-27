@@ -23,8 +23,8 @@ public sealed partial class MainWindow
     private Border? _npStage, _stStage, _lpStage;
     private Canvas? _npCanvas, _stCanvas, _lpCanvas;
     private ModuleScene? _npScene, _stScene, _lpScene;
-    private ToggleTile? _launchpadSwitch, _npSwitch, _npPausedSwitch, _stSwitch;
-    private SegmentTrack? _lpLayout, _lpMaterial, _npMotion, _npRhythm, _stLayout, _stMax;
+    private ToggleTile? _launchpadSwitch, _npSwitch, _npPausedSwitch, _stSwitch, _stPinned;
+    private SegmentTrack? _lpLayout, _lpMaterial, _npMotion, _npRhythm, _stLayout, _stIcon, _stMax;
     private StackPanel? _stList, _stFileList;
     private TextBlock? _stCount, _stFileCount;
     private bool _pickingStack;
@@ -145,11 +145,14 @@ public sealed partial class MainWindow
     {
         _stSwitch = Toggle("Show on the taskbar", "Show file stacks",
             "Left of the tray: a click fans out the folders added here, a click on one opens it.", (s, on) => s.ShowFolderStacks = on);
+        _stPinned = Toggle("Pinned open", "Keep the file stack open",
+            "The expanded stack stays open when you click elsewhere; a second click on its entry closes it.", (s, on) => s.FolderStackPinned = on);
         _stLayout = Segments("stacklayout", [("Fan", "fan"), ("List", "column")], tag => CurrentSettings.FolderStackLayout = tag);
+        _stIcon = Segments("stackicon", [("Colorful", "color"), ("Mono", "mono")], tag => CurrentSettings.FolderStackIcon = tag);
         var invariant = System.Globalization.CultureInfo.InvariantCulture;
         _stMax = Segments("stackmax", [.. StackMaxima.Select(n => (n.ToString(System.Globalization.CultureInfo.CurrentCulture), n.ToString(invariant)))],
             tag => CurrentSettings.FolderStackMax = int.Parse(tag, System.Globalization.CultureInfo.InvariantCulture));
-        return Side("File Stacks", _stSwitch, Row("Opens as", _stLayout), Row("Shows at most", _stMax));
+        return Side("File Stacks", _stSwitch, _stPinned, Row("Opens as", _stLayout), Row("Icon", _stIcon), Row("Shows at most", _stMax));
     }
 
     // The folders and files, under the picture as the taskbar's pinned apps are under theirs: a
@@ -274,7 +277,9 @@ public sealed partial class MainWindow
         Check(_npRhythm, s.NowPlayingRhythm == "loop" ? "loop" : "live");
         RefreshPlayers();
         _stSwitch?.IsOn = s.ShowFolderStacks;
+        _stPinned?.IsOn = s.FolderStackPinned;
         Check(_stLayout, s.FolderStackLayout == "column" ? "column" : "fan");
+        Check(_stIcon, s.FolderStackIcon == "color" ? "color" : "mono");
         int max = StackMaxima.MinBy(n => Math.Abs(n - s.FolderStackMax));
         Check(_stMax, max.ToString(System.Globalization.CultureInfo.InvariantCulture));
         FillStackList(isFile: false);

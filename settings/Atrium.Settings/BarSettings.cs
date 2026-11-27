@@ -5,32 +5,21 @@ using System.Text.Json.Nodes;
 
 namespace Atrium.Settings;
 
-// One pinned app of the bar. Either Path (.lnk / .exe) or Aumid identifies it.
-internal sealed record PinnedApp(string Name, string Path, string Args, string Aumid, bool? MultipleWindows = null)
-{
-    public bool AllowsMultipleWindows(string? resolvedPath = null)
-    {
-        if (MultipleWindows is bool multiple) return multiple;
-        string exe = System.IO.Path.GetFileNameWithoutExtension(resolvedPath ?? Path).ToLowerInvariant();
-        return exe is "explorer" or "chrome" or "msedge" or "firefox" or "brave" or "opera" or "vivaldi" or "chromium" ||
-               Aumid.Equals("Microsoft.Windows.Explorer", StringComparison.OrdinalIgnoreCase);
-    }
-}
-
 // Mirrors native/core/settings.h (same keys, ranges and presets). Lengths in DIP.
 internal sealed class BarSettings
 {
     public const int CurrentVersion = 2;
-
     public string Preset { get; set; } = "liquid";
     public double Transparency { get; set; } = 0.95;
     public double CornerRadius { get; set; } = 30;
     public double Blur { get; set; } = 0.50;
-    public double Refraction { get; set; } = 30;
-    public double Edge { get; set; } = 24;
+    public double Refraction { get; set; } = 39;
+    public double Edge { get; set; } = 10;
     public double Dispersion { get; set; } = 0.30;
-    public double Highlight { get; set; } = 0.80;
-    public double Shadow { get; set; } = 0.30;
+    public double Highlight { get; set; } = 0.60;
+    public double Shadow { get; set; } = 0.10;
+    public double EdgeSoftness { get; set; } = 2.0;   // the rim's coverage transition, in px
+    public double EdgeLightBoost { get; set; } = 0.8;  // extra rim width over light content
     public uint Tint { get; set; } = 0xFFFFFF;
     public double Width { get; set; } = 1200;
     public double Height { get; set; } = 60;
@@ -70,6 +59,8 @@ internal sealed class BarSettings
     public List<string> NowPlayingApps { get; set; } = [];
     public bool ShowFolderStacks { get; set; }
     public string FolderStackLayout { get; set; } = "fan";   // fan | column
+    public string FolderStackIcon { get; set; } = "mono";   // mono (one ink outline, as the other entries) | color (macOS-blue folder)
+    public bool FolderStackPinned { get; set; }  // the expanded stack stays open until its entry is clicked again
     public int FolderStackMax { get; set; } = 8;
     public List<string> FolderStacks { get; set; } = [];
     public List<string> FolderStackFiles { get; set; } = [];
@@ -197,6 +188,8 @@ internal sealed class BarSettings
             ["dispersion"] = Dispersion,
             ["highlight"] = Highlight,
             ["shadow"] = Shadow,
+            ["edgeSoftness"] = EdgeSoftness,
+            ["edgeLightBoost"] = EdgeLightBoost,
             ["tint"] = "#" + Tint.ToString("X6", CultureInfo.InvariantCulture),
             ["width"] = Width,
             ["height"] = Height,
@@ -231,6 +224,8 @@ internal sealed class BarSettings
             ["nowPlayingAppMode"] = NowPlayingAppMode,
             ["showFolderStacks"] = ShowFolderStacks,
             ["folderStackLayout"] = FolderStackLayout,
+            ["folderStackIcon"] = FolderStackIcon,
+            ["folderStackPinned"] = FolderStackPinned,
             ["folderStackMax"] = (double)FolderStackMax, // as the other numbers: read back as a double in memory too
             ["textColor"] = TextColor,
             ["language"] = Language,
@@ -332,6 +327,8 @@ internal sealed class BarSettings
         s.Dispersion = Math.Clamp(Num("dispersion", f.Dispersion), 0, 0.5);
         s.Highlight = Math.Clamp(Num("highlight", f.Highlight), 0, 1);
         s.Shadow = Math.Clamp(Num("shadow", f.Shadow), 0, 1);
+        s.EdgeSoftness = Math.Clamp(Num("edgeSoftness", f.EdgeSoftness), 0.8, 3.0);
+        s.EdgeLightBoost = Math.Clamp(Num("edgeLightBoost", f.EdgeLightBoost), 0, 1.5);
         s.Width = Math.Clamp(Num("width", f.Width), 200, 4000);
         s.Height = Math.Clamp(Num("height", f.Height), 32, 160);
         s.Margin = Math.Clamp(Num("margin", f.Margin), 0, 400);
@@ -534,6 +531,8 @@ internal sealed class BarSettings
         s.ShowFolderStacks = Flag("showFolderStacks", f.ShowFolderStacks);
         string stackLayout = Str("folderStackLayout", f.FolderStackLayout);
         s.FolderStackLayout = stackLayout == "column" ? "column" : "fan";
+        s.FolderStackIcon = Str("folderStackIcon", f.FolderStackIcon) == "color" ? "color" : "mono";
+        s.FolderStackPinned = Flag("folderStackPinned", f.FolderStackPinned);
         double rawMax = o?["folderStackMax"] is JsonValue mv && mv.TryGetValue(out double mx) && double.IsFinite(mx) ? mx : f.FolderStackMax;
         s.FolderStackMax = (int)Math.Round(Math.Clamp(rawMax, 4, 24), MidpointRounding.AwayFromZero);
         s.FolderStacks = ReadUniquePaths(o, "folderStacks", f.FolderStacks, trimTrailingSlashes: true, 32);
@@ -554,7 +553,8 @@ internal sealed class BarSettings
         NowPlayingShowPaused == o.NowPlayingShowPaused && NowPlayingMotion == o.NowPlayingMotion && NowPlayingRhythm == o.NowPlayingRhythm &&
         NowPlayingAppMode == o.NowPlayingAppMode && NowPlayingApps.SequenceEqual(o.NowPlayingApps, StringComparer.OrdinalIgnoreCase) &&
         ShowFolderStacks == o.ShowFolderStacks &&
-        FolderStackLayout == o.FolderStackLayout && FolderStackMax == o.FolderStackMax &&
+        FolderStackLayout == o.FolderStackLayout && FolderStackIcon == o.FolderStackIcon && FolderStackPinned == o.FolderStackPinned &&
+        FolderStackMax == o.FolderStackMax &&
         FolderStacks.SequenceEqual(o.FolderStacks, StringComparer.OrdinalIgnoreCase) &&
         FolderStackFiles.SequenceEqual(o.FolderStackFiles, StringComparer.OrdinalIgnoreCase) &&
         TextColor == o.TextColor && Language == o.Language && AutoHide == o.AutoHide &&
@@ -586,7 +586,7 @@ internal sealed class BarSettings
 
     public bool SameMaterial(BarSettings o) =>
         Transparency == o.Transparency && Blur == o.Blur && Refraction == o.Refraction && Edge == o.Edge && Dispersion == o.Dispersion &&
-        Highlight == o.Highlight && Shadow == o.Shadow && Tint == o.Tint;
+        Highlight == o.Highlight && Shadow == o.Shadow && EdgeSoftness == o.EdgeSoftness && EdgeLightBoost == o.EdgeLightBoost && Tint == o.Tint;
 }
 
 internal static class SettingsPersistence

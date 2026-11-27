@@ -54,6 +54,15 @@ internal sealed class SettingsSession
         DraftVersion++;
     }
 
+    // A settings file from another computer replaces the draft. The saved baseline and the revision
+    // stay, so the window shows unsaved changes that a save then commits.
+    public void Import(BarSettings imported)
+    {
+        if (Closed) return;
+        Draft = imported.Clone();
+        DraftVersion++;
+    }
+
     public void Close() => Closed = true;
 
     public bool ApplyInitialState(

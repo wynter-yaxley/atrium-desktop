@@ -143,7 +143,7 @@ public sealed partial class MainWindow
         else if (_pinOverflowShown)
         {
             _pinOverflowShown = false;
-            Status.IsOpen = false;
+            HideStatus();
         }
     }
 

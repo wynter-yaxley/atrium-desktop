@@ -32,7 +32,8 @@ cbuffer GlassParams : register(b0)
     float4 Wave;        // Dock hover: centre x, support half width, upward height, unused (px)
     float4 FromArea;    // EdgeFrame::FromAreaMatrix: _11, _12, _21, _22
     float2 FromAreaOffset; // _31, _32
-    float2 Pad2;
+    float EdgeSoftness; // the rim's transition width in px
+    float EdgeLightBoost; // extra width over light content, where the shadow marks the rim
 };
 
 Texture2D Bg : register(t0);
@@ -97,8 +98,21 @@ float sdCorner(float2 q, float r, float a)
     return (n - r) * dot(v, derivative) / length(derivative);
 }
 
+// A pill's end is a half circle: the exact rounded-rectangle distance has a unit
+// gradient everywhere there, so its coverage anti-aliases cleanly. The implicit G3
+// field loses that precision where a corner meets a straight side (a pill has none
+// between its ends), which showed as a hard, ragged rim.
+float sdRoundRectExact(float2 p, float2 b, float r)
+{
+    float2 q = abs(p) - b + r;
+    return length(max(q, 0)) + min(max(q.x, q.y), 0) - r;
+}
+
 float sdRoundRect(float2 p, float2 b, float r, bool edge)
 {
+    r = clamp(r, 0, min(b.x, b.y));
+    if (r >= min(b.x, b.y) - 0.01)
+        return sdRoundRectExact(p, b, r);
     float2 profile = cornerProfile(b, r);
     float2 q = abs(p) - b + profile.x;
     return edge ? cornerEdge(q, profile) : sdCorner(q, profile.x, profile.y);
@@ -109,7 +123,9 @@ float sdRoundRect4(float2 p, float2 b, float4 r, bool edge)
 {
     float rr = p.x < 0 ? (p.y < 0 ? r.x : r.w) : (p.y < 0 ? r.y : r.z);
     rr = min(rr, min(b.x, b.y));
-    return sdRoundRect(p, b, rr, edge);
+    float2 profile = cornerProfile(b, rr);
+    float2 q = abs(p) - b + profile.x;
+    return edge ? cornerEdge(q, profile) : sdCorner(q, profile.x, profile.y);
 }
 
 // Smooth minimum: two shapes melt where they come within k px of each other.
@@ -195,6 +211,26 @@ float ShapeDistance(float2 px, bool edge, bool basic)
 
 float Dist(float2 px, bool basic) { return ShapeDistance(px, false, basic); }
 
+// Coverage at the rim: away from it one sample decides; along it the pixel is resolved on a 4x4
+// grid, so a tilted capsule's edge steps by a sixteenth of a pixel instead of a whole one. Both
+// share the same transition width, so the rim reads soft all the way round.
+float EdgeCoverage(float2 px, bool basic, float edgeDistance, float aa)
+{
+    if (abs(edgeDistance) > aa * 0.75)
+        return saturate(0.5 - edgeDistance / aa);
+    const int n = 4;
+    float sum = 0;
+    [unroll] for (int j = 0; j < n; ++j)
+    {
+        [unroll] for (int k = 0; k < n; ++k)
+        {
+            const float2 sub = px + (float2(float(k), float(j)) + 0.5) / float(n) - 0.5;
+            sum += saturate(0.5 - ShapeDistance(sub, true, basic) / aa);
+        }
+    }
+    return sum * (1.0 / float(n * n));
+}
+
 float3 bg(float2 px, float lod) { return Bg.SampleLevel(Linear, (px + RoiOrigin) / RoiSize, lod).rgb; }
 
 float3 blurred(float2 px)
@@ -223,11 +259,12 @@ float4 PSImpl(VSOut i, bool basic)
     float2 px = i.uv * Size;
     float d = Dist(px, basic);
 
-    // Soft drop shadow outside the shape.
+    // Soft drop shadow outside the shape. A wider falloff than before keeps the shadow from sitting
+    // at full strength right against the rim, where it turns the coverage transition into a cliff.
     float shadowA = 0;
     if (d >= 0) {
         float ds = Dist(px - float2(0, Inset * 0.25), basic);
-        shadowA = Shadow * exp(-max(ds, 0) / max(Inset * 0.35, 1));
+        shadowA = Shadow * exp(-max(ds, 0) / max(Inset * 0.45, 1));
     }
 
     // The implicit edge distance is exact only near the outline: where a corner
@@ -235,14 +272,24 @@ float4 PSImpl(VSOut i, bool basic)
     // neighbours, and fwidth would leave a half-covered line there. Past 2 px in
     // the shape is plainly covered.
     float edgeDistance = ShapeDistance(px, true, basic);
-    float aa = max(fwidth(edgeDistance), 1e-3);
-    float cov = d < -2 ? 1 : saturate(0.5 - edgeDistance / aa);
+    // Over light content the glass reflects almost white, so only the shadow marks the rim; there the
+    // transition grows by EdgeLightBoost. A strong shadow raises the edge's contrast just as much, so
+    // it widens the transition too (Shadow). All are settings, tuned from the material page.
+    float backdropLuma = dot(bg(px, BlurLod), float3(0.2126, 0.7152, 0.0722));
+    // The slider follows a squared curve through its 200% default: that point stays as it was, while
+    // the ends move apart (0.32 px at 0%, 4.5 px at 300%), so the whole travel is felt. The shadow's
+    // share is halved so it cannot dilute the slider.
+    float softness = EdgeSoftness * EdgeSoftness * 0.5;
+    float aa = clamp(fwidth(edgeDistance) * (softness + EdgeLightBoost * smoothstep(0.35, 0.55, backdropLuma) + Shadow * 0.4), 0.3, 6.0);
+    float cov = d < -2 ? 1 : EdgeCoverage(px, basic, edgeDistance, aa);
     float keep = saturate(1 - Fade);
     shadowA *= keep;
     if (cov <= 0)
         return float4(0, 0, 0, shadowA);
 
-    float e = 1.0;
+    // A wider step steadies the normal along a tilted rim: one pixel jumps between neighbours there,
+    // and the rim's highlight would follow the jump as specks.
+    float e = 1.5;
     float2 g = float2(Dist(px + float2(e, 0), basic) - Dist(px - float2(e, 0), basic), Dist(px + float2(0, e), basic) - Dist(px - float2(0, e), basic));
     float gl = length(g);
     float2 n = gl > 1e-5 ? g / gl : float2(0, 0);
@@ -285,7 +332,9 @@ float4 PSImpl(VSOut i, bool basic)
     // a softer glow just inside it, and a faint sheen from the top.
     float lit = saturate(dot(n, LightDir));
     float back = saturate(dot(n, -LightDir));
-    float rimLine = 1 - smoothstep(0.0, 1.6, depth);
+    // Wider than a pixel and a half, so a tilted rim's highlight spans several samples instead of
+    // speckling along the coverage steps.
+    float rimLine = 1 - smoothstep(0.0, 2.4, depth);
     float glow = saturate(1 - depth / (Edge * 1.6));
     col += Highlight * rimLine * (0.22 + 0.78 * lit + 0.35 * back);
     col += Highlight * glow * glow * lit * 0.16;

@@ -25,11 +25,15 @@ struct Settings {
     std::wstring preset = L"liquid"; // liquid | frosted | custom (informational)
     double transparency = 0.95;      // 0 = fully tinted, 1 = clear glass
     double blur = 0.50;              // 0 = sharp backdrop, 1 = fully frosted
-    double refraction = 30;          // max sample displacement at the rim
-    double edge = 24;                // width of the refracting rim
+    double refraction = 39;          // max sample displacement at the rim
+    double edge = 10;                // width of the refracting rim
     double dispersion = 0.30;        // relative channel spread of the refraction
-    double highlight = 0.80;
-    double shadow = 0.30;
+    double highlight = 0.60;
+    double shadow = 0.10;
+    // The rim's coverage transition in px, and how much wider it grows over light content (where the
+    // shadow is the only rim signal). Tunable from the material page.
+    double edgeSoftness = 2.0;
+    double edgeLightBoost = 0.8;
     uint32_t tint = 0xFFFFFF;        // 0xRRGGBB
 
     // Layout and content.
@@ -73,6 +77,12 @@ struct Settings {
     std::vector<std::wstring> nowPlayingApps;  // AUMIDs or exe names (max 64)
     bool showFolderStacks = false;   // the folder stack entry left of the tray
     std::wstring folderStackLayout = L"fan";   // fan | column
+    // The stack entry's own icon: mono (one outline in the bar's ink, as the other entries) |
+    // color (a folder in macOS blue, as large as the apps).
+    std::wstring folderStackIcon = L"mono";
+    // The expanded stack stays open when the user clicks elsewhere: only a second click on its entry
+    // closes it (false: losing the focus closes it, as the other popups).
+    bool folderStackPinned = false;
     int folderStackMax = 8;          // 4..24
     std::vector<std::wstring> folderStacks;    // folder paths (max 32)
     std::vector<std::wstring> folderStackFiles; // file paths (max 32)

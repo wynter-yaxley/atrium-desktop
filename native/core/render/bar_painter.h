@@ -55,6 +55,8 @@ struct BarScene {
     std::vector<SceneItem> extras; // Atrium logo (#start), overflow (#more), tray (#tray), status (#status), notifications (#notify)
     SystemStatus status;           // drawn by the #status entry
     bool statusIcons = false;      // as the Windows taskbar's three icons rather than the ring (statusStyle)
+    // The folder stack entry (#stacks): a filled macOS-blue folder (true) or one outline in the ink.
+    bool folderStackColor = true;
     // The input method entry (#ime): the foreground window's input (中/あ/가, a/A), fading in over
     // the glyph before it since imeMs (ClockMs).
     std::wstring imeGlyph, imePrevGlyph;

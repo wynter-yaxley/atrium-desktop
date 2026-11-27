@@ -39,7 +39,7 @@ struct WeChatRow {
     int unread = 0;
     bool muted = false;
     bool collapsed = false;
-    bool official = false; // the official accounts' row (公众号, 订阅号, 服务号): wechatBlockOfficial leaves it out
+    bool official = false; // the official accounts' row (公众号, 订阅号, 服务号): never in the badge; wechatBlockOfficial governs the cards
 };
 
 struct WeChatChatState {
@@ -56,7 +56,9 @@ WeChatRow ParseWeChatRow(const std::wstring& name, const std::wstring& fallbackT
 bool MatchesWeChatCellName(const std::wstring& cellName, const std::wstring& chat);
 std::vector<Notice> DiffWeChatRows(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, bool baseline, bool blockOfficial,
                                    std::map<std::wstring, WeChatChatState>& states);
-int SumWeChatUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, bool blockOfficial);
+// The badge counts chats only: the official accounts' bulk unread (a service account's 349) never
+// becomes the taskbar's; wechatBlockOfficial governs the cards, not this sum.
+int SumWeChatUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows);
 
 enum class WeChatBusyState { None, Foreground, ForegroundShown, Dialog };
 

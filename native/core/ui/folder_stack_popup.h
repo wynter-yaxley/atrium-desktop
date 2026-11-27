@@ -38,6 +38,8 @@ public:
         fan_ = fan;
         maxVisible_ = maxVisible;
     }
+    // folderStackPinned: losing the focus leaves the stack open; a second click on its entry closes it.
+    void SetPinned(bool on) { pinned_ = on; }
     void SetRadius(float dip)
     {
         radius_ = dip;
@@ -68,6 +70,7 @@ private:
     StackPlacement place_;
     RECT entry_{}, bar_{};
     bool fan_ = true;
+    bool pinned_ = false;
     size_t maxVisible_ = 8;
     float radius_ = 24;
     int hover_ = -1, pressed_ = -1, sel_ = -1;
