@@ -1,11 +1,11 @@
 // The media session's player as an app: its window brought forward, its name as the shell shows it.
 #include "shell/media_app.h"
 
+#include "shell/shell_launch.h"
 #include "shell/task_rules.h"
 #include "win32_path.h"
 
 #include <dwmapi.h>
-#include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <tlhelp32.h>
@@ -129,31 +129,28 @@ void ActivatePlayerApp(const std::wstring& appId)
             SwitchToThisWindow(hwnd, TRUE);
         return;
     }
-    if (hasBang) {
-        winrt::com_ptr<IApplicationActivationManager> aam;
-        DWORD pid = 0;
-        if (SUCCEEDED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(aam.put()))) && aam &&
-            SUCCEEDED(aam->ActivateApplication(appId.c_str(), nullptr, AO_NONE, &pid)))
-            return;
-    }
     std::wstring target = isPackaged ? std::wstring{} : FindRunningProcessImage(ctx.targetFolded, ctx.targetStem);
     if (FoldCase(target).find(L"\\windowsapps\\") != std::wstring::npos)
         target.clear();
+    LaunchRequest req;
     if (target.empty()) {
-        if (hasBang)
-            target = L"shell:AppsFolder\\" + appId;
-        else if (isPackaged)
+        if (hasBang) {
+            req.target = appId;
+            req.kind = LaunchTargetKind::AppUserModelId;
+        } else if (isPackaged) {
             return;
-        else
-            target = appId;
+        } else {
+            req.target = appId;
+            req.kind = LaunchTargetKind::Executable;
+        }
+    } else {
+        req.target = target;
+        req.kind = LaunchTargetKind::Executable;
     }
-    SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
-    sei.lpVerb = L"open";
-    sei.lpFile = target.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    ShellExecuteExW(&sei);
+    req.verb = L"open";
+    req.privilege = LaunchPrivilege::ShellDefault;
+    req.noAsync = true;
+    ShellLaunch(req);
 }
 
 std::wstring ResolveAppName(const std::wstring& appId, std::unordered_map<std::wstring, std::wstring>& cache)

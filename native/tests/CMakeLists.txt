@@ -228,3 +228,12 @@ add_test(NAME app_catalog_rules COMMAND app_catalog_rules_tests)
 add_executable(genie_quad_tests genie_quad.cpp)
 target_link_libraries(genie_quad_tests PRIVATE atrium_core_lib)
 add_test(NAME genie_quad COMMAND genie_quad_tests)
+
+add_executable(privilege_lifecycle_tests privilege_lifecycle.cpp)
+target_link_libraries(privilege_lifecycle_tests PRIVATE atrium_core_lib)
+add_test(NAME privilege_lifecycle COMMAND privilege_lifecycle_tests)
+set_tests_properties(privilege_lifecycle PROPERTIES TIMEOUT 20)
+
+add_executable(shell_launch_tests shell_launch.cpp)
+target_link_libraries(shell_launch_tests PRIVATE atrium_core_lib)
+add_test(NAME shell_launch COMMAND shell_launch_tests)

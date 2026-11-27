@@ -1,11 +1,18 @@
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using Microsoft.UI.Xaml;
+using Microsoft.Win32.SafeHandles;
 
 namespace Atrium.Settings;
 
 public partial class App : Application
 {
     private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lparam);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes { public uint Length; public IntPtr SecurityDescriptor; public bool InheritHandle; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ChangeFilterStruct { public uint Size; public uint ExtStatus; }
+
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc proc, IntPtr lparam);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetProp(IntPtr hwnd, string name);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hwnd);
@@ -13,10 +20,14 @@ public partial class App : Application
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint process);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int MessageBox(IntPtr hwnd, string text, string title, uint type);
-    [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ChangeWindowMessageFilterEx(IntPtr hwnd, uint message, uint action, ref ChangeFilterStruct changeFilterStruct);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint revision, out IntPtr sd, out uint size);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateMutexW(ref SecurityAttributes sa, bool initialOwner, string name);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, char[] buffer, ref uint size);
+    [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr hMem);
     internal const string WindowProp = "Atrium.Settings.Window";
     internal const uint OpenPageMessage = 0x8000 + 31;
     internal const uint CloseForUninstallMessage = 0x8000 + 32;
@@ -58,16 +69,14 @@ public partial class App : Application
         Loc.Load(); // also before the single-instance lookup: the title follows the language
         // Single instance: a second launch (tray menu, double click) brings the
         // existing window to the front instead of opening another one.
-        _instance = new Mutex(true, @"Local\Atrium.Settings" + (ThemeOverride == null ? "" : "." + ThemeOverride), out bool created);
-        if (!created)
+        string mutexName = @"Local\Atrium.Settings" + (ThemeOverride == null ? "" : "." + ThemeOverride);
+        if (!TryAcquireInstanceMutex(mutexName, out _instance))
         {
-            _instance.Dispose();
-            _instance = null;
             nint other = FindSettingsWindow();
             if (other != IntPtr.Zero)
             {
                 _ = GetWindowThreadProcessId(other, out uint pid);
-                bool same = string.Equals(ProcessPath(pid), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase);
+                bool same = string.Equals(CoreClient.TryGetProcessPath((int)pid), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase);
                 if (!same)
                 {
                     _ = MessageBox(IntPtr.Zero,
@@ -87,6 +96,7 @@ public partial class App : Application
         try
         {
             CurrentWindow = new MainWindow();
+            AttachWindowLifecycle(CurrentWindow);
             CurrentWindow.Activate();
         }
         catch (Exception e)
@@ -106,6 +116,7 @@ public partial class App : Application
         var old = CurrentWindow;
         old?.ReleaseForReload();
         var window = new MainWindow(page);
+        AttachWindowLifecycle(window);
         CurrentWindow = window;
         window.Activate();
         old?.Close();
@@ -160,17 +171,61 @@ public partial class App : Application
         return found;
     }
 
-    private static string? ProcessPath(uint pid)
+    private static bool TryAcquireInstanceMutex(string name, out Mutex? mutex)
     {
-        nint process = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
-        if (process == IntPtr.Zero) return null;
+        mutex = null;
+        string? sid = WindowsIdentity.GetCurrent().User?.Value;
+        if (!string.IsNullOrEmpty(sid))
+        {
+            // Least-privilege same-user DACL plus Medium integrity label so Medium and Elevated launches coordinate cleanly.
+            string sddl = $"D:P(A;;0x001F0001;;;{sid})(A;;0x001F0001;;;SY)(A;;0x001F0001;;;BA)S:(ML;;NW;;;ME)";
+            if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out IntPtr sd, out _))
+            {
+                try
+                {
+                    var sa = new SecurityAttributes
+                    {
+                        Length = (uint)Marshal.SizeOf<SecurityAttributes>(),
+                        SecurityDescriptor = sd,
+                        InheritHandle = false,
+                    };
+                    IntPtr handle = CreateMutexW(ref sa, true, name);
+                    int err = Marshal.GetLastWin32Error();
+                    if (handle == IntPtr.Zero) return false;
+                    if (err == 183 /* ERROR_ALREADY_EXISTS */) { CloseHandle(handle); return false; }
+                    var sw = new SafeWaitHandle(handle, ownsHandle: true);
+                    mutex = new Mutex(false) { SafeWaitHandle = sw };
+                    return true;
+                }
+                finally { LocalFree(sd); }
+            }
+        }
         try
         {
-            char[] buffer = new char[1024];
-            uint size = (uint)buffer.Length;
-            return QueryFullProcessImageName(process, 0, buffer, ref size) ? new string(buffer, 0, (int)size) : null;
+            var fallback = new Mutex(true, name, out bool created);
+            if (created) { mutex = fallback; return true; }
+            fallback.Dispose();
+            return false;
         }
-        finally { CloseHandle(process); }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    private static void AttachWindowLifecycle(Window window)
+    {
+        window.Closed += (sender, _) =>
+        {
+            if (ReferenceEquals(sender, CurrentWindow))
+            {
+                _instance?.Dispose();
+                _instance = null;
+            }
+        };
+        nint hwnd = WinRT.Interop.WindowNative.GetWindowHandle(window);
+        if (hwnd == IntPtr.Zero) return;
+        const uint MsgFltAllow = 1;
+        var filter = new ChangeFilterStruct { Size = (uint)Marshal.SizeOf<ChangeFilterStruct>() };
+        _ = ChangeWindowMessageFilterEx(hwnd, OpenPageMessage, MsgFltAllow, ref filter);
+        _ = ChangeWindowMessageFilterEx(hwnd, CloseForUninstallMessage, MsgFltAllow, ref filter);
     }
 
     internal static void SignalStartupReady(bool coreReady)

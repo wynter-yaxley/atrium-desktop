@@ -30,6 +30,7 @@ class FeishuSource;
 class GenieMinimize;
 class ImeBubble;
 class ImeWatcher;
+class LifecycleServer;
 class NotificationListener;
 class Notifications;
 class SettingsServer;
@@ -78,6 +79,8 @@ struct AppState {
     ULONGLONG switchedBarAt = 0; // switching displays must not suppress the first popup click
     std::unique_ptr<SystemStatusReader> status;
     std::unique_ptr<SettingsServer> server;
+    std::unique_ptr<LifecycleServer> lifecycle;
+    std::function<bool()> onRestartStandard;
     std::unique_ptr<TaskModel> tasks;
     std::unique_ptr<AppCatalog> catalog;
     std::unique_ptr<StartMenu> start;

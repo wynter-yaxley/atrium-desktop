@@ -6,8 +6,8 @@
 #include "log.h"
 #include "motion.h"
 #include "shell/lunar.h"
+#include "shell/shell_launch.h"
 
-#include <shellapi.h>
 #include <shellscalingapi.h>
 #include <windowsx.h>
 
@@ -26,7 +26,15 @@ D2D1_COLOR_F Alpha(D2D1_COLOR_F c, float a) { return D2D1::ColorF(c.r, c.g, c.b,
 bool In(const D2D1_RECT_F& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 const wchar_t* const kWeekNamesEn[] = {L"M", L"T", L"W", L"T", L"F", L"S", L"S"};
 const wchar_t* WeekHeader(int wd) { return LanguageIsEnglish() ? kWeekNamesEn[wd] : kCalendarWeekNames[wd]; }
-void OpenUri(const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); }
+void OpenUri(const wchar_t* uri)
+{
+    LaunchRequest req;
+    req.target = uri;
+    req.verb = L"open";
+    req.kind = LaunchTargetKind::Uri;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    ShellLaunchAsync(std::move(req));
+}
 
 } // namespace
 

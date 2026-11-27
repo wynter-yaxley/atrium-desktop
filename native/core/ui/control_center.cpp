@@ -2,9 +2,9 @@
 
 #include "clock.h"
 #include "log.h"
+#include "shell/shell_launch.h"
 #include "ui/control_layout.h"
 
-#include <shellapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -46,7 +46,15 @@ struct AudioRead {
 namespace {
 
 bool In(const D2D1_RECT_F& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
-void OpenUri(const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); }
+void OpenUri(const wchar_t* uri)
+{
+    LaunchRequest req;
+    req.target = uri;
+    req.verb = L"open";
+    req.kind = LaunchTargetKind::Uri;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    ShellLaunchAsync(std::move(req));
+}
 
 // Win+K: the system's casting panel (a public shortcut, D11).
 void SendWinK()

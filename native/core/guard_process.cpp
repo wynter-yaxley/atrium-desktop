@@ -2,20 +2,26 @@
 
 #include "log.h"
 #include "settings.h"
+#include "shell/process_integrity.h"
 #include "shell/shell_taskbar.h"
 #include "shell/system_chrome.h"
 
 #include <objbase.h>
 
+#include <atomic>
+#include <cerrno>
+#include <cwchar>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace atrium {
 
 namespace {
 
 constexpr wchar_t kGuardMutex[] = L"Local\\Atrium.Guard"; // held by the guard while it runs
+std::atomic<uint64_t> g_activeGeneration{0};
 
 HWND FindProcessWindow(const wchar_t* className, DWORD pid)
 {
@@ -27,7 +33,84 @@ HWND FindProcessWindow(const wchar_t* className, DWORD pid)
     return nullptr;
 }
 
+uint64_t ParseGenerationText(std::wstring_view text)
+{
+    while (!text.empty() && (text.front() == L' ' || text.front() == L'\t' || text.front() == L'\r' || text.front() == L'\n'))
+        text.remove_prefix(1);
+    while (!text.empty() && (text.back() == L' ' || text.back() == L'\t' || text.back() == L'\r' || text.back() == L'\n'))
+        text.remove_suffix(1);
+    if (text.empty())
+        return 0;
+    for (wchar_t ch : text) {
+        if (ch < L'0' || ch > L'9')
+            return 0;
+    }
+    const std::wstring copy(text);
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long val = std::wcstoull(copy.c_str(), &end, 10);
+    if (errno != 0 || end == copy.c_str() || *end != L'\0')
+        return 0;
+    return static_cast<uint64_t>(val);
+}
+
+HANDLE AcquireGuardMutex()
+{
+    KernelObjectSecurity security = KernelObjectSecurity::CreateSameUserMutex();
+    if (!security.Valid()) {
+        Log(L"guard: could not build security descriptor for guard mutex (%lu)", GetLastError());
+        return nullptr;
+    }
+    HANDLE held = CreateMutexExW(security.Get(), kGuardMutex, CREATE_MUTEX_INITIAL_OWNER, MUTEX_ALL_ACCESS);
+    if (!held) {
+        Log(L"guard: could not create guard mutex (%lu)", GetLastError());
+        return nullptr;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        const DWORD wait = WaitForSingleObject(held, 5000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            Log(L"guard: timed out or failed waiting for guard mutex (%lu, %lu)", wait, GetLastError());
+            CloseHandle(held);
+            return nullptr;
+        }
+    }
+    return held;
+}
+
 } // namespace
+
+std::wstring InstanceGenerationPath()
+{
+    const std::wstring dir = DataDirectory();
+    return dir.empty() ? std::wstring() : (dir + L"\\instance.gen");
+}
+
+uint64_t ReadInstanceGeneration(const std::wstring& path)
+{
+    if (path.empty())
+        return 0;
+    return ParseGenerationText(ReadTextFile(path));
+}
+
+uint64_t AdvanceInstanceGeneration(const std::wstring& path)
+{
+    const uint64_t next = ReadInstanceGeneration(path) + 1;
+    if (!path.empty() && !WriteTextFile(path, std::to_wstring(next)))
+        Log(L"guard: could not persist instance generation %llu (%lu)", static_cast<unsigned long long>(next), GetLastError());
+    g_activeGeneration.store(next);
+    return next;
+}
+
+void SetActiveInstanceGeneration(uint64_t generation) { g_activeGeneration.store(generation); }
+
+uint64_t ActiveInstanceGeneration() { return g_activeGeneration.load(); }
+
+bool ShouldGuardUndoLeftover(uint64_t guardGeneration, uint64_t activeGeneration)
+{
+    if (guardGeneration == 0 || activeGeneration == 0)
+        return true;
+    return activeGeneration <= guardGeneration;
+}
 
 // While Windows' taskbar or its banners are hidden, a second Atrium.exe (`--guard`, RunGuard)
 // watches this one: however it ends (a crash past the exception filter, abort, being killed),
@@ -40,10 +123,14 @@ void EnsureGuard(HANDLE& guard)
         CloseHandle(guard);
         guard = nullptr;
     }
+    uint64_t generation = g_activeGeneration.load();
+    if (generation == 0)
+        generation = AdvanceInstanceGeneration();
     wchar_t exe[MAX_PATH * 2];
     if (!GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe))))
         return;
-    std::wstring command = L"\"" + std::wstring(exe) + L"\" --guard " + std::to_wstring(GetCurrentProcessId()) + DataDirectoryArgs();
+    std::wstring command = L"\"" + std::wstring(exe) + L"\" --guard " + std::to_wstring(GetCurrentProcessId()) + L" --guard-gen " +
+                           std::to_wstring(generation) + DataDirectoryArgs();
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(exe, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
@@ -52,17 +139,14 @@ void EnsureGuard(HANDLE& guard)
     }
     CloseHandle(pi.hThread);
     guard = pi.hProcess;
-    Log(L"guard: started (%lu)", pi.dwProcessId);
+    Log(L"guard: started (%lu, gen %llu)", pi.dwProcessId, static_cast<unsigned long long>(generation));
 }
 
-int RunGuard(DWORD pid, const wchar_t* hostClass)
+int RunGuard(DWORD pid, const wchar_t* hostClass, uint64_t generation)
 {
-    HANDLE held = CreateMutexW(nullptr, TRUE, kGuardMutex);
-    if (held && GetLastError() == ERROR_ALREADY_EXISTS)
-        if (const DWORD wait = WaitForSingleObject(held, 5000); wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
-            CloseHandle(held);
-            held = nullptr;
-        }
+    HANDLE held = AcquireGuardMutex();
+    if (!held)
+        return 1;
     auto release = [](HANDLE h) {
         ReleaseMutex(h);
         CloseHandle(h);
@@ -109,6 +193,12 @@ int RunGuard(DWORD pid, const wchar_t* hostClass)
     DWORD code = 0;
     GetExitCodeProcess(process, &code);
     CloseHandle(process);
+    const uint64_t activeGeneration = ReadInstanceGeneration();
+    if (!ShouldGuardUndoLeftover(generation, activeGeneration)) {
+        Log(L"guard: Atrium (%lu, gen %llu) superseded by gen %llu; skipping chrome undo", pid, static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(activeGeneration));
+        return 0;
+    }
     // A clean exit put everything back (system.json is gone); anything else is put back here.
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         if (SystemChrome::UndoLeftover())

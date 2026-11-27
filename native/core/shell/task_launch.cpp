@@ -1,13 +1,13 @@
 // Task launch, single-instance fallback, window activation, and file opening helpers.
 #include "shell/task_model.h"
 #include "shell/shell_icon.h"
+#include "shell/shell_launch.h"
 #include "shell/task_rules.h"
 
 #include "log.h"
 
 #include <windows.h>
 #include <dwmapi.h>
-#include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
@@ -30,18 +30,6 @@
 namespace atrium::detail {
 
 namespace {
-
-struct ComScope {
-    bool owned;
-    explicit ComScope(DWORD flags = COINIT_APARTMENTTHREADED) : owned(SUCCEEDED(CoInitializeEx(nullptr, flags))) {}
-    ComScope(const ComScope&) = delete;
-    ComScope& operator=(const ComScope&) = delete;
-    ~ComScope()
-    {
-        if (owned)
-            CoUninitialize();
-    }
-};
 
 // Quotes a single command-line argument according to CommandLineToArgvW rules.
 std::wstring QuoteArg(const std::wstring& arg)
@@ -209,7 +197,6 @@ private:
                     continue;
                 lk.unlock();
                 Log(L"tasks: %s showed no window from its tray icon: started", PathFindFileNameW(job.exe.c_str()));
-                const ComScope fallbackCom(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
                 const bool started = ExecTaskLaunch(job.plan->file, job.plan->args, job.plan->dir, true);
                 lk.lock();
                 if (!started || stop_ || gen_ != gen)
@@ -308,14 +295,22 @@ std::wstring TaskProcessImagePath(HANDLE process)
 
 bool ExecTaskLaunch(const std::wstring& file, const std::wstring& args, const std::wstring& dir, bool noAsync)
 {
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI | (noAsync ? SEE_MASK_NOASYNC : 0);
-    sei.lpFile = file.c_str();
-    sei.lpParameters = args.empty() ? nullptr : args.c_str();
-    sei.lpDirectory = dir.empty() ? nullptr : dir.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        Log(L"tasks: launch of %s failed (%lu)", file.c_str(), GetLastError());
+    LaunchRequest req;
+    req.target = file;
+    req.parameters = args;
+    req.workingDirectory = dir;
+    if (file.starts_with(L"shell:AppsFolder\\"))
+        req.kind = LaunchTargetKind::AppUserModelId;
+    else if (IsLink(file))
+        req.kind = LaunchTargetKind::Shortcut;
+    else
+        req.kind = LaunchTargetKind::Executable;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    req.noAsync = noAsync;
+
+    const LaunchResult result = ShellLaunch(req);
+    if (result.outcome != LaunchOutcome::Succeeded) {
+        Log(L"tasks: launch of %s failed (%lu)", file.c_str(), result.error);
         return false;
     }
     Log(L"tasks: started %s", file.c_str());

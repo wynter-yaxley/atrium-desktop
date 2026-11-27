@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -1528,6 +1530,173 @@ finally
                 !NativeFileDialog.IsCancelledHResult(unchecked((int)0x80004005)),
             "S_OK, S_FALSE, and E_FAIL must not be treated as cancellation.");
     }
+
+    // 11. Privilege parsing, Admin card state decisions, and cross-UIPI process path/handle helpers
+    {
+        var std = CoreClient.ParsePrivilegeInfo(JsonNode.Parse("""{"elevated":false,"privilegeMode":"standard","canDeElevate":false}""")!.AsObject());
+        Require(std is { Elevated: false, Mode: CorePrivilegeMode.Standard, CanDeElevate: false },
+            "Standard privilege JSON must map to Standard without de-elevation.");
+
+        var split = CoreClient.ParsePrivilegeInfo(JsonNode.Parse("""{"elevated":true,"privilegeMode":"elevated_split","canDeElevate":true}""")!.AsObject());
+        Require(split is { Elevated: true, Mode: CorePrivilegeMode.ElevatedSplit, CanDeElevate: true },
+            "Elevated split privilege JSON must map to ElevatedSplit with CanDeElevate=true.");
+
+        var unified = CoreClient.ParsePrivilegeInfo(
+            JsonNode.Parse("""{"elevated":true,"privilegeMode":"elevated_unified","canDeElevate":false}""")!.AsObject());
+        Require(unified is { Elevated: true, Mode: CorePrivilegeMode.ElevatedUnified, CanDeElevate: false },
+            "Elevated unified privilege JSON must map to ElevatedUnified without de-elevation.");
+
+        var cross = CoreClient.ParsePrivilegeInfo(
+            JsonNode.Parse("""{"elevated":true,"privilegeMode":"cross_account_elevated","canDeElevate":false}""")!.AsObject());
+        Require(cross is { Elevated: true, Mode: CorePrivilegeMode.CrossAccountElevated, CanDeElevate: false },
+            "Cross-account elevated JSON must map to CrossAccountElevated without de-elevation.");
+
+        var unknown = CoreClient.ParsePrivilegeInfo(JsonNode.Parse("""{"elevated":true,"privilegeMode":"unknown","canDeElevate":false}""")!.AsObject());
+        Require(unknown is { Elevated: true, Mode: CorePrivilegeMode.Unknown, CanDeElevate: false },
+            "Unknown elevated JSON must preserve Elevated=true and keep CanDeElevate=false.");
+
+        var spoofed = CoreClient.ParsePrivilegeInfo(JsonNode.Parse("""{"elevated":true,"privilegeMode":"elevated_unified","canDeElevate":true}""")!.AsObject());
+        Require(!spoofed.CanDeElevate, "CanDeElevate must only be true for elevated_split.");
+
+        var legacyElev = CoreClient.ParsePrivilegeInfo(JsonNode.Parse("""{"elevated":true}""")!.AsObject());
+        Require(legacyElev is { Elevated: true, Mode: CorePrivilegeMode.Unknown, CanDeElevate: false },
+            "Legacy elevated JSON without privilegeMode must fall back to Unknown and disable de-elevation.");
+
+        var legacyStd = CoreClient.ParsePrivilegeInfo(JsonNode.Parse("""{"elevated":false}""")!.AsObject());
+        Require(legacyStd is { Elevated: false, Mode: CorePrivilegeMode.Standard, CanDeElevate: false },
+            "Legacy non-elevated JSON without privilegeMode must fall back to Standard.");
+
+        var offline = CoreClient.GetAdminCardState(false, std, hasCoreExe: true, coreChanging: false);
+        Require(offline is { Action: AdminCardAction.StartAsAdmin, ButtonVisible: true, ButtonEnabled: true, ButtonText: "Start as administrator" },
+            "Disconnected Admin card must offer Start as administrator.");
+
+        var stdCard = CoreClient.GetAdminCardState(true, std, hasCoreExe: true, coreChanging: false);
+        Require(stdCard is { Action: AdminCardAction.RestartAsAdmin, ButtonVisible: true, ButtonEnabled: true, ButtonText: "Restart as administrator" },
+            "Standard Admin card must offer Restart as administrator.");
+
+        var splitCard = CoreClient.GetAdminCardState(true, split, hasCoreExe: true, coreChanging: false);
+        Require(splitCard is { Action: AdminCardAction.RestartAsStandard, ButtonVisible: true, ButtonEnabled: true, ButtonText: "Restart as standard user" },
+            "ElevatedSplit Admin card must offer Restart as standard user.");
+
+        var splitBusy = CoreClient.GetAdminCardState(true, split, hasCoreExe: true, coreChanging: true);
+        Require(splitBusy is { Action: AdminCardAction.RestartAsStandard, ButtonVisible: true, ButtonEnabled: false },
+            "ElevatedSplit Admin card must disable the action button while a core change is in flight.");
+
+        foreach (var nonDeElevatable in new[] { unified, cross, legacyElev })
+        {
+            var card = CoreClient.GetAdminCardState(true, nonDeElevatable, hasCoreExe: true, coreChanging: false);
+            Require(card is { Action: AdminCardAction.None, ButtonVisible: false, ButtonEnabled: false, ButtonText: null } &&
+                    card.Note.Contains("elevated by default", StringComparison.OrdinalIgnoreCase),
+                "Non-de-elevatable Admin card must hide the action button and explain the policy.");
+        }
+
+        string? selfPath = CoreClient.TryGetProcessPath(Environment.ProcessId);
+        Require(!string.IsNullOrEmpty(selfPath) &&
+                string.Equals(selfPath, Environment.ProcessPath, StringComparison.OrdinalIgnoreCase),
+            "TryGetProcessPath(Environment.ProcessId) must resolve the current executable path.");
+        Require(CoreClient.TryGetProcessPath(0) == null && CoreClient.TryGetProcessPath(-1) == null,
+            "TryGetProcessPath must return null for non-positive PIDs.");
+
+        using var selfHandle = CoreClient.TryOpenProcessHandle(Environment.ProcessId, out bool denied);
+        Require(!denied && selfHandle != null && CoreClient.IsProcessRunning(selfHandle),
+            "TryOpenProcessHandle must open a SYNCHRONIZE handle for the running process.");
+    }
+
+    // 12. C# NamedPipeClientStream(PipeDirection.InOut) against tightened Win32 pipe SDDL (0x0012019B + S:(ML;;NW;;;ME))
+    if (OperatingSystem.IsWindows())
+    {
+        const uint PipeAccessMask = 0x0012019Bu;
+        const uint GenericAll = 0x10000000u;
+        const uint FileCreatePipeInstance = 0x00000004u;
+        Require((PipeAccessMask & GenericAll) == 0 && (PipeAccessMask & FileCreatePipeInstance) == 0,
+            "Tightened pipe access mask 0x0012019B must exclude GENERIC_ALL and FILE_CREATE_PIPE_INSTANCE.");
+
+        string userSid = GetCurrentUserSidString();
+        string sddl = $"D:P(A;;0x0012019B;;;{userSid})S:(ML;;NW;;;ME)";
+        Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1u, out IntPtr sd, out _),
+            $"ConvertStringSecurityDescriptorToSecurityDescriptorW failed ({Marshal.GetLastWin32Error()}).");
+        try
+        {
+            var sa = new SecurityAttributes
+            {
+                NLength = Marshal.SizeOf<SecurityAttributes>(),
+                LpSecurityDescriptor = sd,
+                BInheritHandle = false,
+            };
+            string pipeName = "Atrium.Test.TightenedSddl." + Guid.NewGuid().ToString("N");
+            string fullPipePath = $@"\\.\pipe\{pipeName}";
+            const uint PipeAccessDuplex = 0x00000003u;
+            const uint FileFlagOverlapped = 0x40000000u;
+            const uint FileFlagFirstPipeInstance = 0x00080000u;
+            const uint PipeTypeMessage = 0x00000004u;
+            const uint PipeReadmodeMessage = 0x00000002u;
+            const uint PipeWait = 0x00000000u;
+            const uint PipeRejectRemoteClients = 0x00000008u;
+
+            IntPtr rawPipe = CreateNamedPipeW(
+                fullPipePath,
+                PipeAccessDuplex | FileFlagOverlapped | FileFlagFirstPipeInstance,
+                PipeTypeMessage | PipeReadmodeMessage | PipeWait | PipeRejectRemoteClients,
+                1,
+                16384,
+                16384,
+                0,
+                ref sa);
+            Require(rawPipe != IntPtr.Zero && rawPipe != new IntPtr(-1),
+                $"CreateNamedPipeW with tightened SDDL failed ({Marshal.GetLastWin32Error()}).");
+
+            try
+            {
+                IntPtr secondInstance = CreateNamedPipeW(
+                    fullPipePath,
+                    PipeAccessDuplex | FileFlagOverlapped,
+                    PipeTypeMessage | PipeReadmodeMessage | PipeWait | PipeRejectRemoteClients,
+                    2,
+                    16384,
+                    16384,
+                    0,
+                    ref sa);
+                int secondErr = Marshal.GetLastWin32Error();
+                if (secondInstance != IntPtr.Zero && secondInstance != new IntPtr(-1)) CloseHandle(secondInstance);
+                Require(secondInstance == new IntPtr(-1) && secondErr == 5 /* ERROR_ACCESS_DENIED */,
+                    $"Second pipe instance without FILE_CREATE_PIPE_INSTANCE must be denied (err={secondErr}).");
+
+                var serverTask = Task.Run(() =>
+                {
+                    if (OperatingSystem.IsWindows())
+                        ServeSingleOverlappedMessage(rawPipe, """{"cmd":"ping"}""", """{"ok":true,"pong":true}""");
+                });
+
+                using var clientPipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                await clientPipe.ConnectAsync(3000);
+                clientPipe.ReadMode = PipeTransmissionMode.Message;
+                byte[] reqBytes = Encoding.UTF8.GetBytes("""{"cmd":"ping"}""");
+                await clientPipe.WriteAsync(reqBytes);
+                await clientPipe.FlushAsync();
+
+                byte[] replyBuf = new byte[4096];
+                using var replyMs = new MemoryStream();
+                using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                do
+                {
+                    int n = await clientPipe.ReadAsync(replyBuf, readCts.Token);
+                    if (n == 0) throw new EndOfStreamException();
+                    replyMs.Write(replyBuf, 0, n);
+                } while (!clientPipe.IsMessageComplete);
+                string reply = Encoding.UTF8.GetString(replyMs.ToArray());
+                Require(reply == """{"ok":true,"pong":true}""", $"Unexpected pipe reply: {reply}");
+                await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            finally
+            {
+                CloseHandle(rawPipe);
+            }
+        }
+        finally
+        {
+            LocalFree(sd);
+        }
+    }
 }
 Console.WriteLine("Hardening regression checks passed.");
 
@@ -1548,4 +1717,144 @@ internal partial class Program
     private static partial Regex CppLegacyRegex();
     [GeneratedRegex(@"\(""([^""]+)"",\s*""([^""]+)"",\s*""([^""]+)""\)")]
     private static partial Regex CsCityRegex();
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes
+    {
+        public int NLength;
+        public IntPtr LpSecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool BInheritHandle;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(
+        IntPtr tokenHandle, int tokenInformationClass, byte[]? tokenInformation, int tokenInformationLength, out int returnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr stringSid);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string stringSecurityDescriptor, uint stringRevision, out IntPtr securityDescriptor, out uint securityDescriptorSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateNamedPipeW(
+        string lpName, uint dwOpenMode, uint dwPipeMode, uint nMaxInstances,
+        uint nOutBufferSize, uint nInBufferSize, uint nDefaultTimeOut, ref SecurityAttributes lpSecurityAttributes);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConnectNamedPipe(IntPtr hNamedPipe, ref NativeOverlapped lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReadFile(
+        IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, ref NativeOverlapped lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WriteFile(
+        IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, ref NativeOverlapped lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetOverlappedResult(
+        IntPtr hFile, ref NativeOverlapped lpOverlapped, out uint lpNumberOfBytesTransferred, [MarshalAs(UnmanagedType.Bool)] bool bWait);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FlushFileBuffers(IntPtr hFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DisconnectNamedPipe(IntPtr hNamedPipe);
+
+    [SupportedOSPlatform("windows")]
+    private static uint FinishOverlapped(IntPtr pipe, ManualResetEvent ev, ref NativeOverlapped ov, bool immediateOk, string op)
+    {
+        if (!immediateOk)
+        {
+            int err = Marshal.GetLastWin32Error();
+            if (err == 997 /* ERROR_IO_PENDING */)
+            {
+                if (!ev.WaitOne(5000)) throw new TimeoutException($"{op} timed out waiting for overlapped I/O.");
+            }
+            else if (op == "ConnectNamedPipe" && err == 535 /* ERROR_PIPE_CONNECTED */)
+            {
+                return 0;
+            }
+            else
+            {
+                throw new IOException($"{op} failed ({err}).");
+            }
+        }
+        if (!GetOverlappedResult(pipe, ref ov, out uint bytes, false))
+            throw new IOException($"{op} GetOverlappedResult failed ({Marshal.GetLastWin32Error()}).");
+        return bytes;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void ServeSingleOverlappedMessage(IntPtr pipe, string expectedRequest, string replyText)
+    {
+        using var ev = new ManualResetEvent(false);
+        var ov = new NativeOverlapped { EventHandle = ev.SafeWaitHandle.DangerousGetHandle() };
+        try
+        {
+            FinishOverlapped(pipe, ev, ref ov, ConnectNamedPipe(pipe, ref ov), "ConnectNamedPipe");
+            ev.Reset();
+            byte[] buf = new byte[4096];
+            uint read = FinishOverlapped(pipe, ev, ref ov, ReadFile(pipe, buf, (uint)buf.Length, out _, ref ov), "ReadFile");
+            string actual = Encoding.UTF8.GetString(buf, 0, (int)read);
+            if (actual != expectedRequest)
+                throw new InvalidOperationException($"Unexpected pipe request: {actual}");
+
+            ev.Reset();
+            byte[] resp = Encoding.UTF8.GetBytes(replyText);
+            uint written = FinishOverlapped(pipe, ev, ref ov, WriteFile(pipe, resp, (uint)resp.Length, out _, ref ov), "WriteFile");
+            if (written != resp.Length)
+                throw new InvalidOperationException("Pipe server failed to write full response.");
+            FlushFileBuffers(pipe);
+        }
+        finally
+        {
+            DisconnectNamedPipe(pipe);
+        }
+    }
+
+    private static string GetCurrentUserSidString()
+    {
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0008u /* TOKEN_QUERY */, out IntPtr token))
+            throw new InvalidOperationException($"OpenProcessToken failed ({Marshal.GetLastWin32Error()}).");
+        try
+        {
+            GetTokenInformation(token, 1 /* TokenUser */, null, 0, out int len);
+            byte[] buf = new byte[len];
+            if (!GetTokenInformation(token, 1 /* TokenUser */, buf, len, out _))
+                throw new InvalidOperationException($"GetTokenInformation(TokenUser) failed ({Marshal.GetLastWin32Error()}).");
+            IntPtr sidPtr = MemoryMarshal.Read<IntPtr>(buf);
+            if (!ConvertSidToStringSidW(sidPtr, out IntPtr strSid) || strSid == IntPtr.Zero)
+                throw new InvalidOperationException($"ConvertSidToStringSidW failed ({Marshal.GetLastWin32Error()}).");
+            try { return Marshal.PtrToStringUni(strSid) ?? throw new InvalidOperationException("Empty SID string."); }
+            finally { LocalFree(strSid); }
+        }
+        finally { CloseHandle(token); }
+    }
 }

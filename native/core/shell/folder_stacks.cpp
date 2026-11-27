@@ -5,6 +5,7 @@
 
 #include "shell/jump_list.h"
 #include "shell/shell_icon.h"
+#include "shell/shell_launch.h"
 #include "shell/shell_taskbar.h"
 #include "win32_path.h"
 
@@ -12,7 +13,6 @@
 #include <ole2.h>
 #include <shlobj.h>
 #include <shobjidl.h>
-#include <shellapi.h>
 #include <ocidl.h>
 #include <exdisp.h>
 #include <servprov.h>
@@ -247,30 +247,26 @@ bool TryFocusOpenExplorer(const std::wstring& path)
 // folder to the running shell and leaves.
 void LaunchExplorer(const std::wstring& path)
 {
-    wchar_t windows[MAX_PATH] = {};
-    const UINT n = GetWindowsDirectoryW(windows, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
-        return;
-    const std::wstring exe = std::wstring(windows, n) + L"\\explorer.exe";
     // A root's trailing backslash would escape the closing quote; doubled, it reads as one.
     const std::wstring arg = path.ends_with(L'\\') ? path + L'\\' : path;
-    std::wstring cmd = L"\"" + exe + L"\" \"" + arg + L"\"";
-    STARTUPINFOW si{sizeof(si)};
-    PROCESS_INFORMATION pi{};
-    if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
+    LaunchRequest req;
+    req.target = L"explorer.exe";
+    req.parameters = L"\"" + arg + L"\"";
+    req.verb = L"open";
+    req.kind = LaunchTargetKind::Folder;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    ShellLaunch(req);
 }
 
 void OpenFile(const std::wstring& path)
 {
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI | (IsRemotePath(path) ? 0UL : SEE_MASK_NOASYNC);
-    sei.lpVerb = L"open";
-    sei.lpFile = path.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    ShellExecuteExW(&sei);
+    LaunchRequest req;
+    req.target = path;
+    req.verb = L"open";
+    req.kind = LaunchTargetKind::Document;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    req.noAsync = !IsRemotePath(path);
+    ShellLaunch(req);
 }
 
 } // namespace

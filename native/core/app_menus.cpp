@@ -9,18 +9,16 @@
 #include "settings_server.h"
 #include "shell/jump_list.h"
 #include "shell/quick_links.h"
+#include "shell/shell_launch.h"
 #include "shell/shell_verbs.h"
 #include "ui/stage_manager.h"
 #include "win32_path.h"
 
-#include <objbase.h>
-#include <shellapi.h>
 #include <shlobj.h>
 
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
-#include <memory>
 #include <set>
 #include <utility>
 
@@ -50,30 +48,6 @@ enum MenuCmd : UINT {
 };
 constexpr int kCmdRecent = 2000;
 constexpr int kCmdExtra = 4000;
-
-struct ShellLaunchJob {
-    std::wstring verb, file, args, dir;
-};
-
-VOID CALLBACK RunShellLaunchJob(PTP_CALLBACK_INSTANCE, PVOID context)
-{
-    const std::unique_ptr<ShellLaunchJob> job(static_cast<ShellLaunchJob*>(context));
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
-    sei.lpVerb = job->verb.empty() ? nullptr : job->verb.c_str();
-    sei.lpFile = job->file.c_str();
-    sei.lpParameters = job->args.empty() ? nullptr : job->args.c_str();
-    sei.lpDirectory = job->dir.empty() ? nullptr : job->dir.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        const DWORD err = GetLastError();
-        if (err != ERROR_CANCELLED || job->verb != L"runas")
-            Log(L"menu: %s '%s' failed (%lu)", job->verb.empty() ? L"open" : job->verb.c_str(), job->file.c_str(), err);
-    }
-    if (SUCCEEDED(com))
-        CoUninitialize();
-}
 
 template<class Fn> void ModifyPins(SettingsServer* server, Fn&& fn)
 {
@@ -262,12 +236,21 @@ MenuPlace BarMenuPlace(const Bar& bar, bool centered)
 
 void LaunchShellAsync(std::wstring verb, std::wstring file, std::wstring args, std::wstring dir)
 {
-    auto job = std::make_unique<ShellLaunchJob>(ShellLaunchJob{std::move(verb), std::move(file), std::move(args), std::move(dir)});
-    ShellLaunchJob* const raw = job.release();
-    if (!TrySubmitThreadpoolCallback(RunShellLaunchJob, raw, nullptr)) {
-        const std::unique_ptr<ShellLaunchJob> reclaim(raw);
-        Log(L"menu: failed to queue shell launch for '%s' (%lu)", reclaim->file.c_str(), GetLastError());
-    }
+    LaunchRequest req;
+    const bool runAs = !verb.empty() && _wcsicmp(verb.c_str(), L"runas") == 0;
+    req.privilege = runAs ? LaunchPrivilege::RequestElevation : LaunchPrivilege::ShellDefault;
+    if (file.starts_with(L"shell:AppsFolder\\"))
+        req.kind = LaunchTargetKind::AppUserModelId;
+    else if (FoldCase(file).ends_with(L".lnk"))
+        req.kind = LaunchTargetKind::Shortcut;
+    else
+        req.kind = LaunchTargetKind::Executable;
+    req.verb = std::move(verb);
+    req.target = std::move(file);
+    req.parameters = std::move(args);
+    req.workingDirectory = std::move(dir);
+    req.noAsync = true;
+    ShellLaunchAsync(std::move(req));
 }
 
 bool PinsEqual(const PinnedApp& a, const PinnedApp& b)

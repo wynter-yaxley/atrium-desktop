@@ -5,10 +5,17 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.CSharp.RuntimeBinder;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace Atrium.Settings;
 
 internal enum CommitStatus { Saved, Conflict, Error }
+
+internal enum CorePrivilegeMode { Unknown, Standard, ElevatedSplit, ElevatedUnified, CrossAccountElevated }
+internal enum AdminCardAction { StartAsAdmin, RestartAsAdmin, RestartAsStandard, None }
+internal sealed record CorePrivilegeInfo(bool Elevated, CorePrivilegeMode Mode, bool CanDeElevate);
+internal sealed record AdminCardState(string Status, string Note, string? ButtonText, AdminCardAction Action, bool ButtonVisible, bool ButtonEnabled);
+internal sealed record LifecycleRestartResult(bool Succeeded, bool Reconnected, string? Error = null);
 
 internal sealed record CoreState(BarSettings Saved, BarSettings Current, string? InstanceId, ulong Revision, bool FromCore);
 
@@ -28,6 +35,11 @@ internal sealed record CommitResult(
 // core is not running, settings are read from and written to the file directly.
 internal sealed partial class CoreClient : IDisposable
 {
+    internal sealed partial class NativeProcessWaitHandle : WaitHandle
+    {
+        public NativeProcessWaitHandle(IntPtr handle) { SafeWaitHandle = new SafeWaitHandle(handle, ownsHandle: true); }
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint processId);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -35,9 +47,20 @@ internal sealed partial class CoreClient : IDisposable
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, char[] exeName, ref uint size);
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(
+        IntPtr tokenHandle, int tokenInformationClass, out uint tokenInformation, uint tokenInformationLength, out uint returnLength);
 
-    private static string? TryGetProcessPath(uint pid)
+    internal static string? TryGetProcessPath(int pid) => pid > 0 ? TryGetProcessPath((uint)pid) : null;
+
+    internal static string? TryGetProcessPath(uint pid)
     {
         const uint ProcessQueryLimitedInformation = 0x1000;
         IntPtr proc = OpenProcess(ProcessQueryLimitedInformation, false, pid);
@@ -51,7 +74,40 @@ internal sealed partial class CoreClient : IDisposable
         finally { CloseHandle(proc); }
     }
 
+    internal static bool IsElevatedProcess
+    {
+        get
+        {
+            if (!OperatingSystem.IsWindows() || !OpenProcessToken(GetCurrentProcess(), 0x0008 /* TOKEN_QUERY */, out IntPtr token)) return false;
+            try { return GetTokenInformation(token, 20 /* TokenElevation */, out uint elevated, sizeof(uint), out _) && elevated != 0; }
+            finally { CloseHandle(token); }
+        }
+    }
+
+    internal static NativeProcessWaitHandle? TryOpenProcessHandle(int pid, out bool accessDenied)
+    {
+        accessDenied = false;
+        if (pid <= 0 || !OperatingSystem.IsWindows()) return null;
+        IntPtr proc = OpenProcess(0x00101000u /* SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION */, false, (uint)pid);
+        if (proc == IntPtr.Zero) { accessDenied = Marshal.GetLastWin32Error() == 5; return null; }
+        return new NativeProcessWaitHandle(proc);
+    }
+
+    internal static bool IsProcessRunning(NativeProcessWaitHandle? handle) =>
+        handle != null && !handle.SafeWaitHandle.IsInvalid && !handle.SafeWaitHandle.IsClosed &&
+        GetExitCodeProcess(handle.SafeWaitHandle.DangerousGetHandle(), out uint code) && code == 259;
+
+    internal static async Task<bool> WaitForProcessExitAsync(NativeProcessWaitHandle? handle, int timeoutMs, CancellationToken ct = default)
+    {
+        if (!IsProcessRunning(handle)) return true;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reg = ThreadPool.RegisterWaitForSingleObject(handle!, (_, timedOut) => tcs.TrySetResult(!timedOut), null, timeoutMs, true);
+        using var ctr = ct.Register(() => tcs.TrySetCanceled(ct));
+        try { return await tcs.Task; } finally { reg.Unregister(null); }
+    }
+
     private readonly string _pipeName;
+    private readonly string _lifecyclePipeName;
     private readonly string _settingsPath;
     private readonly string? _expectedServerExe;
     private readonly Func<BarSettings, string?>? _writeFileOverride;
@@ -60,9 +116,12 @@ internal sealed partial class CoreClient : IDisposable
         string? pipeName = null,
         string? settingsPath = null,
         string? expectedServerExe = null,
-        Func<BarSettings, string?>? writeFileOverride = null)
+        Func<BarSettings, string?>? writeFileOverride = null,
+        string? lifecyclePipeName = null)
     {
-        _pipeName = pipeName ?? "Atrium.Core." + Process.GetCurrentProcess().SessionId;
+        int sessionId = Process.GetCurrentProcess().SessionId;
+        _pipeName = pipeName ?? "Atrium.Core." + sessionId;
+        _lifecyclePipeName = lifecyclePipeName ?? "Atrium.Lifecycle." + sessionId;
         _settingsPath = settingsPath ?? SettingsPath;
         _expectedServerExe = expectedServerExe;
         _writeFileOverride = writeFileOverride;
@@ -87,15 +146,8 @@ internal sealed partial class CoreClient : IDisposable
                 int slash = trimmed.IndexOfAny(['\\', '/'], 2);
                 if (slash < 0 || slash + 1 >= trimmed.Length) { dir = null; return false; }
             }
-            try
-            {
-                dir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(raw));
-            }
-            catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
-            {
-                dir = null;
-                return false;
-            }
+            try { dir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(raw)); }
+            catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { dir = null; return false; }
         }
         return true;
     }
@@ -104,19 +156,11 @@ internal sealed partial class CoreClient : IDisposable
     {
         get
         {
-            string dir;
-            if (Development)
-            {
-                if (!TryParseDataDirArgument(Environment.GetCommandLineArgs(), out string? custom, out bool specified))
-                    throw new ArgumentException("Invalid --data-dir argument; expected a fully qualified absolute path.", "--data-dir");
-                dir = specified && custom != null
-                    ? custom
-                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Atrium");
-            }
-            else
-            {
-                dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Atrium");
-            }
+            string dir = Development
+                ? TryParseDataDirArgument(Environment.GetCommandLineArgs(), out string? custom, out bool specified)
+                    ? specified && custom != null ? custom : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Atrium")
+                    : throw new ArgumentException("Invalid --data-dir argument; expected a fully qualified absolute path.", "--data-dir")
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Atrium");
             Directory.CreateDirectory(dir);
             return dir;
         }
@@ -149,6 +193,8 @@ internal sealed partial class CoreClient : IDisposable
     public bool Connected => _pipe is { IsConnected: true };
     public int ProcessId { get; private set; }
     public bool CoreElevated { get; private set; }
+    public CorePrivilegeMode PrivilegeMode { get; private set; }
+    public bool CanDeElevate { get; private set; }
     public bool StateConfirmed { get; private set; }
     public string? InstanceId { get; private set; }
     public ulong Revision { get; private set; }
@@ -174,14 +220,7 @@ internal sealed partial class CoreClient : IDisposable
             list.Add(custom);
         }
         if (runAsAdmin)
-        {
-            return new ProcessStartInfo(exe)
-            {
-                UseShellExecute = true,
-                Verb = "runas",
-                Arguments = string.Join(" ", list.Select(QuoteArg)),
-            };
-        }
+            return new ProcessStartInfo(exe) { UseShellExecute = true, Verb = "runas", Arguments = string.Join(" ", list.Select(QuoteArg)) };
         if (list.Count > 0)
         {
             var info = new ProcessStartInfo(exe) { UseShellExecute = false };
@@ -207,32 +246,34 @@ internal sealed partial class CoreClient : IDisposable
         return sb.Append('"').ToString();
     }
 
+    private async Task<(NamedPipeClientStream? Pipe, uint Pid, bool WrongLocation)> OpenVerifiedPipeAsync(
+        string pipeName, int timeoutMs, CancellationToken ct)
+    {
+        var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        await pipe.ConnectAsync(timeoutMs, ct);
+        if (OperatingSystem.IsWindows()) pipe.ReadMode = PipeTransmissionMode.Message;
+        // The name is session-wide; only this distribution's executable owns our settings.
+        if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out uint pid)) { pipe.Dispose(); return (null, 0, false); }
+        string? expected = _expectedServerExe ?? CoreExe();
+        if (expected == null || !string.Equals(TryGetProcessPath(pid), expected, StringComparison.OrdinalIgnoreCase))
+        { pipe.Dispose(); return (null, 0, true); }
+        return (pipe, pid, false);
+    }
+
     public async Task<bool> ConnectAsync(int timeoutMs)
     {
         Disconnect();
-        var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        NamedPipeClientStream? pipe = null;
         try
         {
-            await pipe.ConnectAsync(timeoutMs, _lifetime.Token);
-            if (OperatingSystem.IsWindows()) pipe.ReadMode = PipeTransmissionMode.Message;
-            // The name is session-wide; only this distribution's executable owns our settings.
-            if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out uint pid))
+            (pipe, uint pid, bool wrongLocation) = await OpenVerifiedPipeAsync(_pipeName, timeoutMs, _lifetime.Token);
+            if (pipe == null)
             {
-                pipe.Dispose();
-                return false;
-            }
-            string? actual = TryGetProcessPath(pid);
-            if (actual == null)
-            {
-                using var process = Process.GetProcessById((int)pid);
-                actual = process.MainModule?.FileName;
-            }
-            string? expected = _expectedServerExe ?? CoreExe();
-            if (expected == null || !string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
-            {
-                _connectionLost = true;
-                ConnectionError = Loc.T("Atrium is running from another location; the core in this folder was not connected.");
-                pipe.Dispose();
+                if (wrongLocation)
+                {
+                    _connectionLost = true;
+                    ConnectionError = Loc.T("Atrium is running from another location; the core in this folder was not connected.");
+                }
                 return false;
             }
             _lifetime.Token.ThrowIfCancellationRequested();
@@ -247,11 +288,8 @@ internal sealed partial class CoreClient : IDisposable
             or ArgumentException or InvalidOperationException or OperationCanceledException or System.ComponentModel.Win32Exception)
         {
             if (e is not TimeoutException and not OperationCanceledException)
-            {
-                _connectionLost = true;
-                ConnectionError = Loc.F("Could not connect to the core in this folder: {0}", e.Message);
-            }
-            pipe.Dispose();
+            { _connectionLost = true; ConnectionError = Loc.F("Could not connect to the core in this folder: {0}", e.Message); }
+            pipe?.Dispose();
             return false;
         }
     }
@@ -265,6 +303,8 @@ internal sealed partial class CoreClient : IDisposable
         _pipe = null;
         ProcessId = 0;
         CoreElevated = false;
+        PrivilegeMode = CorePrivilegeMode.Unknown;
+        CanDeElevate = false;
         StateConfirmed = false;
         InstanceId = null;
         Revision = 0;
@@ -288,16 +328,7 @@ internal sealed partial class CoreClient : IDisposable
             byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(request);
             await pipe.WriteAsync(bytes, deadline.Token);
             await pipe.FlushAsync(deadline.Token);
-            using var message = new MemoryStream();
-            do
-            {
-                int n = await pipe.ReadAsync(_readBuffer, deadline.Token);
-                if (n == 0) throw new IOException("pipe closed");
-                message.Write(_readBuffer, 0, n);
-                if (message.Length > 1024 * 1024) throw new IOException(Loc.T("The core's reply was too large"));
-            } while (!pipe.IsMessageComplete);
-            var reply = JsonNode.Parse(message.GetBuffer().AsSpan(0, (int)message.Length));
-            return reply is JsonObject ? reply : null;
+            return await ReadPipeReplyAsync(pipe, _readBuffer, 1024 * 1024, deadline.Token);
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or JsonException or OperationCanceledException)
         {
@@ -319,10 +350,13 @@ internal sealed partial class CoreClient : IDisposable
     public async Task<CoreState> GetAsync()
     {
         var r = await RequestAsync(new JsonObject { ["op"] = "get" });
-        if (r?["op"]?.GetValue<string>() == "state")
+        if (r?["op"]?.GetValue<string>() == "state" && r is JsonObject obj)
         {
             StateConfirmed = true;
-            CoreElevated = r["elevated"] is JsonValue ev && ev.TryGetValue(out bool elev) && elev;
+            var priv = ParsePrivilegeInfo(obj);
+            CoreElevated = priv.Elevated;
+            PrivilegeMode = priv.Mode;
+            CanDeElevate = priv.CanDeElevate;
             InstanceId = ParseNonEmptyString(r["instanceId"]);
             Revision = ParseRevision(r["revision"]);
             return new CoreState(
@@ -338,54 +372,174 @@ internal sealed partial class CoreClient : IDisposable
 
     public Task<string?> PreviewAsync(BarSettings s) => Send("preview", s);
 
+    private static CommitResult ConnectionLostCommitError() => new(CommitStatus.Error,
+        Error: Loc.T("The connection to the core was lost; the save result is not confirmed. Reconnect and check the saved settings."));
+
     public async Task<CommitResult> CommitAsync(BarSettings s, string? expectedInstanceId = null, ulong expectedRevision = 0)
     {
         LastSaveWarning = null;
         if (Connected)
             return await SendCommitAsync(s, expectedInstanceId ?? InstanceId, expectedRevision > 0 ? expectedRevision : Revision);
-        if (_connectionLost || _lifetime.IsCancellationRequested)
-        {
-            return new CommitResult(
-                CommitStatus.Error,
-                Error: Loc.T("The connection to the core was lost; the save result is not confirmed. Reconnect and check the saved settings."));
-        }
+        if (_connectionLost || _lifetime.IsCancellationRequested) return ConnectionLostCommitError();
         var snapshot = s.Clone();
         bool entered = false;
         try
         {
             await _io.WaitAsync(_lifetime.Token);
             entered = true;
-            if (_lifetime.IsCancellationRequested)
-            {
-                return new CommitResult(
-                    CommitStatus.Error,
-                    Error: Loc.T("The connection to the core was lost; the save result is not confirmed. Reconnect and check the saved settings."));
-            }
+            if (_lifetime.IsCancellationRequested) return ConnectionLostCommitError();
             if (Connected)
             {
                 _io.Release();
                 entered = false;
                 return await SendCommitAsync(snapshot, expectedInstanceId ?? InstanceId, expectedRevision > 0 ? expectedRevision : Revision);
             }
-            LastSaveWarning = await Task.Run(() => _writeFileOverride != null
-                ? _writeFileOverride(snapshot)
-                : WriteFile(_settingsPath, snapshot));
+            LastSaveWarning = await Task.Run(() => _writeFileOverride != null ? _writeFileOverride(snapshot) : WriteFile(_settingsPath, snapshot));
             return new CommitResult(CommitStatus.Saved, Warning: LastSaveWarning);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) { return ConnectionLostCommitError(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return new CommitResult(CommitStatus.Error, Error: e.Message); }
+        finally { if (entered) _io.Release(); }
+    }
+
+    internal static CorePrivilegeInfo ParsePrivilegeInfo(JsonObject r)
+    {
+        bool elev = false;
+        bool hasElevated = r["elevated"] is JsonValue ev && ev.TryGetValue(out elev);
+        bool elevatedFlag = hasElevated && elev;
+        var mode = ParseNonEmptyString(r["privilegeMode"]) switch
         {
-            return new CommitResult(
-                CommitStatus.Error,
-                Error: Loc.T("The connection to the core was lost; the save result is not confirmed. Reconnect and check the saved settings."));
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            "standard" => CorePrivilegeMode.Standard,
+            "elevated_split" => CorePrivilegeMode.ElevatedSplit,
+            "elevated_unified" => CorePrivilegeMode.ElevatedUnified,
+            "cross_account_elevated" => CorePrivilegeMode.CrossAccountElevated,
+            "unknown" => CorePrivilegeMode.Unknown,
+            null when hasElevated && !elevatedFlag => CorePrivilegeMode.Standard,
+            _ => CorePrivilegeMode.Unknown,
+        };
+        bool elevated = elevatedFlag || mode is CorePrivilegeMode.ElevatedSplit
+            or CorePrivilegeMode.ElevatedUnified or CorePrivilegeMode.CrossAccountElevated;
+        bool canDeElevate = mode == CorePrivilegeMode.ElevatedSplit &&
+            r["canDeElevate"] is JsonValue cv && cv.TryGetValue(out bool cde) && cde;
+        return new CorePrivilegeInfo(elevated, mode, canDeElevate);
+    }
+
+    internal static AdminCardState GetAdminCardState(bool connected, CorePrivilegeInfo privilege, bool hasCoreExe, bool coreChanging)
+    {
+        string defaultNote = Loc.T("Manage elevated apps in Stage Manager, previews and tray. Prompts UAC; Explorer cannot drag onto an elevated taskbar.");
+        bool enabled = hasCoreExe && !coreChanging;
+        if (!connected)
+            return new(Loc.T("Atrium is not running"), defaultNote, Loc.T("Start as administrator"), AdminCardAction.StartAsAdmin, true, enabled);
+        if (!privilege.Elevated)
+            return new(Loc.T("Running as standard user"), defaultNote, Loc.T("Restart as administrator"), AdminCardAction.RestartAsAdmin, true, enabled);
+        if (privilege.CanDeElevate)
+            return new(Loc.T("Running as administrator"), defaultNote, Loc.T("Restart as standard user"), AdminCardAction.RestartAsStandard, true, enabled);
+        string unifiedNote = Loc.T("Your current Windows account or UAC policy runs apps elevated by default, so Atrium cannot restart as a standard user.");
+        return new(Loc.T("Running as administrator"), unifiedNote, null, AdminCardAction.None, false, false);
+    }
+
+    private static async Task<JsonObject?> ReadPipeReplyAsync(NamedPipeClientStream pipe, byte[] buffer, int maxBytes, CancellationToken ct)
+    {
+        using var message = new MemoryStream();
+        do
         {
-            return new CommitResult(CommitStatus.Error, Error: e.Message);
-        }
-        finally
+            int n = await pipe.ReadAsync(buffer, ct);
+            if (n == 0) throw new IOException("pipe closed");
+            message.Write(buffer, 0, n);
+            if (message.Length > maxBytes) throw new IOException(Loc.T("The core's reply was too large"));
+        } while (!pipe.IsMessageComplete);
+        return JsonNode.Parse(message.GetBuffer().AsSpan(0, (int)message.Length)) as JsonObject;
+    }
+
+    internal async Task<JsonObject?> RequestLifecycleAsync(JsonObject request, int timeoutMs = 1500, CancellationToken ct = default)
+    {
+        try
         {
-            if (entered) _io.Release();
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, ct);
+            linked.CancelAfter(timeoutMs);
+            var (pipe, _, _) = await OpenVerifiedPipeAsync(_lifecyclePipeName, timeoutMs, linked.Token);
+            if (pipe == null) return null;
+            using (pipe)
+            {
+                await pipe.WriteAsync(JsonSerializer.SerializeToUtf8Bytes(request), linked.Token);
+                await pipe.FlushAsync(linked.Token);
+                return await ReadPipeReplyAsync(pipe, new byte[4096], 64 * 1024, linked.Token);
+            }
         }
+        catch (Exception e) when (e is TimeoutException or IOException or UnauthorizedAccessException
+            or ArgumentException or InvalidOperationException or OperationCanceledException or JsonException)
+        { return null; }
+    }
+
+    internal async Task<int?> PingLifecyclePidAsync(int timeoutMs = 400, CancellationToken ct = default)
+    {
+        var r = await RequestLifecycleAsync(new JsonObject { ["cmd"] = "ping" }, timeoutMs, ct);
+        return r?["ok"] is JsonValue okv && okv.TryGetValue(out bool ok) && ok &&
+               r["pid"] is JsonValue pv && pv.TryGetValue(out int pid) ? pid : null;
+    }
+
+    private async Task<bool> WaitForCoreStopAsync(NativeProcessWaitHandle? handle, int oldPid, int timeoutMs, CancellationToken ct)
+    {
+        if (handle != null && !await WaitForProcessExitAsync(handle, timeoutMs, ct)) return false;
+        if (oldPid <= 0) return true;
+        long deadline = Environment.TickCount64 + timeoutMs;
+        while (!ct.IsCancellationRequested)
+        {
+            int? activePid = await PingLifecyclePidAsync(300, ct);
+            if (activePid == null || activePid != oldPid) return true;
+            if (Environment.TickCount64 >= deadline) return false;
+            await Task.Delay(150, ct);
+        }
+        return false;
+    }
+
+    public async Task<LifecycleRestartResult> RestartAsStandardAsync(CancellationToken ct = default)
+    {
+        int oldPid = ProcessId;
+        string? previousId = InstanceId;
+        string? exe = TryGetProcessPath(oldPid) ?? _expectedServerExe ?? CoreExe();
+        if (exe == null) return new(false, false, Loc.T("Atrium.exe was not found"));
+        using var oldProc = TryOpenProcessHandle(oldPid, out _);
+        try
+        {
+            if (!IsElevatedProcess)
+            {
+                var r = await RequestLifecycleAsync(new JsonObject { ["cmd"] = "quit" }, 1500, ct);
+                bool sentQuit = r?["ok"] is JsonValue okv && okv.TryGetValue(out bool ok) && ok;
+                if (!sentQuit && Connected) sentQuit = await QuitCoreAsync();
+                Disconnect();
+                if (sentQuit && !await WaitForCoreStopAsync(oldProc, oldPid, 8000, ct))
+                    return new(false, false, Loc.T("Atrium has not quit yet. Try again later."));
+                using var launched = Process.Start(CoreStartInfo(exe, replace: true));
+            }
+            else
+            {
+                var r = await RequestLifecycleAsync(new JsonObject { ["cmd"] = "restart-standard" }, 3000, ct);
+                if (r?["ok"] is not JsonValue okv || !okv.TryGetValue(out bool ok) || !ok)
+                {
+                    return new(false, false, ParseNonEmptyString(r?["error"]) == "cannot_deelevate"
+                        ? Loc.T("Atrium cannot restart as a standard user under the current Windows account or UAC policy.")
+                        : Loc.T("Could not restart as standard user"));
+                }
+                Disconnect();
+                await WaitForCoreStopAsync(oldProc, oldPid, 8000, ct);
+            }
+            for (int i = 0; i < 66 && !ct.IsCancellationRequested; i++)
+            {
+                if (await ConnectAsync(150))
+                {
+                    var state = await GetAsync();
+                    if (state.FromCore && (!CoreElevated || (InstanceId != null && InstanceId != previousId)))
+                        return new(!CoreElevated, true, CoreElevated ? Loc.T("Could not restart as standard user") : null);
+                    Disconnect();
+                }
+                await Task.Delay(150, ct);
+            }
+            return new(false, false, Loc.T("Atrium restarted, but the settings window could not reconnect yet. Check the status indicator."));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return new(false, false); }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException or IOException)
+        { return new(false, false, e.Message); }
     }
 
     public Task<string?> CancelAsync() => Send("cancel", null);
@@ -409,30 +563,24 @@ internal sealed partial class CoreClient : IDisposable
         var r = await RequestAsync(request);
         if (r == null)
         {
-            return new CommitResult(
-                CommitStatus.Error,
+            return new CommitResult(CommitStatus.Error,
                 Error: Loc.T("The core did not reply in time or the connection closed; the result is not confirmed. Please reconnect."));
         }
         string? op = r["op"]?.GetValue<string>();
-        if (op == "ok")
+        if (op is "ok" or "conflict")
         {
             string? id = ParseNonEmptyString(r["instanceId"]) ?? InstanceId;
             ulong rev = ParseRevision(r["revision"]);
-            if (rev == 0) rev = Revision;
+            if (op == "ok" && rev == 0) rev = Revision;
             InstanceId = id;
             Revision = rev;
-            LastSaveWarning = r["warning"]?.GetValue<string>();
-            return new CommitResult(CommitStatus.Saved, InstanceId: id, Revision: rev, Warning: LastSaveWarning);
-        }
-        if (op == "conflict")
-        {
-            var serverSaved = BarSettings.FromJson(r["saved"] as JsonObject, new());
-            string? id = ParseNonEmptyString(r["instanceId"]) ?? InstanceId;
-            ulong rev = ParseRevision(r["revision"]);
-            InstanceId = id;
-            Revision = rev;
-            string message = r["message"]?.GetValue<string>() ?? "conflict";
-            return new CommitResult(CommitStatus.Conflict, serverSaved, id, rev, Error: message);
+            if (op == "ok")
+            {
+                LastSaveWarning = r["warning"]?.GetValue<string>();
+                return new CommitResult(CommitStatus.Saved, InstanceId: id, Revision: rev, Warning: LastSaveWarning);
+            }
+            return new CommitResult(CommitStatus.Conflict, BarSettings.FromJson(r["saved"] as JsonObject, new()),
+                id, rev, Error: r["message"]?.GetValue<string>() ?? "conflict");
         }
         return new CommitResult(CommitStatus.Error, Error: r["message"]?.GetValue<string>() ?? "error");
     }
@@ -463,14 +611,8 @@ internal sealed partial class CoreClient : IDisposable
             entered = true;
             return await Task.Run(() => ReadFile(_settingsPath));
         }
-        catch (OperationCanceledException)
-        {
-            return new BarSettings();
-        }
-        finally
-        {
-            if (entered) _io.Release();
-        }
+        catch (OperationCanceledException) { return new BarSettings(); }
+        finally { if (entered) _io.Release(); }
     }
 
     private static string? ParseNonEmptyString(JsonNode? node) =>
@@ -503,9 +645,7 @@ internal sealed partial class CoreClient : IDisposable
             foreach (string? f in Directory.EnumerateFiles(dir, "*.lnk").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                 pins.Add(new PinnedApp(Path.GetFileNameWithoutExtension(f), f, "", ""));
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         return pins.Count > 64 ? pins.GetRange(0, 64) : pins;
     }
 
@@ -553,6 +693,13 @@ internal sealed partial class CoreClient : IDisposable
             return Loc.F("Settings were saved, but Windows startup could not be changed: {0}. Toggle Start with Windows again, then save.", e.Message);
         }
         return null;
+    }
+
+    private static void ReleaseCom(params object?[] objects)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        foreach (object? com in objects)
+            if (com != null && Marshal.IsComObject(com)) Marshal.FinalReleaseComObject(com);
     }
 
     // Create or update the standard-user Task Scheduler logon task for this install.
@@ -605,10 +752,7 @@ internal sealed partial class CoreClient : IDisposable
         }
         finally
         {
-            static void Release(object? com) { if (com != null && Marshal.IsComObject(com)) Marshal.FinalReleaseComObject(com); }
-            Release(action); Release(actions); Release(trigger); Release(triggers);
-            Release(idleSettings); Release(settings); Release(principal); Release(registrationInfo);
-            Release(definition); Release(folder); Release(service);
+            ReleaseCom(action, actions, trigger, triggers, idleSettings, settings, principal, registrationInfo, definition, folder, service);
         }
     }
 
@@ -638,19 +782,8 @@ internal sealed partial class CoreClient : IDisposable
             folder.DeleteTask(name, 0);
         }
         catch (Exception e) when (e is RuntimeBinderException or COMException or ArgumentException)
-        {
-            throw new IOException(e.Message, e);
-        }
-        finally
-        {
-            static void Release(object? com) { if (com != null && Marshal.IsComObject(com)) Marshal.FinalReleaseComObject(com); }
-            Release(action);
-            Release(actions);
-            Release(definition);
-            Release(task);
-            Release(folder);
-            Release(service);
-        }
+        { throw new IOException(e.Message, e); }
+        finally { ReleaseCom(action, actions, definition, task, folder, service); }
     }
 
     public void Dispose()

@@ -7,10 +7,9 @@
 #include "localization.h"
 #include "log.h"
 #include "shell/quick_toggles.h"
+#include "shell/shell_launch.h"
 #include "shell/system_chrome.h"
 #include "ui/control_layout.h"
-
-#include <shellapi.h>
 
 #include <algorithm>
 
@@ -24,6 +23,16 @@ using control::kPad;
 using control::kRowH;
 using control::kTopH;
 using control::kW;
+
+void OpenControlUri(const wchar_t* uri)
+{
+    LaunchRequest req;
+    req.target = uri;
+    req.verb = L"open";
+    req.kind = LaunchTargetKind::Uri;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    ShellLaunchAsync(std::move(req));
+}
 
 struct ModuleSpec {
     const wchar_t* id;
@@ -234,13 +243,13 @@ void ControlCenter::FlipModule(const std::wstring& id)
         if (!switched)
             Log(L"control: %s could not be switched %s", id.c_str(), want ? L"on" : L"off");
         if (id == L"airplane" && !switched)
-            ShellExecuteW(nullptr, L"open", L"ms-settings:network-airplanemode", nullptr, nullptr, SW_SHOWNORMAL);
+            OpenControlUri(L"ms-settings:network-airplanemode");
         std::optional<bool> now = ReadSwitch(id);
         // Plugged in, Windows keeps energy saver to its own switch (the threshold only counts on battery):
         // the threshold goes back and its settings page opens instead.
         if (id == L"energysaver" && want && now == false) {
             SetEnergySaver(false);
-            ShellExecuteW(nullptr, L"open", L"ms-settings:batterysaver", nullptr, nullptr, SW_SHOWNORMAL);
+            OpenControlUri(L"ms-settings:batterysaver");
         }
         PostResult(WM_CC_MODULES, [&] {
             if (!moduleSlot_)
@@ -320,7 +329,7 @@ bool ControlCenter::ActivateSubpage(const std::wstring& id)
     }
     if (id == L"locsettings") {
         Close();
-        ShellExecuteW(nullptr, L"open", L"ms-settings:privacy-location", nullptr, nullptr, SW_SHOWNORMAL);
+        OpenControlUri(L"ms-settings:privacy-location");
         return true;
     }
     if (id.starts_with(L"disconnect:")) {
@@ -336,7 +345,7 @@ bool ControlCenter::ActivateSubpage(const std::wstring& id)
         WifiNetwork n = networks_[i];
         if (n.profile.empty()) {
             Close();
-            ShellExecuteW(nullptr, L"open", L"ms-availablenetworks:", nullptr, nullptr, SW_SHOWNORMAL);
+            OpenControlUri(L"ms-availablenetworks:");
         } else {
             WifiOp(n, true, 4000);
             scanning_ = true;

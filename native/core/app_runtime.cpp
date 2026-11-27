@@ -8,6 +8,7 @@
 #include "desktop_helpers.h"
 #include "extras_host.h"
 #include "host_messages.h"
+#include "lifecycle_server.h"
 #include "log.h"
 #include "render/capture.h"
 #include "render/shutdown_wait.h"
@@ -18,6 +19,7 @@
 #include "shell/jump_list.h"
 #include "shell/notification_listener.h"
 #include "shell/shell_icon.h"
+#include "shell/shell_launch.h"
 #include "shell/system_chrome.h"
 #include "shell/tray_model.h"
 #include "shell/update_checker.h"
@@ -35,6 +37,7 @@
 #include "ui/start_menu.h"
 #include "ui/tray_panel.h"
 #include "ui/window_preview.h"
+#include "win32_path.h"
 
 #include <shellapi.h>
 
@@ -244,8 +247,14 @@ void OpenSystem(const std::wstring& what)
         Log(L"start: system entry tray (tray panel)");
         return;
     }
-    if (what == L"account")
-        ShellExecuteW(nullptr, L"open", L"ms-settings:yourinfo", nullptr, nullptr, SW_SHOWNORMAL);
+    if (what == L"account") {
+        LaunchRequest req;
+        req.target = L"ms-settings:yourinfo";
+        req.kind = LaunchTargetKind::Uri;
+        req.privilege = LaunchPrivilege::ShellDefault;
+        req.show = SW_SHOWNORMAL;
+        ShellLaunchAsync(std::move(req));
+    }
     Log(L"start: system entry %s", what.c_str());
 }
 
@@ -351,6 +360,7 @@ void Reorder(const std::wstring& key, int to) { ReorderBarTask(MenuEnv(), key, t
 
 void InitializeSubsystems(HINSTANCE instance, Settings& settings)
 {
+    StartShellLaunch();
     g_app.bar = std::make_unique<Bar>(instance, g_app.capturable);
     g_app.activeBar = g_app.bar.get();
     Surface::SetGlassHost(g_app.bar.get());
@@ -411,6 +421,36 @@ void InitializeSubsystems(HINSTANCE instance, Settings& settings)
         if (g_app.updates)
             g_app.updates->SetAutoCheck(on);
     });
+    g_app.onRestartStandard = [] {
+        if (!CanDeElevateToShell(CurrentPrivilegeMode()))
+            return false;
+        const std::wstring exe = ModulePath();
+        if (exe.empty())
+            return false;
+        LaunchRequest req;
+        req.target = exe;
+        req.parameters = L"--replace" + DataDirectoryArgs();
+        req.kind = LaunchTargetKind::Executable;
+        req.privilege = LaunchPrivilege::RequireMedium;
+        req.show = SW_SHOWNORMAL;
+        return ShellLaunch(req, kDefaultShellLaunchTimeoutMs).outcome == LaunchOutcome::Succeeded;
+    };
+    g_app.lifecycle = std::make_unique<LifecycleServer>(g_app.host, std::wstring{},
+                                                        LifecycleCallbacks{
+                                                            .onOpenSettings =
+                                                                [](const std::wstring& page) {
+                                                                    if (page.empty() && g_app.host)
+                                                                        PostMessageW(g_app.host, WM_OPEN_SETTINGS, 0, 0);
+                                                                    else
+                                                                        OpenSettingsQuiet(page.empty() ? nullptr : page.c_str());
+                                                                },
+                                                            .onQuit =
+                                                                [] {
+                                                                    if (g_app.host)
+                                                                        PostMessageW(g_app.host, WM_CLOSE, 0, 0);
+                                                                },
+                                                            .onRestartStandard = [] { return g_app.onRestartStandard ? g_app.onRestartStandard() : false; },
+                                                        });
     BindStartMenuCallbacks(settings);
 }
 
@@ -435,7 +475,7 @@ void ShutdownApp(HANDLE mutex, std::thread& startupThread)
         AbortStuckShutdown(mutex, L"core: exited (render thread stuck)");
         return;
     }
-    g_app.server.reset(), g_app.updates.reset(), g_app.listener.reset();
+    g_app.lifecycle.reset(), g_app.server.reset(), g_app.updates.reset(), g_app.listener.reset();
     g_app.wechat.reset(), g_app.feishu.reset(), g_app.usb.reset();
     g_app.notes.reset(), g_app.widgets.reset(), g_app.calendar.reset(), g_app.control.reset();
     g_app.trayPanel.reset(), g_app.tray.reset(), g_app.start.reset();
@@ -459,6 +499,7 @@ void ShutdownApp(HANDLE mutex, std::thread& startupThread)
     g_app.tasks.reset();
     g_app.drainingBars.clear(), g_app.secondaryBars.clear(), g_app.bar.reset();
     g_app.chrome.reset();
+    StopShellLaunch();
     if (startupThread.joinable())
         startupThread.join();
     Log(L"core: exited");

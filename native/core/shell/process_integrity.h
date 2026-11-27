@@ -1,68 +1,97 @@
-// Process token integrity level inspection for UIPI boundary handling across Stage Manager,
-// window snapshots, Settings IPC, and privilege-elevation detection.
+// Process token integrity level inspection, privilege classification, and least-privilege ACL builders.
 #pragma once
 
 #include <windows.h>
 
-#include <vector>
+#include <string>
 
 namespace atrium {
+
+enum class IntegrityRelation { Lower, Equal, Higher, Unknown };
+
+enum class PrivilegeMode { Standard, ElevatedSplit, ElevatedUnified, CrossAccountElevated, Unknown };
+
+struct ProcessSecurityContext {
+    DWORD integrityRid = 0;
+    std::wstring userSid;
+    LUID logonId{};
+    DWORD sessionId = 0;
+    bool isElevated = false;
+    bool hasUiAccess = false;
+    bool isAppContainer = false;
+    bool isRestricted = false;
+    bool valid = false;
+};
+
+struct ShellProcessIdentity {
+    DWORD pid = 0;
+    FILETIME creationTime{};
+    ProcessSecurityContext context;
+    bool valid = false;
+};
+
+// Exact client rights for same-user named pipes: avoids GENERIC_ALL and FILE_CREATE_PIPE_INSTANCE (0x0004).
+inline constexpr DWORD kPipeClientAccessMask = FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
+inline constexpr DWORD kMutexSameUserAccessMask = MUTEX_ALL_ACCESS;
 
 inline bool IsHigherIntegrityRid(DWORD selfRid, DWORD targetRid) { return selfRid != 0 && targetRid > selfRid; }
 
 inline bool IsElevatedIntegrityRid(DWORD rid) { return rid >= SECURITY_MANDATORY_HIGH_RID; }
 
-inline DWORD ProcessIntegrityRid(HANDLE process, DWORD* errorOut = nullptr)
-{
-    if (errorOut)
-        *errorOut = 0;
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
-        if (errorOut)
-            *errorOut = GetLastError();
-        return 0;
-    }
-    DWORD size = 0;
-    GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &size);
-    std::vector<BYTE> buffer(size);
-    DWORD rid = 0;
-    if (size && GetTokenInformation(token, TokenIntegrityLevel, buffer.data(), size, &size)) {
-        const auto* label = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(buffer.data());
-        const UCHAR count = *GetSidSubAuthorityCount(label->Label.Sid);
-        if (count > 0)
-            rid = *GetSidSubAuthority(label->Label.Sid, DWORD(count - 1));
-    } else if (errorOut) {
-        *errorOut = GetLastError();
-    }
-    CloseHandle(token);
-    return rid;
-}
+// Directional: compares callerRid against targetRid; returns Unknown if either RID is 0.
+IntegrityRelation CompareIntegrity(DWORD callerRid, DWORD targetRid);
 
-inline DWORD SelfIntegrityRid()
-{
-    static const DWORD kSelf = ProcessIntegrityRid(GetCurrentProcess());
-    return kSelf;
-}
+PrivilegeMode ClassifyPrivilegeMode(const ProcessSecurityContext& self, const ProcessSecurityContext& shell);
 
-inline bool IsElevatedProcess() { return IsElevatedIntegrityRid(SelfIntegrityRid()); }
+bool CanDeElevateToShell(PrivilegeMode mode);
 
-inline bool WindowHasHigherIntegrity(HWND window)
-{
-    if (!window)
-        return false;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(window, &pid);
-    if (!pid || pid == GetCurrentProcessId())
-        return false;
-    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc)
-        return GetLastError() == ERROR_ACCESS_DENIED;
-    DWORD err = 0;
-    const DWORD targetRid = ProcessIntegrityRid(proc, &err);
-    CloseHandle(proc);
-    if (targetRid == 0)
-        return err == ERROR_ACCESS_DENIED;
-    return IsHigherIntegrityRid(SelfIntegrityRid(), targetRid);
-}
+const wchar_t* PrivilegeModeWireName(PrivilegeMode mode);
+
+DWORD ProcessIntegrityRid(HANDLE process, DWORD* errorOut = nullptr);
+
+DWORD SelfIntegrityRid();
+
+bool IsElevatedProcess();
+
+bool WindowHasHigherIntegrity(HWND window);
+
+ProcessSecurityContext QueryProcessSecurityContext(HANDLE process, DWORD* errorOut = nullptr);
+
+ProcessSecurityContext QueryPidSecurityContext(DWORD pid, DWORD* errorOut = nullptr);
+
+const ProcessSecurityContext& SelfSecurityContext();
+
+ShellProcessIdentity ResolveShellProcessIdentity();
+
+PrivilegeMode CurrentPrivilegeMode();
+
+std::wstring BuildSameUserPipeSddl(const std::wstring& userSid, bool includeMediumLabel);
+
+std::wstring BuildSameUserMutexSddl(const std::wstring& userSid, bool includeMediumLabel);
+
+// Owns a Win32 SECURITY_DESCRIPTOR and SECURITY_ATTRIBUTES for kernel objects.
+class KernelObjectSecurity {
+public:
+    KernelObjectSecurity() = default;
+    ~KernelObjectSecurity();
+    KernelObjectSecurity(const KernelObjectSecurity&) = delete;
+    KernelObjectSecurity& operator=(const KernelObjectSecurity&) = delete;
+    KernelObjectSecurity(KernelObjectSecurity&& other) noexcept;
+    KernelObjectSecurity& operator=(KernelObjectSecurity&& other) noexcept;
+
+    static KernelObjectSecurity CreateSameUserPipe();
+    static KernelObjectSecurity CreateSameUserMutex();
+    static KernelObjectSecurity FromSddl(const std::wstring& sddl);
+
+    bool Valid() const { return sd_ != nullptr; }
+    bool ShouldFailClosed() const { return !Valid() && IsElevatedProcess(); }
+    SECURITY_ATTRIBUTES* Get() { return sd_ ? &sa_ : nullptr; }
+
+private:
+    explicit KernelObjectSecurity(PSECURITY_DESCRIPTOR sd);
+
+    PSECURITY_DESCRIPTOR sd_ = nullptr;
+    SECURITY_ATTRIBUTES sa_{sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE};
+};
 
 } // namespace atrium

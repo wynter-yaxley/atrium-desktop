@@ -10,12 +10,29 @@ namespace Atrium.Settings;
 // Administrator privileges card in Settings -> System, core connection/lifecycle, and external settings sync.
 public sealed partial class MainWindow
 {
-    private TextBlock? _adminStatus;
+    private TextBlock? _adminStatus, _adminNote;
     private Button? _adminButton;
-    private bool _adminBuilt;
+    private bool _adminBuilt, _coreExitDenied, _systemClosedHooked;
+    private CoreClient.NativeProcessWaitHandle? _coreProcessHandle;
+    private RegisteredWaitHandle? _coreExitWait;
+    private CancellationTokenSource? _lifecycleCts;
+
+    private void HookSystemClosed()
+    {
+        if (_systemClosedHooked) return;
+        _systemClosedHooked = true;
+        Closed += (_, _) =>
+        {
+            _lifecycleCts?.Cancel();
+            _lifecycleCts?.Dispose();
+            _lifecycleCts = null;
+            DetachCoreProcess();
+        };
+    }
 
     private void EnsureAdminCard()
     {
+        HookSystemClosed();
         if (!_adminBuilt)
         {
             _adminBuilt = true;
@@ -29,7 +46,7 @@ public sealed partial class MainWindow
                 Text = Loc.T("Run as administrator"),
                 Style = (Style)Application.Current.Resources["RowTitleStyle"],
             };
-            var note = new TextBlock
+            _adminNote = new TextBlock
             {
                 Text = Loc.T("Manage elevated apps in Stage Manager, previews and tray. Prompts UAC; Explorer cannot drag onto an elevated taskbar."),
                 Style = (Style)Application.Current.Resources["RowNoteStyle"],
@@ -45,9 +62,9 @@ public sealed partial class MainWindow
                 VerticalAlignment = VerticalAlignment.Center,
                 MinWidth = 140,
             };
-            _adminButton.Click += OnRestartAsAdminClick;
+            _adminButton.Click += OnAdminActionClick;
 
-            var left = new StackPanel { Spacing = 4, Children = { title, note, _adminStatus } };
+            var left = new StackPanel { Spacing = 4, Children = { title, _adminNote, _adminStatus } };
             var grid = new Grid { ColumnSpacing = 16 };
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -70,30 +87,39 @@ public sealed partial class MainWindow
     {
         _coreProcess?.Dispose();
         _coreProcess = null;
+        _coreExitWait?.Unregister(null);
+        _coreExitWait = null;
+        _coreProcessHandle?.Dispose();
+        _coreProcessHandle = null;
+        _coreExitDenied = false;
     }
+
+    private CorePrivilegeInfo CurrentPrivilegeInfo() =>
+        new(_client.CoreElevated, _client.PrivilegeMode, _client.CanDeElevate);
 
     private void RefreshAdminCard()
     {
-        if (_adminStatus == null || _adminButton == null) return;
-        bool running = _client.Connected;
-        bool elevated = running && _client.CoreElevated;
-        bool canRun = CoreClient.CoreExe() != null && !_coreChanging;
-        _adminStatus.Text = elevated ? Loc.T("Running as administrator")
-            : running ? Loc.T("Running as standard user")
-            : Loc.T("Atrium is not running");
-        _adminButton.Content = elevated ? Loc.T("Running as administrator")
-            : running ? Loc.T("Restart as administrator")
-            : Loc.T("Start as administrator");
-        _adminButton.IsEnabled = canRun && !elevated;
+        if (_adminStatus == null || _adminNote == null || _adminButton == null) return;
+        var model = CoreClient.GetAdminCardState(_client.Connected, CurrentPrivilegeInfo(), CoreClient.CoreExe() != null, _coreChanging);
+        _adminStatus.Text = model.Status;
+        _adminNote.Text = model.Note;
+        _adminButton.Visibility = model.ButtonVisible ? Visibility.Visible : Visibility.Collapsed;
+        _adminButton.Content = model.ButtonText ?? string.Empty;
+        _adminButton.IsEnabled = model.ButtonEnabled;
     }
 
-    private async Task<bool> WaitForCoreExitAsync(string exe, bool sentPipeQuit)
+    private async Task<bool> WaitForCoreExitAsync(string exe, bool sentPipeQuit, int oldPid)
     {
-        if (sentPipeQuit)
+        if (sentPipeQuit && _coreProcessHandle != null)
+        {
+            if (await CoreClient.WaitForProcessExitAsync(_coreProcessHandle, 6000)) return true;
+        }
+        else if (sentPipeQuit && _coreExitDenied && oldPid > 0)
         {
             for (int i = 0; i < 40; i++)
             {
-                if (_coreProcess == null || _coreProcess.HasExited) return true;
+                int? activePid = await _client.PingLifecyclePidAsync(300);
+                if (activePid == null || activePid != oldPid) return true;
                 await Task.Delay(150);
             }
         }
@@ -105,7 +131,53 @@ public sealed partial class MainWindow
         return quit.ExitCode == 0;
     }
 
-    private async void OnRestartAsAdminClick(object sender, RoutedEventArgs e)
+    private async void OnAdminActionClick(object sender, RoutedEventArgs e)
+    {
+        var model = CoreClient.GetAdminCardState(_client.Connected, CurrentPrivilegeInfo(), CoreClient.CoreExe() != null, _coreChanging);
+        if (model.Action is AdminCardAction.StartAsAdmin or AdminCardAction.RestartAsAdmin)
+            await RestartAsAdminUiAsync();
+        else if (model.Action == AdminCardAction.RestartAsStandard)
+            await RestartAsStandardUiAsync();
+    }
+
+    private async Task RestartAsStandardUiAsync()
+    {
+        if (_coreChanging || !_client.Connected || !_client.CoreElevated || !_client.CanDeElevate) return;
+        if (_session.HasUnsavedChanges && !await SaveAsync()) return;
+
+        HookSystemClosed();
+        _coreChanging = true;
+        RefreshAdminCard();
+        CoreSwitch.IsEnabled = false;
+        Status.IsOpen = false;
+        _lifecycleCts?.Cancel();
+        _lifecycleCts?.Dispose();
+        _lifecycleCts = new CancellationTokenSource();
+        try
+        {
+            var result = await _client.RestartAsStandardAsync(_lifecycleCts.Token);
+            if (_updatesClosed) return;
+            if (result.Reconnected) await SyncConnectedStateAsync();
+            if (result.Succeeded)
+            {
+                WatchCore();
+                ShowMessage(InfoBarSeverity.Success, Loc.T("Standard user mode active"),
+                    Loc.T("Atrium is now running as a standard user."));
+            }
+            else if (result.Error != null)
+            {
+                ShowMessage(result.Reconnected ? InfoBarSeverity.Warning : InfoBarSeverity.Error,
+                    Loc.T("Could not restart as standard user"), result.Error);
+            }
+        }
+        finally
+        {
+            FinishCoreChange(watch: true);
+            RefreshAdminCard();
+        }
+    }
+
+    private async Task RestartAsAdminUiAsync()
     {
         if (_coreChanging || (_client.Connected && _client.CoreElevated)) return;
         string? exe = CoreClient.CoreExe();
@@ -263,14 +335,15 @@ public sealed partial class MainWindow
     private void ShowStatus(bool connected)
     {
         StatusDot.Fill = connected ? RunningBrush : IdleBrush;
+        bool alive = CoreClient.IsProcessRunning(_coreProcessHandle);
         _updatingCoreSwitch = true;
-        CoreSwitch.IsOn = connected || (_coreProcess != null && !_coreProcess.HasExited);
+        CoreSwitch.IsOn = connected || alive;
         _updatingCoreSwitch = false;
         CoreSwitch.IsEnabled = !_coreChanging && CoreClient.CoreExe() != null;
         if (!_coreChanging)
         {
             StatusMessage.Text = connected ? Loc.T("Running") : _client.ConnectionError ??
-                (_coreProcess != null && !_coreProcess.HasExited
+                (alive
                     ? Loc.T("The core is still running; the settings connection closed")
                     : Loc.T("Closed; Windows' taskbar is back"));
         }
@@ -303,28 +376,26 @@ public sealed partial class MainWindow
     // Follow the process exit event rather than polling the pipe while the settings window is idle.
     private void WatchCore()
     {
+        HookSystemClosed();
         if (_updatesClosed) return;
-        if (!_client.Connected && _coreProcess != null && !_coreProcess.HasExited) return;
-        _coreProcess?.Dispose();
-        _coreProcess = null;
+        if (!_client.Connected && CoreClient.IsProcessRunning(_coreProcessHandle)) return;
+        DetachCoreProcess();
         if (!_client.Connected || _updatesClosed) return;
-        try
+        var handle = CoreClient.TryOpenProcessHandle(_client.ProcessId, out bool accessDenied);
+        if (handle == null)
         {
-            var process = Process.GetProcessById(_client.ProcessId);
-            _coreProcess = process;
-            process.Exited += (_, _) => DispatcherQueue.TryEnqueue(() =>
-            {
-                if (_coreProcess != process)
-                    return;
-                _client.Disconnect(coreStopped: true);
-                _coreProcess.Dispose();
-                _coreProcess = null;
-                ShowStatus(false);
-            });
-            process.EnableRaisingEvents = true;
+            if (accessDenied) { _coreExitDenied = true; return; }
+            _client.Disconnect(coreStopped: true);
+            return;
         }
-        catch (System.ComponentModel.Win32Exception) { DetachCoreProcess(); }
-        catch (ArgumentException) { _client.Disconnect(coreStopped: true); }
+        _coreProcessHandle = handle;
+        _coreExitWait = ThreadPool.RegisterWaitForSingleObject(handle, (_, _) => DispatcherQueue.TryEnqueue(() =>
+        {
+            if (!ReferenceEquals(_coreProcessHandle, handle)) return;
+            _client.Disconnect(coreStopped: true);
+            DetachCoreProcess();
+            ShowStatus(false);
+        }), null, Timeout.Infinite, executeOnlyOnce: true);
     }
 
     private async void OnCoreToggled(object sender, RoutedEventArgs e)
@@ -346,10 +417,11 @@ public sealed partial class MainWindow
             }
             else
             {
+                int oldPid = _client.ProcessId;
                 bool sentQuit = _client.Connected && await _client.QuitCoreAsync();
                 _client.Disconnect();
                 WatchCore();
-                if (!await WaitForCoreExitAsync(exe, sentQuit))
+                if (!await WaitForCoreExitAsync(exe, sentQuit, oldPid))
                     throw new InvalidOperationException(Loc.T("Atrium has not quit yet. Try again later."));
                 _client.Disconnect(coreStopped: true);
             }

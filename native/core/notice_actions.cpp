@@ -2,16 +2,12 @@
 
 #include "desktop_helpers.h"
 #include "localization.h"
+#include "shell/shell_launch.h"
 #include "shell/task_model.h"
 #include "shell/tray_model.h"
 #include "shell/wechat_source.h"
 #include "ui/notifications.h"
 #include "win32_path.h"
-
-#include <shellapi.h>
-#include <shobjidl.h>
-
-#include <winrt/base.h>
 
 #include <algorithm>
 #include <array>
@@ -74,19 +70,16 @@ bool SameAppItem(const TaskItem& t, const PinnedApp& pin, const std::wstring& ke
                                                             aumid.find(L"qqdesktop") != std::wstring::npos || aumid.find(L"qqnt") != std::wstring::npos)));
 }
 
-bool ShellExecuteApp(const std::wstring& aumid)
-{
-    const std::wstring path = (aumid.size() > 2 && aumid[1] == L':') ? aumid : L"shell:AppsFolder\\" + aumid;
-    return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
-}
-
-bool ActivateAumidApp(const std::wstring& aumid)
+bool LaunchNoticeApp(const std::wstring& aumid)
 {
     AllowSetForegroundWindow(ASFW_ANY);
-    winrt::com_ptr<IApplicationActivationManager> aam;
-    DWORD pid = 0;
-    return SUCCEEDED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(aam.put()))) &&
-           SUCCEEDED(aam->ActivateApplication(aumid.c_str(), nullptr, AO_NONE, &pid));
+    const bool isDrivePath = aumid.size() > 2 && aumid[1] == L':';
+    LaunchRequest req;
+    req.target = aumid;
+    req.verb = L"open";
+    req.kind = isDrivePath ? LaunchTargetKind::Executable : LaunchTargetKind::AppUserModelId;
+    req.privilege = LaunchPrivilege::ShellDefault;
+    return ShellLaunch(req).outcome == LaunchOutcome::Succeeded;
 }
 
 } // namespace
@@ -142,8 +135,14 @@ bool RunNoticeAction(const NoticeActionEnv& env, const Notice& n)
 {
     if (n.action == L"settings:updates")
         return env.openSettings ? (env.openSettings(L"about"), true) : true;
-    if (n.action.starts_with(L"uri:"))
-        return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", n.action.substr(4).c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+    if (n.action.starts_with(L"uri:")) {
+        LaunchRequest req;
+        req.target = n.action.substr(4);
+        req.verb = L"open";
+        req.kind = LaunchTargetKind::Uri;
+        req.privilege = LaunchPrivilege::ShellDefault;
+        return ShellLaunch(req).outcome == LaunchOutcome::Succeeded;
+    }
     if (!n.action.starts_with(L"app:"))
         return true;
 
@@ -164,15 +163,15 @@ bool RunNoticeAction(const NoticeActionEnv& env, const Notice& n)
             if (trayIcon && env.tray)
                 clickTray();
             else if (!(env.tray && env.tray->OpenExisting(aumid, n.pid)))
-                ShellExecuteApp(aumid);
+                LaunchNoticeApp(aumid);
         }
         if (env.wechat)
             env.wechat->OpenChat(n.title, n.pid);
         return true;
     case NoticeAppRoute::ClickTrayIcon: clickTray(); return true;
     case NoticeAppRoute::ShowAppWindow: ShowNoticeAppTarget(env.tasks, appTaskKey, n.pid); return true;
-    case NoticeAppRoute::ActivateAumid: return ActivateAumidApp(aumid) || ShellExecuteApp(aumid);
-    case NoticeAppRoute::ShellOpen: return ShellExecuteApp(aumid);
+    case NoticeAppRoute::ActivateAumid:
+    case NoticeAppRoute::ShellOpen: return LaunchNoticeApp(aumid);
     }
     return true;
 }

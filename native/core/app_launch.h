@@ -18,6 +18,7 @@ inline constexpr wchar_t kInstanceMutex[] = L"Local\\Atrium.Core";
 
 std::wstring ExeDir();
 void OpenSettings(const wchar_t* page = nullptr);
+void OpenSettingsQuiet(const wchar_t* page = nullptr);
 std::thread StartLogonUpdate(const Settings& settings);
 std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch);
 HANDLE AcquireInstanceMutex(int& exitCode, bool replace);

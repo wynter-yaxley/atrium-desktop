@@ -3,6 +3,7 @@
 
 #include "log.h"
 #include "shell/keyboard_hook.h"
+#include "shell/process_integrity.h"
 #include "shell/tray_click.h"
 
 #include <shlwapi.h>
@@ -97,25 +98,26 @@ bool FollowStillValid()
 
 bool FollowProcessAllowed(DWORD pid, std::wstring& path)
 {
-    if (g_follow.exe.empty())
+    if (g_follow.exe.empty() || !pid)
         return false;
-    bool elevated = true;
+    DWORD selfSession = 0;
+    DWORD targetSession = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &selfSession) || !ProcessIdToSessionId(pid, &targetSession) || selfSession != targetSession)
+        return false;
+    DWORD targetRid = 0;
     if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
         wchar_t buf[32768];
         DWORD size = DWORD(std::size(buf));
         if (QueryFullProcessImageNameW(process, 0, buf, &size))
             path.assign(buf, size);
-        HANDLE token = nullptr;
-        if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
-            TOKEN_ELEVATION e{};
-            DWORD got = 0;
-            if (GetTokenInformation(token, TokenElevation, &e, sizeof(e), &got))
-                elevated = e.TokenIsElevated != 0;
-            CloseHandle(token);
-        }
+        targetRid = ProcessIntegrityRid(process);
         CloseHandle(process);
     }
-    if (elevated || path.empty() || CompareStringOrdinal(path.c_str(), -1, g_follow.exe.c_str(), -1, TRUE) != CSTR_EQUAL)
+    // Target at higher or unknown integrity cannot be moved across UIPI.
+    const IntegrityRelation relation = CompareIntegrity(targetRid, SelfIntegrityRid());
+    if (relation == IntegrityRelation::Higher || relation == IntegrityRelation::Unknown)
+        return false;
+    if (path.empty() || CompareStringOrdinal(path.c_str(), -1, g_follow.exe.c_str(), -1, TRUE) != CSTR_EQUAL)
         return false;
     return g_follow.menu || g_follow.pid == 0 || pid == g_follow.pid;
 }

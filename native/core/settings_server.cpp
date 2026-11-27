@@ -6,8 +6,6 @@
 #include "shell/logon_task.h"
 #include "ui/desktop_widgets.h"
 
-#include <sddl.h>
-
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
@@ -52,59 +50,6 @@ std::wstring MakeInstanceId()
     return std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" +
            std::to_wstring(seq.fetch_add(1, std::memory_order_relaxed));
 }
-
-std::wstring CurrentUserSid()
-{
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        return {};
-    DWORD size = 0;
-    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
-    std::string buffer(size, '\0');
-    wchar_t* sidText = nullptr;
-    std::wstring result;
-    if (size && GetTokenInformation(token, TokenUser, buffer.data(), size, &size) &&
-        ConvertSidToStringSidW(reinterpret_cast<const TOKEN_USER*>(buffer.data())->User.Sid, &sidText)) {
-        result = sidText;
-        LocalFree(sidText);
-    }
-    CloseHandle(token);
-    return result;
-}
-
-struct PipeSecurity {
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    SECURITY_ATTRIBUTES sa{sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE};
-
-    PipeSecurity()
-    {
-        const std::wstring sid = CurrentUserSid();
-        if (sid.empty()) {
-            Log(L"pipe: could not resolve user SID for DACL (%lu), using default security", GetLastError());
-            return;
-        }
-        std::wstring sddl = L"D:P(A;;GA;;;" + sid + L")(A;;GA;;;SY)(A;;GA;;;BA)";
-        if (IsElevatedProcess())
-            sddl += L"S:(ML;;NW;;;ME)";
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
-            Log(L"pipe: ConvertStringSecurityDescriptorToSecurityDescriptorW failed (%lu), using default security", GetLastError());
-            sd = nullptr;
-            return;
-        }
-        sa.lpSecurityDescriptor = sd;
-    }
-
-    ~PipeSecurity()
-    {
-        if (sd)
-            LocalFree(sd);
-    }
-
-    PipeSecurity(const PipeSecurity&) = delete;
-    PipeSecurity& operator=(const PipeSecurity&) = delete;
-
-    SECURITY_ATTRIBUTES* Get() { return sd ? &sa : nullptr; }
-};
 
 bool MatchesExpected(const json::JsonObject& o, const std::wstring& instanceId, uint64_t revision)
 {
@@ -307,7 +252,12 @@ void SettingsServer::SetCurrent(const Settings& s)
 void SettingsServer::Run()
 {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    PipeSecurity security;
+    KernelObjectSecurity security = KernelObjectSecurity::CreateSameUserPipe();
+    if (!security.Valid()) {
+        Log(L"pipe: could not build pipe security descriptor (%lu); failing closed", GetLastError());
+        winrt::uninit_apartment();
+        return;
+    }
     bool readyNotified = false;
     while (WaitForSingleObject(quit_, 0) == WAIT_TIMEOUT) {
         // First instance only: another process cannot pre-create our pipe name.
@@ -409,7 +359,10 @@ std::string SettingsServer::Handle(const std::string& request)
         r.SetNamedValue(L"protocol", json::JsonValue::CreateNumberValue(kProtocol));
         r.SetNamedValue(L"instanceId", json::JsonValue::CreateStringValue(instanceId_));
         r.SetNamedValue(L"revision", json::JsonValue::CreateNumberValue(double(revision)));
+        const PrivilegeMode privilegeMode = CurrentPrivilegeMode();
         r.SetNamedValue(L"elevated", json::JsonValue::CreateBooleanValue(IsElevatedProcess()));
+        r.SetNamedValue(L"privilegeMode", json::JsonValue::CreateStringValue(PrivilegeModeWireName(privilegeMode)));
+        r.SetNamedValue(L"canDeElevate", json::JsonValue::CreateBooleanValue(CanDeElevateToShell(privilegeMode)));
         r.SetNamedValue(L"saved", json::JsonObject::Parse(saved.ToJson()));
         r.SetNamedValue(L"current", json::JsonObject::Parse(current.ToJson()));
         r.SetNamedValue(L"path", json::JsonValue::CreateStringValue(EffectiveSettingsPath()));

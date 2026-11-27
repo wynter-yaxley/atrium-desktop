@@ -270,14 +270,8 @@ internal static class ReleaseInstaller
     {
         IntPtr host = FindWindow("AtriumCoreHost", null);
         if (host == IntPtr.Zero || GetWindowThreadProcessId(host, out uint pid) == 0) return;
-        try
-        {
-            using var core = Process.GetProcessById((int)pid);
-            if (string.Equals(core.MainModule?.FileName, CoreClient.CoreExe(), StringComparison.OrdinalIgnoreCase))
-                PostMessage(host, 0x8000 + 11, UIntPtr.Zero, IntPtr.Zero);
-        }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
-        { /* The core may have exited; it reads ready.json on its next startup. */ }
+        if (string.Equals(CoreClient.TryGetProcessPath((int)pid), CoreClient.CoreExe(), StringComparison.OrdinalIgnoreCase))
+            PostMessage(host, 0x8000 + 11, UIntPtr.Zero, IntPtr.Zero);
     }
 
     private static void ValidatePackage(string directory, Version expected, Func<string, Version>? versionReader = null) =>

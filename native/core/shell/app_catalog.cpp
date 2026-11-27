@@ -3,9 +3,9 @@
 #include "log.h"
 #include "shell/app_catalog_rules.h"
 #include "shell/shell_icon.h"
+#include "shell/shell_launch.h"
 #include "shell/start_layout.h"
 
-#include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <knownfolders.h>
@@ -406,13 +406,19 @@ void AppCatalog::Worker()
 
 bool AppCatalog::Launch(const CatalogApp& app)
 {
-    std::wstring path = ShellTarget(app.id);
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI;
-    sei.lpFile = path.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        Log(L"catalog: launch of %s failed (%lu)", app.id.c_str(), GetLastError());
+    LaunchRequest req;
+    req.target = ShellTarget(app.id);
+    if (IsPath(app.id))
+        req.kind = Fold(app.id).ends_with(L".lnk") ? LaunchTargetKind::Shortcut : LaunchTargetKind::Executable;
+    else if (app.id.starts_with(L"::{"))
+        req.kind = LaunchTargetKind::Uri;
+    else
+        req.kind = LaunchTargetKind::AppUserModelId;
+    req.privilege = LaunchPrivilege::ShellDefault;
+
+    const LaunchResult result = ShellLaunch(req);
+    if (result.outcome != LaunchOutcome::Succeeded) {
+        Log(L"catalog: launch of %s failed (%lu)", app.id.c_str(), result.error);
         return false;
     }
     Log(L"catalog: launched %s", app.id.c_str());
@@ -435,17 +441,18 @@ bool AppCatalog::LaunchAsAdmin(const CatalogApp& app)
     if (file.empty() || GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES)
         return false;
     const std::wstring dir = link ? std::wstring() : file.substr(0, file.find_last_of(L"\\/"));
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI;
-    sei.lpVerb = L"runas";
-    sei.lpFile = file.c_str();
-    sei.lpParameters = link || app.args.empty() ? nullptr : app.args.c_str();
-    sei.lpDirectory = dir.empty() ? nullptr : dir.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        const DWORD error = GetLastError();
-        if (error != ERROR_CANCELLED) // the user said no at the prompt
-            Log(L"catalog: elevated launch of %s failed (%lu)", file.c_str(), error);
+    LaunchRequest req;
+    req.target = file;
+    req.parameters = link ? std::wstring() : app.args;
+    req.workingDirectory = dir;
+    req.verb = L"runas";
+    req.kind = link ? LaunchTargetKind::Shortcut : LaunchTargetKind::Executable;
+    req.privilege = LaunchPrivilege::RequestElevation;
+
+    const LaunchResult result = ShellLaunch(req);
+    if (result.outcome != LaunchOutcome::Succeeded) {
+        if (result.error != ERROR_CANCELLED && result.outcome != LaunchOutcome::TimedOutOrUnknown)
+            Log(L"catalog: elevated launch of %s failed (%lu)", file.c_str(), result.error);
         return false;
     }
     Log(L"catalog: launched %s as administrator", file.c_str());

@@ -9,6 +9,7 @@
 #include "localization.h"
 #include "log.h"
 #include "shell/quick_toggles.h"
+#include "shell/shell_launch.h"
 #include "shell/wifi.h"
 #include "../posted.h"
 
@@ -18,7 +19,6 @@
 #include <mmdeviceapi.h>
 #include <netlistmgr.h>
 #include <powrprof.h>
-#include <shellapi.h>
 
 #include <winrt/base.h>
 
@@ -588,15 +588,18 @@ PowerActionStatus ExecuteHibernateAction(DWORD* error)
         return PowerActionStatus::Unsupported;
     if (cap == HibernateCapability::NeedsEnable) {
         Log(L"power: hibernation is disabled; requesting elevation to enable and hibernate");
-        const std::wstring powercfg = SystemPowerCfgPath();
-        SHELLEXECUTEINFOW sei{sizeof(sei)};
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
-        sei.lpVerb = L"runas";
-        sei.lpFile = powercfg.c_str();
-        sei.lpParameters = L"/h on";
-        sei.nShow = SW_HIDE;
-        if (!ShellExecuteExW(&sei)) {
-            err = GetLastError();
+        LaunchRequest req;
+        req.target = SystemPowerCfgPath();
+        req.parameters = L"/h on";
+        req.verb = L"runas";
+        req.kind = LaunchTargetKind::Executable;
+        req.privilege = LaunchPrivilege::RequestElevation;
+        req.show = SW_HIDE;
+        req.noAsync = true;
+        req.captureProcess = true;
+        const LaunchResult launch = ShellLaunch(req, INFINITE);
+        if (launch.outcome != LaunchOutcome::Succeeded) {
+            err = launch.error;
             if (error)
                 *error = err;
             if (err == ERROR_CANCELLED) {
@@ -607,11 +610,11 @@ PowerActionStatus ExecuteHibernateAction(DWORD* error)
             return PowerActionStatus::ElevationFailed;
         }
         DWORD exitCode = 1;
-        if (sei.hProcess) {
-            const DWORD wait = WaitForSingleObject(sei.hProcess, 60000);
-            if (wait != WAIT_OBJECT_0 || !GetExitCodeProcess(sei.hProcess, &exitCode))
+        if (launch.process) {
+            const DWORD wait = WaitForSingleObject(launch.process, 60000);
+            if (wait != WAIT_OBJECT_0 || !GetExitCodeProcess(launch.process, &exitCode))
                 exitCode = 1;
-            CloseHandle(sei.hProcess);
+            CloseHandle(launch.process);
         }
         if (exitCode != 0) {
             if (error)

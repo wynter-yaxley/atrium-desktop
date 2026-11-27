@@ -41,6 +41,7 @@ add_library(atrium_core_lib STATIC
     notice_actions.cpp
     extras_host.cpp
     guard_process.cpp
+    lifecycle_server.cpp
     near_hover.cpp
     log.cpp
     settings.cpp
@@ -49,6 +50,7 @@ add_library(atrium_core_lib STATIC
     localization.cpp
     shell/ime_status.cpp
     shell/keyboard_hook.cpp
+    shell/process_integrity.cpp
     shell/shell_icon.cpp
     shell/task_launch.cpp
     shell/task_model.cpp
@@ -86,6 +88,7 @@ add_library(atrium_core_lib STATIC
     shell/tray_actions.cpp
     shell/tray_match.cpp
     shell/shell_verbs.cpp
+    shell/shell_launch.cpp
     shell/jump_list.cpp
     shell/folder_stacks.cpp
     shell/wechat_source.cpp

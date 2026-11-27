@@ -2,9 +2,9 @@
 
 #include "localization.h"
 #include "log.h"
+#include "shell/shell_launch.h"
 
 #include <imm.h>
-#include <shellapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -285,6 +285,7 @@ void DesktopWidgets::Activate(Widget& w)
     float s = w.surface->Scale();
     w.surface->Ripple(float(c.x) / s, float(c.y) / s);
     std::wstring open;
+    LaunchTargetKind kind = LaunchTargetKind::Uri;
     switch (w.kind) {
     case WidgetKind::Clock:
     case WidgetKind::Digital: open = L"ms-clock:"; break;
@@ -292,25 +293,42 @@ void DesktopWidgets::Activate(Widget& w)
         if (onCalendar)
             onCalendar();
         break;
-    case WidgetKind::System: open = L"taskmgr.exe"; break;
+    case WidgetKind::System:
+        open = L"taskmgr.exe";
+        kind = LaunchTargetKind::Executable;
+        break;
     case WidgetKind::Battery: open = world_.status.battery ? L"ms-settings:batterysaver" : L"ms-settings:powersleep"; break;
     case WidgetKind::Bluetooth: open = L"ms-settings:bluetooth"; break; // Bluetooth & devices: each device with its battery
     case WidgetKind::Network: open = L"ms-settings:network-status"; break; // 网络和 Internet: the adapters, their speeds and their usage
     case WidgetKind::Photos:
-        if (w.content.photo.empty())
+        if (w.content.photo.empty()) {
             PickFolder(w);
-        else
+        } else {
             open = w.content.photo;
+            kind = LaunchTargetKind::Folder;
+        }
         break;
-    case WidgetKind::Weather:
+    case WidgetKind::Weather: {
         // Windows' weather app, else its web page.
-        if (INT_PTR(ShellExecuteW(nullptr, L"open", L"msnweather:", nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+        LaunchRequest weatherReq;
+        weatherReq.target = L"msnweather:";
+        weatherReq.verb = L"open";
+        weatherReq.kind = LaunchTargetKind::Uri;
+        weatherReq.privilege = LaunchPrivilege::ShellDefault;
+        if (ShellLaunch(weatherReq).outcome == LaunchOutcome::Failed)
             open = L"https://www.msn.cn/zh-cn/weather/forecast";
         break;
+    }
     default: break;
     }
-    if (!open.empty())
-        ShellExecuteW(nullptr, L"open", open.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (!open.empty()) {
+        LaunchRequest req;
+        req.target = open;
+        req.verb = L"open";
+        req.kind = kind;
+        req.privilege = LaunchPrivilege::ShellDefault;
+        ShellLaunchAsync(std::move(req));
+    }
     Log(L"widgets: %s opened", NameOf(w.kind));
 }
 

@@ -2,14 +2,12 @@
 #include "shell/quick_links.h"
 
 #include "localization.h"
-#include "log.h"
+#include "shell/shell_launch.h"
 #include "shell/system_status.h"
 
 #include <windows.h>
-#include <objbase.h>
-#include <shellapi.h>
 
-#include <memory>
+#include <utility>
 
 namespace atrium {
 
@@ -52,45 +50,21 @@ bool HasMobilityCenter()
 
 const wchar_t* TerminalTarget() { return SearchPathW(nullptr, L"wt.exe", nullptr, 0, nullptr, nullptr) ? L"wt.exe" : L"powershell.exe"; }
 
-void ShellOpen(const wchar_t* target, bool elevated)
+void DispatchShellOpen(const wchar_t* target, LaunchTargetKind kind, bool elevated)
 {
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
-    sei.lpVerb = elevated ? L"runas" : nullptr;
-    sei.lpFile = target;
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        const DWORD err = GetLastError();
-        if (!elevated || err != ERROR_CANCELLED)
-            Log(L"quick_links: launch %s failed (%lu)", target, err);
-    }
-}
-
-struct LaunchJob {
-    const wchar_t* target = nullptr;
-    bool elevated = false;
-    bool terminal = false;
-};
-
-void CALLBACK LaunchWorker(PTP_CALLBACK_INSTANCE, void* ctx)
-{
-    const std::unique_ptr<LaunchJob> job(static_cast<LaunchJob*>(ctx));
-    const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    const wchar_t* target = job->terminal ? TerminalTarget() : job->target;
-    if (target)
-        ShellOpen(target, job->elevated);
-    if (SUCCEEDED(hr))
-        CoUninitialize();
-}
-
-void DispatchShellOpen(const wchar_t* target, bool elevated, bool terminal)
-{
-    auto job = std::make_unique<LaunchJob>(LaunchJob{target, elevated, terminal});
-    if (TrySubmitThreadpoolCallback(LaunchWorker, job.get(), nullptr)) {
-        [[maybe_unused]] LaunchJob* raw = job.release();
+    if (!target)
         return;
+    LaunchRequest req;
+    req.target = target;
+    req.kind = kind;
+    if (elevated) {
+        req.verb = L"runas";
+        req.privilege = LaunchPrivilege::RequestElevation;
+    } else {
+        req.privilege = LaunchPrivilege::ShellDefault;
     }
-    Log(L"quick_links: threadpool dispatch failed (%lu)", GetLastError());
+    req.noAsync = true;
+    ShellLaunchAsync(std::move(req));
 }
 
 void SendWinKey(WORD vk)
@@ -148,31 +122,32 @@ std::vector<QuickLink> QuickLinks()
 void RunQuickLink(int id, HWND notifyHost, UINT noticeMsg)
 {
     if (id == Terminal || id == TerminalAdmin) {
-        DispatchShellOpen(nullptr, id == TerminalAdmin, true);
+        DispatchShellOpen(TerminalTarget(), LaunchTargetKind::Executable, id == TerminalAdmin);
         return;
     }
     struct LaunchSpec {
         int id;
         const wchar_t* target;
+        LaunchTargetKind kind;
     };
     static constexpr LaunchSpec kLaunches[] = {
-        {InstalledApps, L"ms-settings:appsfeatures"},
-        {MobilityCenter, L"mblctr.exe"},
-        {PowerOptions, L"ms-settings:powersleep"},
-        {EventViewer, L"eventvwr.msc"},
-        {System, L"ms-settings:about"},
-        {DeviceManager, L"devmgmt.msc"},
-        {NetworkConnections, L"ms-settings:network"},
-        {DiskManagement, L"diskmgmt.msc"},
-        {ComputerManagement, L"compmgmt.msc"},
-        {TaskManager, L"taskmgr.exe"},
-        {Settings, L"ms-settings:"},
-        {FileExplorer, L"explorer.exe"},
-        {Run, L"shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}"},
+        {InstalledApps, L"ms-settings:appsfeatures", LaunchTargetKind::Uri},
+        {MobilityCenter, L"mblctr.exe", LaunchTargetKind::Executable},
+        {PowerOptions, L"ms-settings:powersleep", LaunchTargetKind::Uri},
+        {EventViewer, L"eventvwr.msc", LaunchTargetKind::Document},
+        {System, L"ms-settings:about", LaunchTargetKind::Uri},
+        {DeviceManager, L"devmgmt.msc", LaunchTargetKind::Document},
+        {NetworkConnections, L"ms-settings:network", LaunchTargetKind::Uri},
+        {DiskManagement, L"diskmgmt.msc", LaunchTargetKind::Document},
+        {ComputerManagement, L"compmgmt.msc", LaunchTargetKind::Document},
+        {TaskManager, L"taskmgr.exe", LaunchTargetKind::Executable},
+        {Settings, L"ms-settings:", LaunchTargetKind::Uri},
+        {FileExplorer, L"explorer.exe", LaunchTargetKind::Executable},
+        {Run, L"shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}", LaunchTargetKind::Uri},
     };
     for (const LaunchSpec& spec : kLaunches) {
         if (spec.id == id) {
-            DispatchShellOpen(spec.target, false, false);
+            DispatchShellOpen(spec.target, spec.kind, false);
             return;
         }
     }
