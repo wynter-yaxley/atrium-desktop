@@ -294,6 +294,13 @@ void GlassRenderer::Resize(int width, int height)
     overlayTarget_ = nullptr;
     Check(swap_->ResizeBuffers(2, UINT(w_), UINT(h_), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
     CreateSizeDependent();
+    Commit();
+}
+
+void GlassRenderer::Commit()
+{
+    if (dcomp_)
+        dcomp_->Commit();
 }
 
 void GlassRenderer::UpdateBackdrop(ID3D11Texture2D* frame, int x, int y)

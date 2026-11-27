@@ -6,6 +6,8 @@
 
 #include <windows.h>
 
+#include <string_view>
+
 namespace atrium {
 
 class Notifications;
@@ -13,12 +15,14 @@ class TaskModel;
 class TrayModel;
 class WeChatSource;
 
-enum class NoticeAppRoute { ActivateTitleWindow, WeChatOpenChat, ClickTrayIcon, ShowAppWindow, ActivateAumid, ShellOpen };
+enum class NoticeAppRoute { OpenSystemNotificationCenter, ActivateTitleWindow, WeChatOpenChat, ClickTrayIcon, ShowAppWindow, ActivateAumid, ShellOpen };
 
 struct NoticeAppRouteInput {
-    bool hasMatchingTitleWindow = false, isWeChatChat = false, hasTrayIcon = false, trayFlashing = false, hasAppWindow = false, isPackagedAumid = false;
+    bool hasMatchingTitleWindow = false, isWeChatChat = false, hasTrayIcon = false, trayFlashing = false, hasAppWindow = false, isPackagedAumid = false,
+         openSystemNotificationCenter = false;
 };
 
+bool ShouldOpenSystemNotificationCenter(std::wstring_view source, std::wstring_view appId);
 NoticeAppRoute ChooseNoticeAppRoute(const NoticeAppRouteInput& in);
 
 struct NoticeActionEnv {

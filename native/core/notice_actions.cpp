@@ -91,8 +91,18 @@ bool ActivateAumidApp(const std::wstring& aumid)
 
 } // namespace
 
+bool ShouldOpenSystemNotificationCenter(std::wstring_view source, std::wstring_view appId)
+{
+    if (source != L"windows" || appId.empty())
+        return false;
+    const std::wstring folded = FoldCase(std::wstring(appId));
+    return folded.find(L"screensketch") != std::wstring::npos || folded.find(L"screenclippinghost") != std::wstring::npos;
+}
+
 NoticeAppRoute ChooseNoticeAppRoute(const NoticeAppRouteInput& in)
 {
+    if (in.openSystemNotificationCenter)
+        return NoticeAppRoute::OpenSystemNotificationCenter;
     if (in.hasMatchingTitleWindow)
         return NoticeAppRoute::ActivateTitleWindow;
     if (in.isWeChatChat)
@@ -144,8 +154,10 @@ bool RunNoticeAction(const NoticeActionEnv& env, const Notice& n)
         if (env.tray && trayIcon)
             AllowSetForegroundWindow(ASFW_ANY), env.tray->Click(*trayIcon, false);
     };
+    const bool openSystemCenter = ShouldOpenSystemNotificationCenter(n.source, n.appId.empty() ? aumid : n.appId);
     switch (ChooseNoticeAppRoute({titleHwnd != nullptr, n.source == L"wechat" && (n.title != Tr(L"New message") || !n.body.empty()), trayIcon.has_value(),
-                                  trayIcon && trayIcon->flashing, !appTaskKey.empty(), aumid.find(L'!') != std::wstring::npos})) {
+                                  trayIcon && trayIcon->flashing, !appTaskKey.empty(), aumid.find(L'!') != std::wstring::npos, openSystemCenter})) {
+    case NoticeAppRoute::OpenSystemNotificationCenter: SendWinShortcut('N'); return true;
     case NoticeAppRoute::ActivateTitleWindow: TaskModel::ActivateWindow(titleHwnd); return true;
     case NoticeAppRoute::WeChatOpenChat:
         if (!ShowNoticeAppTarget(env.tasks, appTaskKey, n.pid)) {

@@ -380,6 +380,8 @@ struct BarRender {
             return false;
         }
         animating = barOwed = pendingBackdropDirty = owedBody = owedMusic = wasGlass = wasBody = wasMusic = false;
+        wasHidden = true;
+        readyStalledSinceMs = 0;
         return true;
     }
 
@@ -441,6 +443,7 @@ struct BarRender {
                                  darkIcons != drawnDarkIcons || anim.Any() || wasGlass || wasBody || wasMusic || barOwed || owedBody || owedMusic ||
                                  now - lastPresent > kStaleMs;
         if (!needPresent) {
+            readyStalledSinceMs = 0;
             ++stats.skipped; // echo of our own present, or nothing new under the glass
             if (hadBackdrop)
                 stats.workMs.push_back(ElapsedMs(t0));
@@ -456,8 +459,20 @@ struct BarRender {
             return true;
         }
         pendingBackdropDirty = backdropDirty;
-        if (!renderer.Ready() || (!renderer.HasBackdrop() && ClockMs() - sessionStartMs < 1500)) {
-            barOwed = true; // the last frame is not on screen yet, or no backdrop: drawn when it is
+        const bool ready = renderer.Ready();
+        if (!ready) {
+            if (IsPresentReadyStalled(false, nowMs, readyStalledSinceMs, 1000.0)) {
+                Log(L"render: swap chain latency waitable stalled; rebuilding");
+                return false;
+            }
+            barOwed = true; // the last frame is not on screen yet: drawn when it is
+            owedBody |= anim.body;
+            owedMusic |= anim.music;
+            return true;
+        }
+        readyStalledSinceMs = 0;
+        if (!renderer.HasBackdrop() && ClockMs() - sessionStartMs < 1500) {
+            barOwed = true; // no backdrop yet: drawn when it is
             owedBody |= anim.body;
             owedMusic |= anim.music;
             return true;
@@ -536,6 +551,11 @@ struct BarRender {
             return false;
         if (!snap.visible)
             return RenderHiddenSessionStep(gpu, renderer, capture, panelHost, frame, needPrimaryScreen, t0, stop);
+        if (wasHidden) {
+            wasHidden = false;
+            readyStalledSinceMs = 0;
+            renderer.Commit();
+        }
         renderer.Resize(snap.window.right - snap.window.left, snap.window.bottom - snap.window.top);
         bool freezeLost = false;
         winrt::com_ptr<ID3D11Texture2D> source = AcquireBarBackdrop(gpu, renderer, capture, panelHost, frame, freezeLost);
@@ -629,9 +649,10 @@ struct BarRender {
     const double sessionStartMs = ClockMs();
     RECT backdropAt{};
     bool missedFrame = false;
-    bool panelsMoving = false, barOwed = false, paused = false, anyScreenPaused = false;
+    bool panelsMoving = false, barOwed = false, paused = false, anyScreenPaused = false, wasHidden = false;
     bool wasGlass = false, wasBody = false, wasMusic = false;
     bool owedBody = false, owedMusic = false, pendingBackdropDirty = false;
+    double readyStalledSinceMs = 0;
     uint64_t tick = 1; // compositor frames (every wake-up when not paced by the clock)
     winrt::com_ptr<ID3D11Texture2D> frozen; // --debug-capturable only
     RenderMinuteStats stats;

@@ -223,11 +223,13 @@ float4 PSImpl(VSOut i, bool basic)
     float2 px = i.uv * Size;
     float d = Dist(px, basic);
 
-    // Soft drop shadow outside the shape.
+    // Soft drop shadow outside the shape, fading smoothly to zero before the window inset boundary.
     float shadowA = 0;
     if (d >= 0) {
-        float ds = Dist(px - float2(0, Inset * 0.25), basic);
-        shadowA = Shadow * exp(-max(ds, 0) / max(Inset * 0.35, 1));
+        float ds = Dist(px - float2(0, Inset * 0.16), basic);
+        float edgeFade = 1 - smoothstep(Inset * 0.50, max(Inset - 0.5, 1.0), d);
+        float dist = (max(ds, 0) * 0.75 + d * 0.25) / max(Inset * 0.34, 1.0);
+        shadowA = Shadow * exp(-dist * (0.85 + 0.30 * dist)) * edgeFade;
     }
 
     // The implicit edge distance is exact only near the outline: where a corner
@@ -294,9 +296,11 @@ float4 PSImpl(VSOut i, bool basic)
     float sheen = saturate(1 - (px.y - shapeTop) / max(shapeBottom - shapeTop, 1));
     col += Highlight * 0.045 * sheen * sheen;
 
-    // Depth: a very light shade in the band where the lens bends the most.
+    // Depth: subtle bevel shade on dark/translucent glass, faded out on light or high-tint panels to avoid a muddy rim.
     float band = smoothstep(0.0, Edge * 0.5, depth) * (1 - smoothstep(Edge * 0.5, Edge * 1.3, depth));
-    col *= 1 - 0.05 * band * (1 - lit);
+    float colLuma = dot(saturate(col), float3(0.2126, 0.7152, 0.0722));
+    float shadeWeight = 0.025 * (1 - smoothstep(0.50, 0.88, colLuma)) * (1 - 0.75 * TintMix);
+    col *= 1 - shadeWeight * band * (1 - lit);
     col += ring * 0.10 * (0.4 + Highlight);
 
     float4 glass = float4(saturate(col) * cov, cov) * keep;

@@ -53,6 +53,16 @@ void TestNonBusyErrorAndOverlayOnly()
             "overlay-only S_OK must preserve hasPresented_ without re-copying presented_");
 }
 
+void TestPresentReadyStallWatchdog()
+{
+    double stalledSince = 0;
+    Require(!atrium::IsPresentReadyStalled(true, 100.0, stalledSince) && stalledSince == 0.0, "ready == true keeps stalledSinceMs reset");
+    Require(!atrium::IsPresentReadyStalled(false, 200.0, stalledSince) && stalledSince == 200.0, "first !ready records stall start without tripping");
+    Require(!atrium::IsPresentReadyStalled(false, 1199.0, stalledSince), "!ready before 1000 ms does not trip watchdog");
+    Require(atrium::IsPresentReadyStalled(false, 1200.0, stalledSince), "!ready at >= 1000 ms trips stall watchdog");
+    Require(!atrium::IsPresentReadyStalled(true, 1300.0, stalledSince) && stalledSince == 0.0, "subsequent ready == true resets stalledSinceMs");
+}
+
 } // namespace
 
 int main()
@@ -60,6 +70,7 @@ int main()
     TestBusyOnFirstFrameThenSucceeds();
     TestBusyPreservesPreviousPresentedBackdrop();
     TestNonBusyErrorAndOverlayOnly();
+    TestPresentReadyStallWatchdog();
     if (g_failures > 0)
         return 1;
     std::printf("glass present retry: all checks passed\n");

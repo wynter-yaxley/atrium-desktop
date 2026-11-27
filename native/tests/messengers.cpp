@@ -261,8 +261,14 @@ void CheckNoticeRouting()
                 ChooseNoticeAppRoute({false, false, true, false, true, false}) == NoticeAppRoute::ShowAppWindow &&
                 ChooseNoticeAppRoute({false, false, false, false, true, true}) == NoticeAppRoute::ShowAppWindow &&
                 ChooseNoticeAppRoute({false, false, false, false, false, true}) == NoticeAppRoute::ActivateAumid &&
-                ChooseNoticeAppRoute({}) == NoticeAppRoute::ShellOpen,
+                ChooseNoticeAppRoute({}) == NoticeAppRoute::ShellOpen &&
+                ChooseNoticeAppRoute({true, false, true, false, true, true, true}) == NoticeAppRoute::OpenSystemNotificationCenter,
             "notice app routing");
+    Require(ShouldOpenSystemNotificationCenter(L"windows", L"Microsoft.ScreenSketch_8wekyb3d8bbwe!App") &&
+                ShouldOpenSystemNotificationCenter(L"windows", L"MicrosoftWindows.Client.CBS_cw5n1h2txyewy!ScreenClippingHost") &&
+                !ShouldOpenSystemNotificationCenter(L"wechat", L"Microsoft.ScreenSketch_8wekyb3d8bbwe!App") &&
+                !ShouldOpenSystemNotificationCenter(L"windows", L"Microsoft.WindowsStore_8wekyb3d8bbwe!App"),
+            "#179: snipping tool Windows toasts route to Windows notification center");
 }
 
 void CheckToastDiff()

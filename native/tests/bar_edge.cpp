@@ -255,6 +255,26 @@ void CheckTaskbarWorkSync()
     const auto restoreSnap = MakeTaskbarSnapshot(reinterpret_cast<HMONITOR>(1), tbBottom, mon, mon, false);
     Require(restoreSnap.has_value() && WorkAreaSnapshotSynced(*restoreSnap, workBottom, false), "#191: restore synced once work shrinks back");
 }
+
+void CheckMeetingToolbarOverlap()
+{
+    const RECT barZone{660, 1010, 1260, 1080};
+    Require(IsMeetingShareToolbarBounds(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, RECT{760, 1020, 1180, 1068}, barZone, 1.0f),
+            "#210: topmost horizontal meeting share toolbar overlapping bar triggers cover");
+    Require(!IsMeetingShareToolbarBounds(WS_EX_TOOLWINDOW, RECT{760, 1020, 1180, 1068}, barZone, 1.0f),
+            "#210: non-topmost window is not a meeting share toolbar");
+    Require(!IsMeetingShareToolbarBounds(WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED, RECT{760, 1020, 1180, 1068}, barZone, 1.0f),
+            "#210: click-through overlay is ignored");
+    Require(!IsMeetingShareToolbarBounds(WS_EX_TOPMOST, RECT{760, 600, 1180, 1068}, barZone, 1.0f), "#210: tall window is not a floating meeting toolbar");
+    Require(!IsMeetingShareToolbarBounds(WS_EX_TOPMOST, RECT{760, 0, 1180, 48}, barZone, 1.0f),
+            "#210: non-overlapping top toolbar does not trigger bottom bar hide");
+
+    Require(IsMeetingShareExeStem(L"feishu") && IsMeetingShareExeStem(L"Feishu") && IsMeetingShareExeStem(L"lark") && IsMeetingShareExeStem(L"wemeetapp") &&
+                IsMeetingShareExeStem(L"zoom") && IsMeetingShareExeStem(L"ms-teams"),
+            "#210: known meeting share executables matched");
+    Require(!IsMeetingShareExeStem(L"chrome") && !IsMeetingShareExeStem(L"explorer") && !IsMeetingShareExeStem(L"weixin"),
+            "#210: unrelated apps are not treated as meeting share toolbars");
+}
 } // namespace
 
 int main()
@@ -269,6 +289,7 @@ int main()
     CheckDodgeOverlap();
     CheckAutoHideEdgeZones();
     CheckTaskbarWorkSync();
+    CheckMeetingToolbarOverlap();
     if (g_failed)
         return 1;
     std::cout << "bar edge: all checks passed\n";

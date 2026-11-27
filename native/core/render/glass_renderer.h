@@ -78,6 +78,19 @@ inline PresentStateTransition ResolvePresentTransition(HRESULT hr, bool hadPrese
     return {false, hadPresented, false, false};
 }
 
+inline bool IsPresentReadyStalled(bool ready, double nowMs, double& stalledSinceMs, double timeoutMs = 1000.0)
+{
+    if (ready) {
+        stalledSinceMs = 0;
+        return false;
+    }
+    if (stalledSinceMs <= 0 || nowMs < stalledSinceMs) {
+        stalledSinceMs = nowMs > 0 ? nowMs : 1.0;
+        return false;
+    }
+    return nowMs - stalledSinceMs >= timeoutMs;
+}
+
 class GlassRenderer {
 public:
     static constexpr int kPad = 64; // backdrop margin for refraction and blur
@@ -91,6 +104,7 @@ public:
     GlassRenderer& operator=(const GlassRenderer&) = delete;
 
     void Resize(int width, int height);
+    void Commit();
     void SetOffset(POINT offset);
     int Width() const { return w_; }
     int Height() const { return h_; }
