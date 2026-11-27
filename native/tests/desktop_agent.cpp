@@ -1,10 +1,13 @@
 #include "shell/desktop_agent_client.h"
 #include "shell/desktop_agent_host.h"
 #include "shell/desktop_agent_ipc.h"
+#include "shell/tray_model.h"
+#include "win32_path.h"
 
 #include <windows.h>
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/base.h>
 
 #include <atomic>
 #include <chrono>
@@ -44,6 +47,7 @@ void TestCommandSerialization()
 {
     AgentCommandMessage cmd;
     cmd.type = AgentCommandType::TraySend;
+    cmd.opId = 9001;
     cmd.key = L"guid:{1234}";
     cmd.action = tray::HostAction::Double;
     cmd.at = POINT{120, 400};
@@ -51,7 +55,8 @@ void TestCommandSerialization()
 
     AgentCommandMessage parsed;
     Check(ValidateAndParseAgentCommand(SerializeAgentCommand(cmd), parsed), "parse valid tray-send");
-    Check(parsed.type == AgentCommandType::TraySend && parsed.key == cmd.key && parsed.action == cmd.action, "tray-send fields match");
+    Check(parsed.type == AgentCommandType::TraySend && parsed.opId == 9001 && parsed.key == cmd.key && parsed.action == cmd.action,
+          "tray-send fields + opId match");
     Check(parsed.at.x == 120 && parsed.at.y == 400 && EqualRect(&parsed.cell, &cmd.cell), "tray-send geometry matches");
 
     AgentCommandMessage sync;
@@ -117,11 +122,12 @@ void TestEventSerializationAndBounds()
 
     AgentEventMessage drop;
     drop.type = AgentEventType::Drop;
+    drop.opId = 7777;
     drop.key = L"app-1";
     drop.paths = {L"C:\\test\\a.txt", L"C:\\test\\b.txt"};
     AgentEventMessage dropParsed;
     Check(ValidateAndParseAgentEvent(SerializeAgentEvent(drop), dropParsed), "parse valid drop");
-    Check(dropParsed.key == drop.key && dropParsed.paths == drop.paths, "drop payload round-trip");
+    Check(dropParsed.opId == 7777 && dropParsed.key == drop.key && dropParsed.paths == drop.paths, "drop payload + opId round-trip");
 
     // Reject oversized / invalid payloads.
     AgentCommandMessage cmdParsed;
@@ -208,6 +214,7 @@ void TestLoopbackPipeAndClient()
     std::atomic_int trayCalls{0};
     std::atomic_int yieldCalls{0};
     std::atomic_int dropCalls{0};
+    std::atomic_bool acceptDrop{true};
     std::wstring droppedKey;
     std::vector<std::wstring> droppedPaths;
 
@@ -220,27 +227,28 @@ void TestLoopbackPipeAndClient()
         res.key = res.allow ? L"app-target" : L"";
         return res;
     };
-    cb.onDropFiles = [&](const std::wstring& key, const std::vector<std::wstring>& paths) {
+    cb.onDropFilesAccepted = [&](const std::wstring& key, const std::vector<std::wstring>& paths) {
+        if (!acceptDrop.load())
+            return false;
         droppedKey = key;
         droppedPaths = paths;
         dropCalls.fetch_add(1);
+        return true;
     };
 
     DesktopAgentClientOptions opts;
     opts.cmdPipeOverride = cmdPipe;
     opts.evtPipeOverride = evtPipe;
     opts.launchSupervisor = false;
+    opts.allowUnboundTestEvtPeer = true;
     DesktopAgentClient client(cb, opts);
 
     for (int i = 0; i < 200 && !client.EvtServerReady(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     Check(client.EvtServerReady(), "DesktopAgentClient Evt pipe server ready");
 
-    // Push TraySnapshot with bitmap, then second TraySnapshot omitting cached bitmap by imageVersion.
     AgentEventMessage snap1;
     snap1.type = AgentEventType::TraySnapshot;
-    snap1.snapshot.yielded = false;
-    snap1.snapshot.yieldReason = TrayHostYieldReason::None;
     AgentTrayIconDto icon1;
     icon1.key = L"hwnd:1:1";
     icon1.exe = L"c:\\demo\\qq.exe";
@@ -260,36 +268,95 @@ void TestLoopbackPipeAndClient()
     Check(client.Flashing().size() == 1 && client.FlashingIcons().size() == 1, "flashing state exposed");
 
     AgentEventMessage snap2 = snap1;
-    snap2.snapshot.icons[0].width = 0;
-    snap2.snapshot.icons[0].height = 0;
-    snap2.snapshot.icons[0].pixels.clear();
-    snap2.snapshot.yielded = true;
-    snap2.snapshot.yieldReason = TrayHostYieldReason::OtherProcess;
+    snap2.snapshot.icons[0].width = 0, snap2.snapshot.icons[0].height = 0, snap2.snapshot.icons[0].pixels.clear();
+    snap2.snapshot.yielded = true, snap2.snapshot.yieldReason = TrayHostYieldReason::OtherProcess;
     Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(snap2), replyRaw, 2000), "send snap2 with cached imageVersion");
     Check(client.Icons().size() == 1 && client.Icons()[0].image && client.Icons()[0].image->ByteSize() == 16, "reused cached image by version");
     Check(client.Yielded() && client.YieldReason() == TrayHostYieldReason::OtherProcess, "yield state updated");
     Check(trayCalls.load() >= 2 && yieldCalls.load() >= 1, "tray and yield callbacks fired");
 
-    // Drag-over & drop round-trip.
     AgentEventMessage drag;
-    drag.type = AgentEventType::DragOver;
-    drag.pt = POINT{50, 10};
+    drag.type = AgentEventType::DragOver, drag.pt = POINT{50, 10};
     Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(drag), replyRaw, 2000), "send drag-over");
     Check(ValidateAndParseAgentEventReply(replyRaw, replyParsed) && replyParsed.allow && replyParsed.key == L"app-target", "drag-over allowed");
 
     AgentEventMessage drop;
-    drop.type = AgentEventType::Drop;
-    drop.key = L"app-target";
-    drop.paths = {L"C:\\file1.txt"};
-    Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(drop), replyRaw, 2000), "send drop");
-    Check(dropCalls.load() == 1 && droppedKey == L"app-target" && droppedPaths.size() == 1, "drop callback received files");
+    drop.type = AgentEventType::Drop, drop.opId = 101, drop.key = L"app-target", drop.paths = {L"C:\\file1.txt"};
+    acceptDrop.store(false);
+    Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(drop), replyRaw, 2000), "send rejected drop");
+    Check(ValidateAndParseAgentEventReply(replyRaw, replyParsed) && replyParsed.ok && !replyParsed.allow && dropCalls.load() == 0,
+          "rejected drop returns allow=false");
+
+    acceptDrop.store(true);
+    drop.opId = 102;
+    Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(drop), replyRaw, 2000), "send accepted drop");
+    Check(ValidateAndParseAgentEventReply(replyRaw, replyParsed) && replyParsed.ok && replyParsed.allow && dropCalls.load() == 1 &&
+              droppedKey == L"app-target" && droppedPaths.size() == 1,
+          "drop callback accepted files");
+
+    Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(drop), replyRaw, 2000), "send duplicate opId drop");
+    Check(ValidateAndParseAgentEventReply(replyRaw, replyParsed) && replyParsed.ok && !replyParsed.allow && dropCalls.load() == 1,
+          "duplicate drop opId deduplicated");
 
     client.Shutdown();
 }
 
+void TestEvtPeerBindingAndVerifyHelper()
+{
+    const std::wstring evtPipe = UniquePipe(L"UnboundEvt", 10);
+    std::atomic_int trayCalls{0};
+    DesktopAgentCallbacks cb;
+    cb.onTrayChanged = [&] { trayCalls.fetch_add(1); };
+
+    DesktopAgentClientOptions opts;
+    opts.cmdPipeOverride = UniquePipe(L"UnboundCmd", 10);
+    opts.evtPipeOverride = evtPipe;
+    opts.launchSupervisor = false;
+    opts.allowUnboundTestEvtPeer = false;
+    DesktopAgentClient client(cb, opts);
+    for (int i = 0; i < 200 && !client.EvtServerReady(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Check(client.EvtServerReady(), "unbound Evt test server ready");
+
+    AgentEventMessage snap;
+    snap.type = AgentEventType::TraySnapshot;
+    std::string replyRaw;
+    Check(!SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(snap), replyRaw, 1000) && trayCalls.load() == 0,
+          "production Evt pipe rejects unbound peer before HandleEvent");
+    client.Shutdown();
+
+    const std::wstring peerPipeName = UniquePipe(L"PeerVerify", 11);
+    const winrt::handle srv{CreateSameUserNamedPipeServer(peerPipeName)};
+    const winrt::handle evt{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    const winrt::handle quit{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    Check(srv.get() != INVALID_HANDLE_VALUE && evt && quit, "create loopback pipe for VerifyNamedPipePeerProcess");
+    std::atomic_bool serverOk{false};
+    std::atomic_bool wrongExeRejected{false};
+    std::thread serverThread([&] {
+        OVERLAPPED ov{};
+        ov.hEvent = evt.get();
+        if (ConnectNamedPipeOverlapped(srv.get(), ov, quit.get())) {
+            AgentPeerIdentity p1, p2;
+            winrt::handle proc;
+            serverOk.store(VerifyNamedPipePeerProcess(srv.get(), true, ModulePath(), false, p1, &proc) && p1.valid && p1.pid == GetCurrentProcessId() && proc);
+            wrongExeRejected.store(!VerifyNamedPipePeerProcess(srv.get(), true, L"C:\\nonexistent\\other.exe", false, p2));
+            DisconnectNamedPipe(srv.get());
+        }
+    });
+    const winrt::handle cli{ConnectSameUserPipeClient(peerPipeName, 2000, quit.get())};
+    Check(cli.get() != INVALID_HANDLE_VALUE && cli, "connect client for VerifyNamedPipePeerProcess");
+    if (cli.get() != INVALID_HANDLE_VALUE) {
+        AgentPeerIdentity srvPeer;
+        Check(VerifyNamedPipePeerProcess(cli.get(), false, ModulePath(), false, srvPeer) && srvPeer.pid == GetCurrentProcessId(),
+              "VerifyNamedPipePeerProcess verified server side");
+    }
+    if (serverThread.joinable())
+        serverThread.join();
+    Check(serverOk.load() && wrongExeRejected.load(), "VerifyNamedPipePeerProcess checks exe path and PID");
+}
+
 void TestSupervisorExhaustionAndHostRoundTrip()
 {
-    // 1. Supervisor exhaustion using failing spawn override (never touches Atrium.exe).
     std::atomic_int spawnAttempts{0};
     DesktopAgentClientOptions failOpts;
     failOpts.cmdPipeOverride = UniquePipe(L"FailCmd", 2);
@@ -310,7 +377,6 @@ void TestSupervisorExhaustionAndHostRoundTrip()
         client.Shutdown();
     }
 
-    // 2. Real RunDesktopAgent host + DesktopAgentClient Cmd/Evt round-trip in-process.
     const std::wstring cmdPipe = UniquePipe(L"HostCmd", 3);
     const std::wstring evtPipe = UniquePipe(L"HostEvt", 3);
     const DWORD selfPid = GetCurrentProcessId();
@@ -329,6 +395,7 @@ void TestSupervisorExhaustionAndHostRoundTrip()
     liveOpts.cmdPipeOverride = cmdPipe;
     liveOpts.evtPipeOverride = evtPipe;
     liveOpts.pingWaitMs = 3000;
+    liveOpts.allowSameProcessPeer = true;
     liveOpts.spawnAgentOverride = [](const std::wstring&, DWORD& errOut) -> HANDLE {
         errOut = 0;
         return nullptr;
@@ -350,6 +417,315 @@ void TestSupervisorExhaustionAndHostRoundTrip()
     Check(hostExitCode.load() == 0, "RunDesktopAgent exited cleanly on quit");
 }
 
+void TestSlowStaCommandTimeoutNoUaf()
+{
+    const std::wstring cmdPipe = UniquePipe(L"SlowCmd", 20);
+    const std::wstring evtPipe = UniquePipe(L"SlowEvt", 20);
+    const DWORD selfPid = GetCurrentProcessId();
+    const winrt::handle stopEvt{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::atomic_int slowStarted{0};
+    std::atomic_int slowFinished{0};
+    std::atomic_int syncCalled{0};
+
+    DesktopAgentHostOptions hostOpts;
+    hostOpts.cmdPipeOverride = cmdPipe;
+    hostOpts.evtPipeOverride = evtPipe;
+    hostOpts.staTaskTimeoutMs = 50;
+    hostOpts.stopEvent = stopEvt.get();
+    hostOpts.onBeforeStaCommandForTest = [&](const AgentCommandMessage& cmd) {
+        if (cmd.type == AgentCommandType::SetTrayPlaces) {
+            slowStarted.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(180));
+            slowFinished.fetch_add(1);
+        } else if (cmd.type == AgentCommandType::SyncDropBars) {
+            syncCalled.fetch_add(1);
+        }
+    };
+
+    std::atomic<int> exitCode{-1};
+    std::thread hostThread([&] { exitCode.store(RunDesktopAgentWithOptions(selfPid, 77, GetModuleHandleW(nullptr), hostOpts)); });
+
+    const winrt::handle pipe{ConnectSameUserPipeClient(cmdPipe, 3000)};
+    Check(pipe.get() != INVALID_HANDLE_VALUE && pipe, "connected to slow-STA host");
+    if (pipe.get() != INVALID_HANDLE_VALUE) {
+        std::string rawReply;
+        AgentCommandReply reply;
+        AgentCommandMessage slowCmd;
+        slowCmd.type = AgentCommandType::SetTrayPlaces, slowCmd.anchor = RECT{0, 0, 10, 10};
+        Check(SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(slowCmd), rawReply, 2000) && ValidateAndParseAgentCommandReply(rawReply, reply) &&
+                  !reply.ok && reply.error == L"sta_timeout",
+              "slow STA command returned sta_timeout without blocking caller");
+
+        AgentCommandMessage queuedCmd;
+        queuedCmd.type = AgentCommandType::SyncDropBars;
+        Check(SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(queuedCmd), rawReply, 2000) && ValidateAndParseAgentCommandReply(rawReply, reply) &&
+                  !reply.ok && reply.error == L"sta_timeout",
+              "queued command behind slow STA task timed out and cancelled");
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(220));
+        Check(slowStarted.load() == 1 && slowFinished.load() == 1 && syncCalled.load() == 0,
+              "running slow STA task completed without UAF and cancelled queued task was skipped");
+
+        AgentCommandMessage pingCmd, quitCmd;
+        pingCmd.type = AgentCommandType::Ping, quitCmd.type = AgentCommandType::Quit;
+        Check(SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(pingCmd), rawReply, 2000) && ValidateAndParseAgentCommandReply(rawReply, reply) &&
+                  reply.ok,
+              "host remains healthy after STA timeout");
+        SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(quitCmd), rawReply, 2000);
+    }
+    SetEvent(stopEvt.get());
+    if (hostThread.joinable())
+        hostThread.join();
+    Check(exitCode.load() == 0, "slow STA host exited cleanly");
+}
+
+void TestStalledReaderShutdownUnder500ms()
+{
+    const std::wstring evtPipe = UniquePipe(L"StallEvt", 30);
+    DesktopAgentClientOptions opts;
+    opts.cmdPipeOverride = UniquePipe(L"StallEvtCmd", 30);
+    opts.evtPipeOverride = evtPipe;
+    opts.launchSupervisor = false;
+    opts.allowUnboundTestEvtPeer = true;
+    DesktopAgentClient client({}, opts);
+    for (int i = 0; i < 200 && !client.EvtServerReady(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    const winrt::handle evtCli{ConnectSameUserPipeClient(evtPipe, 2000)};
+    Check(evtCli.get() != INVALID_HANDLE_VALUE && evtCli, "stalled Evt client connected");
+    if (evtCli.get() != INVALID_HANDLE_VALUE) {
+        AgentEventMessage snap;
+        snap.type = AgentEventType::TraySnapshot;
+        const std::string payload = SerializeAgentEvent(snap);
+        DWORD written = 0;
+        OVERLAPPED ov{};
+        const winrt::handle ev{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        ov.hEvent = ev.get();
+        WriteFile(evtCli.get(), payload.data(), static_cast<DWORD>(payload.size()), &written, &ov);
+        WaitForSingleObject(ev.get(), 1000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    const ULONGLONG t0 = GetTickCount64();
+    client.Shutdown();
+    const ULONGLONG evtShutdownMs = GetTickCount64() - t0;
+    Check(evtShutdownMs < 500, "Evt server shuts down in < 500ms despite stalled reader");
+
+    const std::wstring cmdPipe = UniquePipe(L"StallCmd", 31);
+    const winrt::handle stopEvt{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    DesktopAgentHostOptions hostOpts;
+    hostOpts.cmdPipeOverride = cmdPipe;
+    hostOpts.evtPipeOverride = UniquePipe(L"StallHostEvt", 31);
+    hostOpts.stopEvent = stopEvt.get();
+    std::atomic<int> hostExit{-1};
+    std::thread hostThread([&] { hostExit.store(RunDesktopAgentWithOptions(GetCurrentProcessId(), 88, GetModuleHandleW(nullptr), hostOpts)); });
+
+    const winrt::handle cmdCli{ConnectSameUserPipeClient(cmdPipe, 2000)};
+    Check(cmdCli.get() != INVALID_HANDLE_VALUE && cmdCli, "stalled Cmd client connected");
+    if (cmdCli.get() != INVALID_HANDLE_VALUE) {
+        AgentCommandMessage ping;
+        ping.type = AgentCommandType::Ping;
+        const std::string payload = SerializeAgentCommand(ping);
+        DWORD written = 0;
+        OVERLAPPED ov{};
+        const winrt::handle ev{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        ov.hEvent = ev.get();
+        WriteFile(cmdCli.get(), payload.data(), static_cast<DWORD>(payload.size()), &written, &ov);
+        WaitForSingleObject(ev.get(), 1000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    const ULONGLONG t1 = GetTickCount64();
+    SetEvent(stopEvt.get());
+    if (hostThread.joinable())
+        hostThread.join();
+    const ULONGLONG cmdShutdownMs = GetTickCount64() - t1;
+    Check(hostExit.load() == 0 && cmdShutdownMs < 500, "Cmd server shuts down in < 500ms despite stalled reader");
+}
+
+void TestOpTrackerNoReplaySyncBarsAndAckState()
+{
+    RecentOpTracker tracker;
+    for (uint64_t i = 1; i <= RecentOpTracker::kMaxSeenOps; ++i)
+        Check(tracker.MarkSeenIfNew(i), "first 64 opIds accepted");
+    Check(!tracker.MarkSeenIfNew(RecentOpTracker::kMaxSeenOps), "recent opId deduplicated");
+    Check(tracker.MarkSeenIfNew(RecentOpTracker::kMaxSeenOps + 1), "65th opId accepted");
+    Check(tracker.MarkSeenIfNew(1), "oldest opId evicted after capacity 64");
+
+    TraySnapshotAckState ack;
+    AgentTraySnapshot snap;
+    AgentTrayIconDto dto;
+    dto.key = L"k1", dto.imageVersion = 42, dto.width = 1, dto.height = 1, dto.pixels = {1, 2, 3, 4};
+    snap.icons.push_back(dto);
+    ack.RecordAck(1, snap, false);
+    Check(!ack.IsConfirmed(1, 42), "failed ack does not mark imageVersion confirmed");
+    ack.RecordAck(1, snap, true);
+    Check(ack.IsConfirmed(1, 42), "successful ack marks imageVersion confirmed");
+    Check(!ack.IsConfirmed(2, 42), "session bump resets confirmed imageVersions");
+
+    const std::wstring cmdPipe = UniquePipe(L"MockCmd", 40);
+    const std::wstring evtPipe = UniquePipe(L"MockEvt", 40);
+    const DWORD selfPid = GetCurrentProcessId();
+    const uint64_t gen = 999;
+    const winrt::handle stopMock{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    const winrt::handle ev{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::atomic_int syncCount{0};
+    std::atomic_int sendCount{0};
+    std::atomic_bool seenOpId{false};
+
+    std::thread mockCmd([&] {
+        const winrt::handle srv{CreateSameUserNamedPipeServer(cmdPipe)};
+        OVERLAPPED ov{};
+        ov.hEvent = ev.get();
+        if (srv.get() == INVALID_HANDLE_VALUE || !ConnectNamedPipeOverlapped(srv.get(), ov, stopMock.get()))
+            return;
+        while (WaitForSingleObject(stopMock.get(), 0) == WAIT_TIMEOUT) {
+            std::string raw;
+            bool disc = false;
+            if (!ReadPipeMessageOverlapped(srv.get(), ov, stopMock.get(), raw, disc))
+                break;
+            AgentCommandMessage cmd;
+            if (!ValidateAndParseAgentCommand(raw, cmd))
+                break;
+            AgentCommandReply reply;
+            if (cmd.type == AgentCommandType::Ping) {
+                reply.ok = true, reply.pid = selfPid, reply.generation = gen;
+            } else if (cmd.type == AgentCommandType::SyncDropBars) {
+                const int n = syncCount.fetch_add(1) + 1;
+                reply.ok = (n >= 2);
+            } else if (cmd.type == AgentCommandType::TraySend) {
+                sendCount.fetch_add(1);
+                seenOpId.store(cmd.opId != 0);
+                break; // Drop without replying: client must NOT replay TraySend.
+            } else if (cmd.type == AgentCommandType::Quit) {
+                reply.ok = true;
+                WritePipeMessageOverlapped(srv.get(), ov, stopMock.get(), SerializeAgentCommandReply(reply));
+                break;
+            } else {
+                reply.ok = true;
+            }
+            if (!WritePipeMessageOverlapped(srv.get(), ov, stopMock.get(), SerializeAgentCommandReply(reply)))
+                break;
+        }
+        DisconnectNamedPipe(srv.get());
+    });
+
+    DesktopAgentClientOptions opts;
+    opts.corePid = selfPid, opts.generation = gen, opts.cmdPipeOverride = cmdPipe, opts.evtPipeOverride = evtPipe;
+    opts.allowSameProcessPeer = true, opts.pingWaitMs = 2000;
+    opts.spawnAgentOverride = [](const std::wstring&, DWORD& errOut) -> HANDLE { return errOut = 0, nullptr; };
+    DesktopAgentClient client({}, opts);
+    for (int i = 0; i < 200 && !client.Running(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Check(client.Running(), "mock Cmd server connected");
+
+    const std::vector<AgentBarRect> bars{{1, RECT{0, 0, 100, 40}, true}};
+    client.SyncDropBars(bars); // fails (reply.ok = false)
+    client.SyncDropBars(bars); // must retry because confirmedDropBars_ != bars
+    client.SyncDropBars(bars); // now confirmed, must skip
+    Check(syncCount.load() == 2, "SyncDropBars retried after failure and skipped once confirmed");
+
+    const HostSendStatus sendStatus = client.Send(L"icon1", tray::HostAction::Left, POINT{5, 5});
+    Check(sendStatus == HostSendStatus::NotSent && sendCount.load() == 1 && seenOpId.load(), "TraySend sets opId and never auto-replays");
+
+    SetEvent(stopMock.get());
+    client.Shutdown();
+    if (mockCmd.joinable())
+        mockCmd.join();
+}
+
+void TestTrayModelSendHostedNoUntrustedRelay()
+{
+    constexpr UINT kCallbackMsg = WM_APP + 77;
+    std::atomic_int relayCount{0};
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+        if (msg == WM_NCCREATE)
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<const CREATESTRUCTW*>(lp)->lpCreateParams));
+        auto* counter = reinterpret_cast<std::atomic_int*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == kCallbackMsg && counter)
+            counter->fetch_add(1);
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    };
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"AtriumTestNoRelayTarget";
+    RegisterClassExW(&wc);
+    HWND targetHwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, &relayCount);
+    Check(targetHwnd != nullptr, "created message-only test window");
+
+    const std::wstring cmdPipe = UniquePipe(L"RelayCmd", 50);
+    const std::wstring evtPipe = UniquePipe(L"RelayEvt", 50);
+    const DWORD selfPid = GetCurrentProcessId();
+    const uint64_t gen = 505;
+    const winrt::handle stopEvt{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    const winrt::handle ev{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::atomic_int traySendObserved{0};
+
+    std::thread mockCmd([&] {
+        const winrt::handle srv{CreateSameUserNamedPipeServer(cmdPipe)};
+        OVERLAPPED ov{};
+        ov.hEvent = ev.get();
+        if (srv.get() == INVALID_HANDLE_VALUE || !ConnectNamedPipeOverlapped(srv.get(), ov, stopEvt.get()))
+            return;
+        while (WaitForSingleObject(stopEvt.get(), 0) == WAIT_TIMEOUT) {
+            std::string raw;
+            bool disc = false;
+            if (!ReadPipeMessageOverlapped(srv.get(), ov, stopEvt.get(), raw, disc))
+                break;
+            AgentCommandMessage cmd;
+            if (!ValidateAndParseAgentCommand(raw, cmd))
+                break;
+            AgentCommandReply reply;
+            reply.ok = true;
+            if (cmd.type == AgentCommandType::Ping)
+                reply.pid = selfPid, reply.generation = gen;
+            else if (cmd.type == AgentCommandType::TraySend) {
+                traySendObserved.fetch_add(1);
+                reply.sendStatus = HostSendStatus::NotSent;
+                reply.higherIntegrity = true;
+            }
+            WritePipeMessageOverlapped(srv.get(), ov, stopEvt.get(), SerializeAgentCommandReply(reply));
+            if (cmd.type == AgentCommandType::Quit)
+                break;
+        }
+        DisconnectNamedPipe(srv.get());
+    });
+
+    DesktopAgentClientOptions opts;
+    opts.corePid = selfPid, opts.generation = gen, opts.cmdPipeOverride = cmdPipe, opts.evtPipeOverride = evtPipe;
+    opts.allowSameProcessPeer = true, opts.allowUnboundTestEvtPeer = true, opts.pingWaitMs = 2000;
+    opts.spawnAgentOverride = [](const std::wstring&, DWORD& errOut) -> HANDLE { return errOut = 0, nullptr; };
+    DesktopAgentClient client({}, opts);
+    for (int i = 0; i < 200 && (!client.Running() || !client.EvtServerReady()); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Check(client.Running() && client.EvtServerReady(), "relay test client connected");
+
+    AgentEventMessage snap;
+    snap.type = AgentEventType::TraySnapshot;
+    AgentTrayIconDto dto;
+    dto.key = L"test:higher", dto.hwnd = reinterpret_cast<uintptr_t>(targetHwnd), dto.uid = 1, dto.callback = kCallbackMsg, dto.version = 4;
+    dto.pid = selfPid;
+    snap.snapshot.icons.push_back(dto);
+    std::string evtReply;
+    Check(SendNamedPipeOneShot(evtPipe, SerializeAgentEvent(snap), evtReply, 2000), "seeded snapshot with target hwnd");
+
+    TrayModel model(nullptr, 0);
+    model.SetDesktopAgent(&client);
+    TrayIcon icon;
+    icon.hostKey = L"test:higher";
+    const HostSendStatus status = model.SendHosted(icon.hostKey, tray::HostAction::Middle, POINT{5, 5}, RECT{0, 0, 20, 20});
+
+    for (MSG msg{}; PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE);)
+        TranslateMessage(&msg), DispatchMessageW(&msg);
+    Check(status == HostSendStatus::NotSent && traySendObserved.load() == 1 && relayCount.load() == 0,
+          "Core skipped blind High-token SendNotifyMessageW relay for higherIntegrity target");
+
+    SetEvent(stopEvt.get());
+    client.Shutdown();
+    if (mockCmd.joinable())
+        mockCmd.join();
+    if (targetHwnd)
+        DestroyWindow(targetHwnd);
+}
+
 } // namespace
 
 int main()
@@ -360,7 +736,12 @@ int main()
     TestEventSerializationAndBounds();
     TestSupervisorPolicy();
     TestLoopbackPipeAndClient();
+    TestEvtPeerBindingAndVerifyHelper();
     TestSupervisorExhaustionAndHostRoundTrip();
+    TestSlowStaCommandTimeoutNoUaf();
+    TestStalledReaderShutdownUnder500ms();
+    TestOpTrackerNoReplaySyncBarsAndAckState();
+    TestTrayModelSendHostedNoUntrustedRelay();
     winrt::uninit_apartment();
     return g_failures == 0 ? 0 : 1;
 }

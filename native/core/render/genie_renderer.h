@@ -98,6 +98,21 @@ inline GenieFlightEval EvaluateGenieFlightAt(const GenieFlightDraw& f, double no
     return {};
 }
 
+struct GeniePresentedFlags {
+    bool notify = false;
+    bool firstFrame = false;
+    bool pourDone = false;
+};
+
+// Gates first-frame CoverReady notification on an actual draw call so failed uploads fall back to CoverTimeout.
+inline GeniePresentedFlags EvaluateGenieFlightNotify(uint64_t flightId, bool drewFlight, bool pourFinished, std::unordered_set<uint64_t>& reportedFirstFrames,
+                                                     std::unordered_set<uint64_t>& reportedPourDone)
+{
+    const bool firstFrame = drewFlight && reportedFirstFrames.insert(flightId).second;
+    const bool pourDone = pourFinished && reportedPourDone.insert(flightId).second;
+    return {firstFrame || pourDone, firstFrame, pourDone};
+}
+
 class GenieRenderer {
 public:
     static constexpr double kIdleReleaseMs = 4000.0;
@@ -130,7 +145,7 @@ private:
     ID3D11ShaderResourceView* LookupOrUploadTexture(uint64_t pictureId, const IconImage& image);
     RenderResult RenderIdle(const GenieSceneSnapshot& scene, double nowMs);
     void BindFramePipeline(int width, int height);
-    bool DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, bool& deviceLost);
+    bool DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, bool& drewFlight, bool& deviceLost);
     void PruneUnusedTextures(const GenieSceneSnapshot& scene);
     void PruneFlightTracking(const GenieSceneSnapshot& scene);
     bool IsDeviceRemoved(HRESULT hr) const;

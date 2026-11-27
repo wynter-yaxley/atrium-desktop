@@ -4,13 +4,14 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace atrium {
 
 std::wstring InstanceGenerationPath();
 uint64_t ReadInstanceGeneration(const std::wstring& path = InstanceGenerationPath());
-uint64_t AdvanceInstanceGeneration(const std::wstring& path = InstanceGenerationPath());
+std::optional<uint64_t> AdvanceInstanceGeneration(const std::wstring& path = InstanceGenerationPath());
 void SetActiveInstanceGeneration(uint64_t generation);
 uint64_t ActiveInstanceGeneration();
 bool ShouldGuardUndoLeftover(uint64_t guardGeneration, uint64_t activeGeneration);

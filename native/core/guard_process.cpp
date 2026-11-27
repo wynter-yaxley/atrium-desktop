@@ -22,6 +22,7 @@ namespace atrium {
 namespace {
 
 constexpr wchar_t kGuardMutex[] = L"Local\\Atrium.Guard"; // held by the guard while it runs
+constexpr wchar_t kChromeStateMutex[] = L"Local\\Atrium.ChromeState";
 std::atomic<uint64_t> g_activeGeneration{0};
 
 HWND FindProcessWindow(const wchar_t* className, DWORD pid)
@@ -79,28 +80,47 @@ uint64_t ParseUnsignedText(std::wstring_view text)
     return static_cast<uint64_t>(val);
 }
 
-HANDLE AcquireGuardMutex()
+HANDLE AcquireNamedMutex(const wchar_t* name, const wchar_t* label)
 {
     KernelObjectSecurity security = KernelObjectSecurity::CreateSameUserMutex();
     if (!security.Valid()) {
-        Log(L"guard: could not build security descriptor for guard mutex (%lu)", GetLastError());
+        Log(L"guard: could not build security descriptor for %s mutex (%lu)", label, GetLastError());
         return nullptr;
     }
-    HANDLE held = CreateMutexExW(security.Get(), kGuardMutex, CREATE_MUTEX_INITIAL_OWNER, MUTEX_ALL_ACCESS);
+    HANDLE held = CreateMutexExW(security.Get(), name, CREATE_MUTEX_INITIAL_OWNER, MUTEX_ALL_ACCESS);
     if (!held) {
-        Log(L"guard: could not create guard mutex (%lu)", GetLastError());
+        Log(L"guard: could not create %s mutex (%lu)", label, GetLastError());
         return nullptr;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         const DWORD wait = WaitForSingleObject(held, 5000);
         if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
-            Log(L"guard: timed out or failed waiting for guard mutex (%lu, %lu)", wait, GetLastError());
+            Log(L"guard: timed out or failed waiting for %s mutex (%lu, %lu)", label, wait, GetLastError());
             CloseHandle(held);
             return nullptr;
         }
     }
     return held;
 }
+
+class ScopedMutexLock {
+public:
+    ScopedMutexLock(const wchar_t* name, const wchar_t* label) : handle_(AcquireNamedMutex(name, label)) {}
+    ~ScopedMutexLock()
+    {
+        if (handle_) {
+            ReleaseMutex(handle_);
+            CloseHandle(handle_);
+        }
+    }
+    ScopedMutexLock(const ScopedMutexLock&) = delete;
+    ScopedMutexLock& operator=(const ScopedMutexLock&) = delete;
+
+    bool Held() const { return handle_ != nullptr; }
+
+private:
+    HANDLE handle_ = nullptr;
+};
 
 void CheckGuardTrayHost(DWORD corePid, DWORD& activeTrayOwnerPid, int& traySilent, bool& trayBack)
 {
@@ -163,11 +183,22 @@ uint64_t ReadInstanceGeneration(const std::wstring& path)
     return ParseUnsignedText(ReadTextFile(path));
 }
 
-uint64_t AdvanceInstanceGeneration(const std::wstring& path)
+std::optional<uint64_t> AdvanceInstanceGeneration(const std::wstring& path)
 {
+    const ScopedMutexLock chromeLock(kChromeStateMutex, L"chrome state");
+    if (!chromeLock.Held()) {
+        Log(L"guard: could not acquire chrome state mutex to advance instance generation");
+        return std::nullopt;
+    }
+    if (path.empty()) {
+        Log(L"guard: could not persist instance generation because path is empty");
+        return std::nullopt;
+    }
     const uint64_t next = ReadInstanceGeneration(path) + 1;
-    if (!path.empty() && !WriteTextFile(path, std::to_wstring(next)))
+    if (!WriteTextFile(path, std::to_wstring(next))) {
         Log(L"guard: could not persist instance generation %llu (%lu)", static_cast<unsigned long long>(next), GetLastError());
+        return std::nullopt;
+    }
     g_activeGeneration.store(next);
     return next;
 }
@@ -228,8 +259,14 @@ void EnsureGuard(HANDLE& guard)
         guard = nullptr;
     }
     uint64_t generation = g_activeGeneration.load();
-    if (generation == 0)
-        generation = AdvanceInstanceGeneration();
+    if (generation == 0) {
+        const std::optional<uint64_t> advanced = AdvanceInstanceGeneration();
+        if (!advanced) {
+            Log(L"guard: skipping launch because instance generation could not be persisted");
+            return;
+        }
+        generation = *advanced;
+    }
     wchar_t exe[MAX_PATH * 2];
     if (!GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe))))
         return;
@@ -248,14 +285,9 @@ void EnsureGuard(HANDLE& guard)
 
 int RunGuard(DWORD pid, const wchar_t* hostClass, uint64_t generation)
 {
-    HANDLE held = AcquireGuardMutex();
-    if (!held)
+    const ScopedMutexLock guardLock(kGuardMutex, L"guard");
+    if (!guardLock.Held())
         return 1;
-    auto release = [](HANDLE h) {
-        ReleaseMutex(h);
-        CloseHandle(h);
-    };
-    std::unique_ptr<void, decltype(release)> guard(held, release);
     HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process)
         return 1;
@@ -273,6 +305,11 @@ int RunGuard(DWORD pid, const wchar_t* hostClass, uint64_t generation)
     DWORD code = 0;
     GetExitCodeProcess(process, &code);
     CloseHandle(process);
+    const ScopedMutexLock chromeLock(kChromeStateMutex, L"chrome state");
+    if (!chromeLock.Held()) {
+        Log(L"guard: could not acquire chrome state mutex; skipping chrome undo");
+        return 0;
+    }
     const uint64_t activeGeneration = ReadInstanceGeneration();
     if (!ShouldGuardUndoLeftover(generation, activeGeneration)) {
         Log(L"guard: Atrium (%lu, gen %llu) superseded by gen %llu; skipping chrome undo", pid, static_cast<unsigned long long>(generation),

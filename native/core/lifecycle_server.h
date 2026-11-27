@@ -18,6 +18,7 @@ struct LifecycleCallbacks {
     std::function<void(const std::wstring& page)> onOpenSettings;
     std::function<void()> onQuit;
     std::function<bool()> onRestartStandard;
+    std::function<void()> onNotifyUpdateReady;
     std::function<PrivilegeMode()> privilegeModeProvider;
 };
 
@@ -56,6 +57,6 @@ private:
 };
 
 bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page = {}, LifecycleReply* replyOut = nullptr, const std::wstring& pipeName = {},
-                          DWORD timeoutMs = 2000);
+                          DWORD timeoutMs = 2000, DWORD expectedPid = 0, const std::wstring& expectedExePath = {});
 
 } // namespace atrium

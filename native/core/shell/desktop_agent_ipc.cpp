@@ -1,6 +1,7 @@
 #include "shell/desktop_agent_ipc.h"
 
 #include "log.h"
+#include "win32_path.h"
 
 #include <aclapi.h>
 #include <sddl.h>
@@ -113,14 +114,14 @@ bool ReadUint64(const json::JsonObject& o, const wchar_t* k, uint64_t& out, bool
     return errno == 0 && end != text.c_str() && *end == L'\0' && (out = static_cast<uint64_t>(parsed), true);
 }
 
-bool GetNamedObj(const json::JsonObject& o, const wchar_t* key, json::JsonObject& out)
+bool GetNamedObj(const json::JsonObject& o, const wchar_t* k, json::JsonObject& out)
 {
-    return o.HasKey(key) && o.GetNamedValue(key).ValueType() == json::JsonValueType::Object && (out = o.GetNamedObject(key), true);
+    return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Object && (out = o.GetNamedObject(k), true);
 }
 
-bool GetNamedArr(const json::JsonObject& o, const wchar_t* key, json::JsonArray& out)
+bool GetNamedArr(const json::JsonObject& o, const wchar_t* k, json::JsonArray& out)
 {
-    return o.HasKey(key) && o.GetNamedValue(key).ValueType() == json::JsonValueType::Array && (out = o.GetNamedArray(key), true);
+    return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Array && (out = o.GetNamedArray(k), true);
 }
 
 json::JsonObject RectToJson(const RECT& r)
@@ -192,13 +193,12 @@ std::wstring EncodeBase64(const std::vector<uint8_t>& data)
 
 int Base64Val(wchar_t ch)
 {
-    if (ch >= L'A' && ch <= L'Z')
-        return ch - L'A';
-    if (ch >= L'a' && ch <= L'z')
-        return 26 + (ch - L'a');
-    if (ch >= L'0' && ch <= L'9')
-        return 52 + (ch - L'0');
-    return ch == L'+' ? 62 : ch == L'/' ? 63 : -1;
+    return (ch >= L'A' && ch <= L'Z') ? ch - L'A' :
+           (ch >= L'a' && ch <= L'z') ? 26 + ch - L'a' :
+           (ch >= L'0' && ch <= L'9') ? 52 + ch - L'0' :
+           ch == L'+'                 ? 62 :
+           ch == L'/'                 ? 63 :
+                                        -1;
 }
 
 bool DecodeBase64(std::wstring_view text, size_t maxDecodedBytes, std::vector<uint8_t>& out)
@@ -233,24 +233,12 @@ bool DecodeBase64(std::wstring_view text, size_t maxDecodedBytes, std::vector<ui
 json::JsonObject TrayIconToJson(const AgentTrayIconDto& icon)
 {
     json::JsonObject obj;
-    SetStr(obj, L"key", icon.key);
-    SetStr(obj, L"hwnd", std::to_wstring(icon.hwnd));
-    SetNum(obj, L"uid", icon.uid);
-    SetNum(obj, L"callback", icon.callback);
-    SetNum(obj, L"version", icon.version);
-    SetBool(obj, L"showTip", icon.showTip);
-    SetStr(obj, L"tip", icon.tip);
-    SetStr(obj, L"exe", icon.exe);
-    SetNum(obj, L"pid", icon.pid);
-    SetStr(obj, L"imageVersion", std::to_wstring(icon.imageVersion));
-    SetBool(obj, L"hidden", icon.hidden);
-    SetStr(obj, L"added", std::to_wstring(icon.added));
-    SetBool(obj, L"flashing", icon.flashing);
-    if (icon.width > 0 && icon.height > 0 && !icon.pixels.empty()) {
-        SetNum(obj, L"width", icon.width);
-        SetNum(obj, L"height", icon.height);
-        SetStr(obj, L"pixels", EncodeBase64(icon.pixels));
-    }
+    SetStr(obj, L"key", icon.key), SetStr(obj, L"hwnd", std::to_wstring(icon.hwnd)), SetNum(obj, L"uid", icon.uid), SetNum(obj, L"callback", icon.callback);
+    SetNum(obj, L"version", icon.version), SetBool(obj, L"showTip", icon.showTip), SetStr(obj, L"tip", icon.tip), SetStr(obj, L"exe", icon.exe);
+    SetNum(obj, L"pid", icon.pid), SetStr(obj, L"imageVersion", std::to_wstring(icon.imageVersion)), SetBool(obj, L"hidden", icon.hidden);
+    SetStr(obj, L"added", std::to_wstring(icon.added)), SetBool(obj, L"flashing", icon.flashing);
+    if (icon.width > 0 && icon.height > 0 && !icon.pixels.empty())
+        SetNum(obj, L"width", icon.width), SetNum(obj, L"height", icon.height), SetStr(obj, L"pixels", EncodeBase64(icon.pixels));
     return obj;
 }
 
@@ -265,9 +253,7 @@ bool JsonToTrayIcon(const json::JsonObject& obj, AgentTrayIconDto& out)
         !ReadBool(obj, L"flashing", out.flashing)) {
         return false;
     }
-    out.uid = static_cast<UINT>(uid);
-    out.callback = static_cast<UINT>(cb);
-    out.version = static_cast<UINT>(ver);
+    out.uid = static_cast<UINT>(uid), out.callback = static_cast<UINT>(cb), out.version = static_cast<UINT>(ver);
     if (obj.HasKey(L"width") || obj.HasKey(L"height") || obj.HasKey(L"pixels")) {
         std::wstring b64;
         if (!ReadInt(obj, L"width", out.width) || !ReadInt(obj, L"height", out.height) || !ReadString(obj, L"pixels", b64, kMaxIconBase64Chars) ||
@@ -300,16 +286,14 @@ bool ParseSyncDropBars(const json::JsonObject& o, AgentCommandMessage& out)
     json::JsonArray arr{nullptr};
     if (!GetNamedArr(o, L"bars", arr) || arr.Size() > kMaxAgentDropBars)
         return false;
-    out.type = AgentCommandType::SyncDropBars;
-    out.bars.reserve(arr.Size());
+    out.type = AgentCommandType::SyncDropBars, out.bars.reserve(arr.Size());
     for (uint32_t i = 0; i < arr.Size(); ++i) {
         const auto v = arr.GetAt(i);
         json::JsonObject rectObj{nullptr};
         AgentBarRect bar;
         if (v.ValueType() != json::JsonValueType::Object || !ReadUint64(v.GetObject(), L"id", bar.id) || !ReadBool(v.GetObject(), L"visible", bar.visible) ||
-            !GetNamedObj(v.GetObject(), L"rect", rectObj) || !JsonToRect(rectObj, bar.rect)) {
+            !GetNamedObj(v.GetObject(), L"rect", rectObj) || !JsonToRect(rectObj, bar.rect))
             return false;
-        }
         out.bars.push_back(bar);
     }
     return true;
@@ -320,15 +304,12 @@ bool ParseTraySnapshotEvent(const json::JsonObject& o, AgentEventMessage& out)
     std::wstring reasonText;
     json::JsonArray arr{nullptr};
     if (!ReadBool(o, L"yielded", out.snapshot.yielded) || !ReadString(o, L"yieldReason", reasonText, 64) ||
-        !FromWire(kYieldReasonMap, reasonText, out.snapshot.yieldReason) || !GetNamedArr(o, L"icons", arr) || arr.Size() > kMaxAgentTrayIcons) {
+        !FromWire(kYieldReasonMap, reasonText, out.snapshot.yieldReason) || !GetNamedArr(o, L"icons", arr) || arr.Size() > kMaxAgentTrayIcons)
         return false;
-    }
-    out.type = AgentEventType::TraySnapshot;
-    out.snapshot.icons.reserve(arr.Size());
+    out.type = AgentEventType::TraySnapshot, out.snapshot.icons.reserve(arr.Size());
     for (uint32_t i = 0; i < arr.Size(); ++i) {
-        const auto v = arr.GetAt(i);
         AgentTrayIconDto icon;
-        if (v.ValueType() != json::JsonValueType::Object || !JsonToTrayIcon(v.GetObject(), icon))
+        if (arr.GetAt(i).ValueType() != json::JsonValueType::Object || !JsonToTrayIcon(arr.GetAt(i).GetObject(), icon))
             return false;
         out.snapshot.icons.push_back(std::move(icon));
     }
@@ -339,11 +320,9 @@ bool ParseDropEvent(const json::JsonObject& o, AgentEventMessage& out)
 {
     json::JsonArray arr{nullptr};
     if (!ReadString(o, L"key", out.key, kMaxAgentPathLength) || out.key.empty() || !GetNamedArr(o, L"paths", arr) || arr.Size() == 0 ||
-        arr.Size() > kMaxAgentDropPaths) {
+        arr.Size() > kMaxAgentDropPaths)
         return false;
-    }
-    out.type = AgentEventType::Drop;
-    out.paths.reserve(arr.Size());
+    out.type = AgentEventType::Drop, out.paths.reserve(arr.Size());
     for (uint32_t i = 0; i < arr.Size(); ++i) {
         const auto v = arr.GetAt(i);
         if (v.ValueType() != json::JsonValueType::String)
@@ -399,32 +378,33 @@ bool VerifyImpersonatedClientSid(HANDLE pipe, const std::wstring& expectedSid)
     return ok;
 }
 
-bool VerifyConnectedServerSameUser(HANDLE pipe)
+bool VerifyPipeOwnerSameUser(HANDLE pipe, const std::wstring& expectedSid)
 {
-    const auto& self = SelfSecurityContext();
     PSID ownerSid = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
-    if (!self.valid || GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &ownerSid, nullptr, nullptr, nullptr, &sd) != ERROR_SUCCESS ||
-        !ownerSid) {
+    if (GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &ownerSid, nullptr, nullptr, nullptr, &sd) != ERROR_SUCCESS || !ownerSid) {
         if (sd)
             LocalFree(sd);
         return false;
     }
     wchar_t* sidText = nullptr;
-    const bool ownerOk = ConvertSidToStringSidW(ownerSid, &sidText) && sidText && _wcsicmp(sidText, self.userSid.c_str()) == 0;
+    const bool ownerOk = ConvertSidToStringSidW(ownerSid, &sidText) && sidText && _wcsicmp(sidText, expectedSid.c_str()) == 0;
     if (sidText)
         LocalFree(sidText);
     LocalFree(sd);
-    if (!ownerOk)
+    return ownerOk;
+}
+
+bool VerifyConnectedServerSameUser(HANDLE pipe)
+{
+    const auto& self = SelfSecurityContext();
+    if (!self.valid || !VerifyPipeOwnerSameUser(pipe, self.userSid))
         return false;
     ULONG serverPid = 0;
     if (GetNamedPipeServerProcessId(pipe, &serverPid) && serverPid != 0) {
         DWORD err = 0;
         const ProcessSecurityContext server = QueryPidSecurityContext(serverPid, &err);
-        if (server.valid)
-            return _wcsicmp(server.userSid.c_str(), self.userSid.c_str()) == 0;
-        if (err != ERROR_ACCESS_DENIED)
-            return false;
+        return server.valid ? _wcsicmp(server.userSid.c_str(), self.userSid.c_str()) == 0 : (err == ERROR_ACCESS_DENIED);
     }
     return true;
 }
@@ -471,38 +451,29 @@ std::string SerializeAgentCommand(const AgentCommandMessage& msg)
     switch (msg.type) {
     case AgentCommandType::Ping: SetStr(o, L"cmd", L"ping"); break;
     case AgentCommandType::Quit: SetStr(o, L"cmd", L"quit"); break;
-    case AgentCommandType::SetTrayHosting:
-        SetStr(o, L"cmd", L"set-tray-hosting");
-        SetBool(o, L"hosting", msg.hosting);
-        break;
-    case AgentCommandType::SetTrayPlaces:
-        SetStr(o, L"cmd", L"set-tray-places");
-        o.SetNamedValue(L"anchor", RectToJson(msg.anchor));
-        break;
+    case AgentCommandType::SetTrayHosting: SetStr(o, L"cmd", L"set-tray-hosting"), SetBool(o, L"hosting", msg.hosting); break;
+    case AgentCommandType::SetTrayPlaces: SetStr(o, L"cmd", L"set-tray-places"), o.SetNamedValue(L"anchor", RectToJson(msg.anchor)); break;
     case AgentCommandType::TraySend:
     case AgentCommandType::TrayHover:
-        SetStr(o, L"cmd", msg.type == AgentCommandType::TraySend ? L"tray-send" : L"tray-hover");
-        SetStr(o, L"key", msg.key);
+        SetStr(o, L"cmd", msg.type == AgentCommandType::TraySend ? L"tray-send" : L"tray-hover"), SetStr(o, L"key", msg.key);
         if (msg.type == AgentCommandType::TraySend)
             SetStr(o, L"action", ToWire(kActionMap, msg.action));
-        o.SetNamedValue(L"at", PointToJson(msg.at));
-        o.SetNamedValue(L"cell", RectToJson(msg.cell));
+        o.SetNamedValue(L"at", PointToJson(msg.at)), o.SetNamedValue(L"cell", RectToJson(msg.cell));
         break;
     case AgentCommandType::SyncDropBars: {
         SetStr(o, L"cmd", L"sync-drop-bars");
         json::JsonArray arr;
-        const size_t limit = (std::min)(msg.bars.size(), kMaxAgentDropBars);
-        for (size_t i = 0; i < limit; ++i) {
+        for (size_t i = 0; i < (std::min)(msg.bars.size(), kMaxAgentDropBars); ++i) {
             json::JsonObject item;
-            SetStr(item, L"id", std::to_wstring(msg.bars[i].id));
-            item.SetNamedValue(L"rect", RectToJson(msg.bars[i].rect));
-            SetBool(item, L"visible", msg.bars[i].visible);
-            arr.Append(item);
+            SetStr(item, L"id", std::to_wstring(msg.bars[i].id)), item.SetNamedValue(L"rect", RectToJson(msg.bars[i].rect)),
+                SetBool(item, L"visible", msg.bars[i].visible), arr.Append(item);
         }
         o.SetNamedValue(L"bars", arr);
         break;
     }
     }
+    if (msg.opId != 0)
+        SetStr(o, L"opId", std::to_wstring(msg.opId));
     return JsonStringify(o);
 }
 
@@ -515,6 +486,8 @@ bool ValidateAndParseAgentCommand(const std::string& raw, AgentCommandMessage& o
     if (!json::JsonObject::TryParse(Widen(raw), o) || !ReadString(o, L"cmd", cmd, 64) || cmd.empty())
         return false;
     out = {};
+    if (!ReadUint64(o, L"opId", out.opId, false))
+        return false;
     if (cmd == L"ping")
         return out.type = AgentCommandType::Ping, true;
     if (cmd == L"quit")
@@ -529,20 +502,17 @@ bool ValidateAndParseAgentCommand(const std::string& raw, AgentCommandMessage& o
         return ParseTrayClickOrHover(o, true, out);
     if (cmd == L"tray-hover")
         return ParseTrayClickOrHover(o, false, out);
-    if (cmd == L"sync-drop-bars")
-        return ParseSyncDropBars(o, out);
-    return false;
+    return cmd == L"sync-drop-bars" && ParseSyncDropBars(o, out);
 }
 
 std::string SerializeAgentCommandReply(const AgentCommandReply& reply)
 {
     json::JsonObject o;
-    SetBool(o, L"ok", reply.ok);
+    SetBool(o, L"ok", reply.ok), SetStr(o, L"status", ToWire(kSendStatusMap, reply.sendStatus));
     if (reply.pid != 0)
         SetNum(o, L"pid", reply.pid);
     if (reply.generation != 0)
         SetStr(o, L"generation", std::to_wstring(reply.generation));
-    SetStr(o, L"status", ToWire(kSendStatusMap, reply.sendStatus));
     if (reply.higherIntegrity)
         SetBool(o, L"higherIntegrity", true);
     if (!reply.error.empty())
@@ -572,12 +542,10 @@ std::string SerializeAgentEvent(const AgentEventMessage& msg)
     json::JsonObject o;
     switch (msg.type) {
     case AgentEventType::TraySnapshot: {
-        SetStr(o, L"evt", L"tray-snapshot");
-        SetBool(o, L"yielded", msg.snapshot.yielded);
-        SetStr(o, L"yieldReason", ToWire(kYieldReasonMap, msg.snapshot.yieldReason));
+        SetStr(o, L"evt", L"tray-snapshot"), SetBool(o, L"yielded", msg.snapshot.yielded),
+            SetStr(o, L"yieldReason", ToWire(kYieldReasonMap, msg.snapshot.yieldReason));
         json::JsonArray arr;
-        const size_t limit = (std::min)(msg.snapshot.icons.size(), kMaxAgentTrayIcons);
-        for (size_t i = 0; i < limit; ++i)
+        for (size_t i = 0; i < (std::min)(msg.snapshot.icons.size(), kMaxAgentTrayIcons); ++i)
             arr.Append(TrayIconToJson(msg.snapshot.icons[i]));
         o.SetNamedValue(L"icons", arr);
         break;
@@ -596,6 +564,8 @@ std::string SerializeAgentEvent(const AgentEventMessage& msg)
         break;
     }
     }
+    if (msg.opId != 0)
+        SetStr(o, L"opId", std::to_wstring(msg.opId));
     return JsonStringify(o);
 }
 
@@ -605,9 +575,9 @@ bool ValidateAndParseAgentEvent(const std::string& raw, AgentEventMessage& out)
         return false;
     json::JsonObject o{nullptr};
     std::wstring evt;
-    if (!json::JsonObject::TryParse(Widen(raw), o) || !ReadString(o, L"evt", evt, 64) || evt.empty())
-        return false;
     out = {};
+    if (!json::JsonObject::TryParse(Widen(raw), o) || !ReadString(o, L"evt", evt, 64) || evt.empty() || !ReadUint64(o, L"opId", out.opId, false))
+        return false;
     if (evt == L"tray-snapshot")
         return ParseTraySnapshotEvent(o, out);
     if (evt == L"tray-yield") {
@@ -619,16 +589,13 @@ bool ValidateAndParseAgentEvent(const std::string& raw, AgentEventMessage& out)
         json::JsonObject ptObj{nullptr};
         return out.type = AgentEventType::DragOver, GetNamedObj(o, L"pt", ptObj) && JsonToPoint(ptObj, out.pt);
     }
-    if (evt == L"drag-leave")
-        return out.type = AgentEventType::DragLeave, true;
-    return evt == L"drop" && ParseDropEvent(o, out);
+    return evt == L"drag-leave" ? (out.type = AgentEventType::DragLeave, true) : (evt == L"drop" && ParseDropEvent(o, out));
 }
 
 std::string SerializeAgentEventReply(const AgentEventReply& reply)
 {
     json::JsonObject o;
-    SetBool(o, L"ok", reply.ok);
-    SetBool(o, L"allow", reply.allow);
+    SetBool(o, L"ok", reply.ok), SetBool(o, L"allow", reply.allow);
     if (!reply.key.empty())
         SetStr(o, L"key", reply.key);
     if (!reply.error.empty())
@@ -672,6 +639,49 @@ bool VerifyNamedPipeClientSameUser(HANDLE pipe)
     if (client.valid)
         return _wcsicmp(client.userSid.c_str(), self.userSid.c_str()) == 0;
     return err == ERROR_ACCESS_DENIED && VerifyImpersonatedClientSid(pipe, self.userSid);
+}
+
+bool VerifyNamedPipePeerProcess(HANDLE pipe, bool isServerSide, const std::wstring& expectedImagePath, bool requireNonElevated, AgentPeerIdentity& out,
+                                winrt::handle* procOut)
+{
+    out = {};
+    if (procOut)
+        *procOut = {};
+    const auto& self = SelfSecurityContext();
+    if (!self.valid || !pipe || pipe == INVALID_HANDLE_VALUE)
+        return false;
+    ULONG peerPid = 0;
+    const BOOL gotPid = isServerSide ? GetNamedPipeClientProcessId(pipe, &peerPid) : GetNamedPipeServerProcessId(pipe, &peerPid);
+    if (!gotPid || peerPid == 0)
+        return false;
+    winrt::handle proc{OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, peerPid)};
+    if (!proc)
+        return false;
+    FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
+    if (!GetProcessTimes(proc.get(), &creation, &exitTime, &kernelTime, &userTime))
+        return false;
+    std::wstring imagePath = ProcessImagePath(proc.get());
+    if (imagePath.empty() || (!expectedImagePath.empty() && FoldCase(imagePath) != FoldCase(expectedImagePath)))
+        return false;
+    DWORD secErr = 0;
+    ProcessSecurityContext security = QueryProcessSecurityContext(proc.get(), &secErr);
+    if (security.valid) {
+        if (_wcsicmp(security.userSid.c_str(), self.userSid.c_str()) != 0 || security.sessionId != self.sessionId)
+            return false;
+        if (requireNonElevated && (security.isElevated || IsElevatedIntegrityRid(security.integrityRid)))
+            return false;
+    } else {
+        if (requireNonElevated || secErr != ERROR_ACCESS_DENIED)
+            return false;
+        const bool pipeUserOk = isServerSide ? VerifyImpersonatedClientSid(pipe, self.userSid) : VerifyPipeOwnerSameUser(pipe, self.userSid);
+        DWORD peerSession = 0;
+        if (!pipeUserOk || !ProcessIdToSessionId(peerPid, &peerSession) || peerSession != self.sessionId)
+            return false;
+    }
+    out = AgentPeerIdentity{peerPid, creation, std::move(imagePath), std::move(security), true};
+    if (procOut)
+        *procOut = std::move(proc);
+    return true;
 }
 
 bool ConnectNamedPipeOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent)
@@ -764,10 +774,8 @@ HANDLE ConnectSameUserPipeClient(const std::wstring& pipeName, DWORD timeoutMs, 
 bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent)
 {
     replyOut.clear();
-    if (pipe == INVALID_HANDLE_VALUE || request.empty() || request.size() > kMaxAgentMessageBytes)
-        return false;
     const winrt::handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    if (!event)
+    if (pipe == INVALID_HANDLE_VALUE || request.empty() || request.size() > kMaxAgentMessageBytes || !event)
         return false;
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
     OVERLAPPED ov{};

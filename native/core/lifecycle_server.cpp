@@ -2,6 +2,7 @@
 
 #include "host_messages.h"
 #include "log.h"
+#include "win32_path.h"
 
 #include <sddl.h>
 
@@ -20,6 +21,7 @@ namespace {
 
 constexpr DWORD kBuffer = 16 * 1024;
 constexpr DWORD kMaxMessageBytes = 1024 * 1024;
+constexpr DWORD kDrainTimeoutMs = 200;
 
 std::wstring Widen(const std::string& s)
 {
@@ -146,6 +148,102 @@ bool WritePipeMessage(HANDLE pipe, OVERLAPPED& ov, HANDLE quit, const std::strin
     return bytes == reply.size();
 }
 
+DWORD RemainingMs(ULONGLONG deadlineMs)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadlineMs)
+        return 0;
+    const ULONGLONG diff = deadlineMs - now;
+    return diff > MAXDWORD ? MAXDWORD : static_cast<DWORD>(diff);
+}
+
+void DrainPipeClient(HANDLE pipe, OVERLAPPED& ov, HANDLE quit, DWORD timeoutMs)
+{
+    const ULONGLONG deadlineMs = GetTickCount64() + timeoutMs;
+    char drain[64]{};
+    for (;;) {
+        const DWORD remaining = RemainingMs(deadlineMs);
+        if (remaining == 0)
+            return;
+        ResetEvent(ov.hEvent);
+        DWORD bytes = 0;
+        if (ReadFile(pipe, drain, sizeof(drain), &bytes, &ov))
+            continue;
+        const DWORD error = GetLastError();
+        if (error == ERROR_MORE_DATA)
+            continue;
+        if (error != ERROR_IO_PENDING)
+            return;
+        HANDLE hs[] = {ov.hEvent, quit};
+        if (WaitForMultipleObjects(2, hs, FALSE, remaining) != WAIT_OBJECT_0) {
+            CancelIoEx(pipe, &ov);
+            GetOverlappedResult(pipe, &ov, &bytes, TRUE);
+            return;
+        }
+        if (!GetOverlappedResult(pipe, &ov, &bytes, FALSE)) {
+            if (GetLastError() == ERROR_MORE_DATA)
+                continue;
+            return;
+        }
+    }
+}
+
+bool WaitClientOverlapped(HANDLE pipe, OVERLAPPED& ov, ULONGLONG deadlineMs, DWORD& bytes, DWORD& error)
+{
+    const DWORD remaining = RemainingMs(deadlineMs);
+    if (WaitForSingleObject(ov.hEvent, remaining) != WAIT_OBJECT_0) {
+        CancelIoEx(pipe, &ov);
+        GetOverlappedResult(pipe, &ov, &bytes, TRUE);
+        error = ERROR_TIMEOUT;
+        return false;
+    }
+    error = GetOverlappedResult(pipe, &ov, &bytes, FALSE) ? ERROR_SUCCESS : GetLastError();
+    return error == ERROR_SUCCESS || error == ERROR_MORE_DATA;
+}
+
+std::wstring FileBaseName(const std::wstring& path)
+{
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+bool MatchesExpectedExecutable(HANDLE process, const std::wstring& expectedExePath)
+{
+    const std::wstring actual = ProcessImagePath(process);
+    if (actual.empty())
+        return false;
+    if (expectedExePath.empty())
+        return FoldCase(FileBaseName(actual)) == L"atrium.exe";
+    if (expectedExePath.find_first_of(L"\\/") != std::wstring::npos)
+        return FoldCase(actual) == FoldCase(expectedExePath);
+    return FoldCase(FileBaseName(actual)) == FoldCase(expectedExePath);
+}
+
+bool VerifyPipeServerIdentity(HANDLE pipe, DWORD expectedPid, const std::wstring& expectedExePath)
+{
+    const auto& self = SelfSecurityContext();
+    if (!self.valid)
+        return false;
+    ULONG serverPid = 0;
+    if (!GetNamedPipeServerProcessId(pipe, &serverPid) || serverPid == 0)
+        return false;
+    if (expectedPid != 0 && serverPid != expectedPid)
+        return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, serverPid);
+    if (!proc)
+        return false;
+    const ProcessSecurityContext server = QueryProcessSecurityContext(proc);
+    const bool exeOk = MatchesExpectedExecutable(proc, expectedExePath);
+    CloseHandle(proc);
+    if (!server.valid || server.sessionId != self.sessionId)
+        return false;
+    if (_wcsicmp(server.userSid.c_str(), self.userSid.c_str()) != 0)
+        return false;
+    if (!expectedExePath.empty() && !exeOk)
+        return false;
+    return expectedPid != 0 || exeOk;
+}
+
 bool VerifyImpersonatedClientSid(HANDLE pipe, const std::wstring& expectedSid)
 {
     if (!ImpersonateNamedPipeClient(pipe))
@@ -191,12 +289,16 @@ bool ParseLifecycleReply(const std::string& raw, LifecycleReply& out)
     return true;
 }
 
-HANDLE OpenLifecyclePipe(const std::wstring& pipeName, DWORD timeoutMs)
+HANDLE OpenLifecyclePipe(const std::wstring& pipeName, ULONGLONG deadlineMs, DWORD expectedPid, const std::wstring& expectedExePath)
 {
-    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
     for (;;) {
-        HANDLE pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                  SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION | FILE_FLAG_OVERLAPPED, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) {
+            if (!VerifyPipeServerIdentity(pipe, expectedPid, expectedExePath)) {
+                CloseHandle(pipe);
+                return INVALID_HANDLE_VALUE;
+            }
             DWORD mode = PIPE_READMODE_MESSAGE;
             if (!SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr)) {
                 CloseHandle(pipe);
@@ -205,14 +307,13 @@ HANDLE OpenLifecyclePipe(const std::wstring& pipeName, DWORD timeoutMs)
             return pipe;
         }
         const DWORD err = GetLastError();
-        const ULONGLONG now = GetTickCount64();
-        if (now >= deadline)
+        const DWORD remaining = RemainingMs(deadlineMs);
+        if (remaining == 0)
             return INVALID_HANDLE_VALUE;
         if (err == ERROR_PIPE_BUSY) {
-            const DWORD remaining = static_cast<DWORD>(deadline - now);
             WaitNamedPipeW(pipeName.c_str(), remaining > 100 ? 100 : remaining);
         } else if (err == ERROR_FILE_NOT_FOUND) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::this_thread::sleep_for(std::chrono::milliseconds(remaining > 25 ? 25 : remaining));
         } else {
             return INVALID_HANDLE_VALUE;
         }
@@ -313,7 +414,7 @@ void LifecycleServer::Serve(HANDLE pipe)
     }
     const std::string reply = Handle(message);
     if (WritePipeMessage(pipe, ov, quit_, reply))
-        FlushFileBuffers(pipe);
+        DrainPipeClient(pipe, ov, quit_, kDrainTimeoutMs);
 }
 
 std::string LifecycleServer::Handle(const std::string& request)
@@ -349,6 +450,13 @@ std::string LifecycleServer::Handle(const std::string& request)
             PostMessageW(host_, WM_CLOSE, 0, 0);
         return AcceptedReply();
     }
+    if (cmd == L"notify-update-ready") {
+        if (callbacks_.onNotifyUpdateReady)
+            callbacks_.onNotifyUpdateReady();
+        else if (host_)
+            PostMessageW(host_, WM_UPDATE_READY, 0, 0);
+        return AcceptedReply();
+    }
     if (cmd == L"restart-standard") {
         if (!CanDeElevateToShell(mode))
             return ErrorReply(L"cannot_deelevate");
@@ -365,14 +473,22 @@ std::string LifecycleServer::Handle(const std::string& request)
     return ErrorReply(L"unknown_command");
 }
 
-bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page, LifecycleReply* replyOut, const std::wstring& pipeName, DWORD timeoutMs)
+bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page, LifecycleReply* replyOut, const std::wstring& pipeName, DWORD timeoutMs,
+                          DWORD expectedPid, const std::wstring& expectedExePath)
 {
     if (replyOut)
         *replyOut = {};
+    const ULONGLONG deadlineMs = GetTickCount64() + timeoutMs;
     const std::wstring target = pipeName.empty() ? LifecyclePipeName() : pipeName;
-    HANDLE pipe = OpenLifecyclePipe(target, timeoutMs);
+    HANDLE pipe = OpenLifecyclePipe(target, deadlineMs, expectedPid, expectedExePath);
     if (pipe == INVALID_HANDLE_VALUE)
         return false;
+
+    ScopedEvent event;
+    if (!event.handle) {
+        CloseHandle(pipe);
+        return false;
+    }
 
     json::JsonObject req;
     req.SetNamedValue(L"cmd", json::JsonValue::CreateStringValue(cmd));
@@ -380,8 +496,17 @@ bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page, Lif
         req.SetNamedValue(L"page", json::JsonValue::CreateStringValue(page));
     const std::string payload = JsonStringify(req);
 
+    OVERLAPPED ov{};
+    ov.hEvent = event.handle;
     DWORD written = 0;
-    if (!WriteFile(pipe, payload.data(), DWORD(payload.size()), &written, nullptr) || written != payload.size()) {
+    if (!WriteFile(pipe, payload.data(), DWORD(payload.size()), &written, &ov)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_IO_PENDING || !WaitClientOverlapped(pipe, ov, deadlineMs, written, err)) {
+            CloseHandle(pipe);
+            return false;
+        }
+    }
+    if (written != payload.size()) {
         CloseHandle(pipe);
         return false;
     }
@@ -389,12 +514,20 @@ bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page, Lif
     std::string reply;
     std::string chunk(kBuffer, '\0');
     for (;;) {
+        ResetEvent(ov.hEvent);
         DWORD read = 0;
-        const bool ok = ReadFile(pipe, chunk.data(), DWORD(chunk.size()), &read, nullptr) != FALSE;
-        const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        if (!ok && err != ERROR_MORE_DATA) {
-            CloseHandle(pipe);
-            return false;
+        DWORD err = ERROR_SUCCESS;
+        if (!ReadFile(pipe, chunk.data(), DWORD(chunk.size()), &read, &ov)) {
+            err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                if (!WaitClientOverlapped(pipe, ov, deadlineMs, read, err)) {
+                    CloseHandle(pipe);
+                    return false;
+                }
+            } else if (err != ERROR_MORE_DATA) {
+                CloseHandle(pipe);
+                return false;
+            }
         }
         reply.append(chunk.data(), read);
         if (reply.size() > kMaxMessageBytes) {

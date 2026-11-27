@@ -35,7 +35,7 @@ struct LaunchResult {
 
 constexpr DWORD kDefaultShellLaunchTimeoutMs = 2500;
 
-LaunchRoute ResolveLaunchRoute(PrivilegeMode mode, LaunchPrivilege privilege, LaunchTargetKind kind, const std::wstring& verb = {});
+LaunchRoute ResolveLaunchRoute(PrivilegeMode mode, LaunchPrivilege privilege, LaunchTargetKind kind, const std::wstring& verb = {}, bool selfElevated = false);
 
 void StartShellLaunch();
 void StopShellLaunch();

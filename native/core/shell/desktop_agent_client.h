@@ -24,6 +24,7 @@ struct DesktopAgentCallbacks {
     std::function<AgentDragOverResult(POINT)> onDragOver;
     std::function<void()> onDragLeave;
     std::function<void(const std::wstring&, const std::vector<std::wstring>&)> onDropFiles;
+    std::function<bool(const std::wstring&, const std::vector<std::wstring>&)> onDropFilesAccepted;
     std::function<void(DWORD)> onAgentPidChanged;
 };
 
@@ -34,6 +35,8 @@ struct DesktopAgentClientOptions {
     std::wstring cmdPipeOverride;
     std::wstring evtPipeOverride;
     bool launchSupervisor = true;
+    bool allowUnboundTestEvtPeer = false;
+    bool allowSameProcessPeer = false;
     // Optional test hook replacing ShellLaunch(..., RequireMedium). Returns an owned waitable handle or nullptr.
     std::function<HANDLE(const std::wstring& args, DWORD& errorOut)> spawnAgentOverride;
     DWORD pingWaitMs = 3000;
@@ -77,7 +80,7 @@ private:
     AgentEventReply HandleEvent(const AgentEventMessage& evt);
 
     void SupervisorLoop();
-    bool SpawnAndConnect(HANDLE& procOut, DWORD& pidOut);
+    bool SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut);
     void ReplayDesiredState();
     void ClearAgentStateOnExit();
     bool SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs);
@@ -96,16 +99,21 @@ private:
     std::atomic_bool evtReady_{false};
     std::atomic<DWORD> agentPid_{0};
     std::atomic_bool degraded_{false};
+    std::atomic<uint64_t> nextOpId_{1};
 
     mutable std::mutex stateMutex_;
+    DWORD activeAgentPid_ = 0;
+    FILETIME activeAgentCreationTime_{};
     bool hosting_ = false;
     bool hasAnchor_ = false;
     RECT anchor_{};
-    std::vector<AgentBarRect> dropBars_;
+    std::vector<AgentBarRect> desiredDropBars_;
+    std::vector<AgentBarRect> confirmedDropBars_;
     bool yielded_ = false;
     TrayHostYieldReason yieldReason_ = TrayHostYieldReason::None;
     std::vector<CachedIcon> icons_;
     std::map<uint64_t, std::shared_ptr<const IconImage>> imageCache_;
+    RecentOpTracker seenDropOps_;
 
     std::mutex cmdPipeMutex_;
     HANDLE cmdPipe_ = INVALID_HANDLE_VALUE;

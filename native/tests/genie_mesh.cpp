@@ -1,5 +1,6 @@
 #include "render/genie_mesh.h"
 #include "render/genie_renderer.h"
+#include "ui/genie_minimize.h"
 #include "ui/window_snapshot.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -222,14 +224,16 @@ void TestWindowPictureCache()
     atrium::WindowPictureCache cache(entryBytes * 2);
     Require(atrium::WindowPictureCache::kDefaultMaxBytes == 64ULL * 1024ULL * 1024ULL, "default cache budget must be 64 MiB");
 
-    cache.Put({wA, 10, ft1, 1}, {0, 0, 20, 20}, picA);
-    cache.Put({wB, 20, ft1, 1}, {0, 0, 20, 20}, picB);
-    Require(cache.Count() == 2 && cache.TotalBytes() == entryBytes * 2, "cache holds 2 entries within budget");
+    Require(cache.Put({wA, 10, ft1, 1}, {0, 0, 20, 20}, picA), "wA Put within budget must succeed");
+    Require(cache.TotalBytes() <= cache.MaxBytes(), "TotalBytes must remain <= MaxBytes");
+    Require(cache.Put({wB, 20, ft1, 1}, {0, 0, 20, 20}, picB), "wB Put within budget must succeed");
+    Require(cache.Count() == 2 && cache.TotalBytes() == entryBytes * 2 && cache.TotalBytes() <= cache.MaxBytes(), "cache holds 2 entries within budget");
 
     // Touch wA so wB becomes LRU, then insert wC -> wB must be evicted.
     Require(cache.Find(wA, 10, ft1, 1) != nullptr, "wA hit expected");
-    cache.Put({wC, 30, ft1, 1}, {0, 0, 20, 20}, picC);
-    Require(cache.Count() == 2 && cache.TotalBytes() == entryBytes * 2, "LRU eviction must keep total bytes within budget");
+    Require(cache.Put({wC, 30, ft1, 1}, {0, 0, 20, 20}, picC), "wC Put within budget must succeed");
+    Require(cache.Count() == 2 && cache.TotalBytes() == entryBytes * 2 && cache.TotalBytes() <= cache.MaxBytes(),
+            "LRU eviction must keep total bytes within budget");
     Require(cache.Find(wB, 20, ft1, 1) == nullptr, "wB (LRU) must be evicted");
     Require(cache.Find(wA, 10, ft1, 1) != nullptr && cache.Find(wC, 30, ft1, 1) != nullptr, "wA and wC must remain cached");
 
@@ -238,17 +242,28 @@ void TestWindowPictureCache()
 
     // Recycled HWND with different PID or creationTime invalidates & erases stale entry.
     Require(cache.Find(wA, 99, ft1, 1) == nullptr, "mismatched PID must invalidate recycled HWND");
-    Require(cache.Count() == 1 && cache.TotalBytes() == entryBytes, "invalidated recycled HWND must be erased");
+    Require(cache.Count() == 1 && cache.TotalBytes() == entryBytes && cache.TotalBytes() <= cache.MaxBytes(), "invalidated recycled HWND must be erased");
     Require(!cache.Touch(wC, 30, ft2), "mismatched creationTime must invalidate recycled HWND");
-    Require(cache.Count() == 0 && cache.TotalBytes() == 0, "invalidated creationTime entry must be erased");
+    Require(cache.Count() == 0 && cache.TotalBytes() == 0 && cache.TotalBytes() <= cache.MaxBytes(), "invalidated creationTime entry must be erased");
 
-    // Single entry larger than non-zero budget stays alone (all others evicted); SetMaxBytes(0) clears all.
+    // Hard budget enforcement: single entry larger than MaxBytes is refused without dropping existing entries.
     auto huge = MakeTestPicture(60, 60);
-    cache.Put({wA, 10, ft1, 1}, {}, picA);
-    cache.Put({wB, 20, ft1, 1}, {}, huge);
-    Require(cache.Count() == 1 && cache.Find(wB, 20, ft1, 1) != nullptr, "single oversized entry evicts older entries");
+    Require(huge->image.ByteSize() > cache.MaxBytes(), "test oversized picture must exceed cache MaxBytes");
+    Require(cache.Put({wA, 10, ft1, 1}, {}, picA), "wA Put within budget must succeed");
+    Require(!cache.Put({wB, 20, ft1, 1}, {}, huge), "oversized entry (> MaxBytes) must be refused");
+    Require(cache.Count() == 1 && cache.TotalBytes() == entryBytes && cache.TotalBytes() <= cache.MaxBytes(),
+            "refused oversized entry must preserve existing valid entries and hard budget");
+    Require(cache.Find(wA, 10, ft1, 1) != nullptr && cache.Find(wB, 20, ft1, 1) == nullptr,
+            "existing valid entry remains cached and oversized entry is absent");
+    Require(!cache.Put({wA, 10, ft1, 2}, {}, huge), "oversized replacement for existing HWND must also be refused");
+    Require(cache.Count() == 1 && cache.TotalBytes() == entryBytes && cache.TotalBytes() <= cache.MaxBytes(),
+            "refused oversized replacement must preserve TotalBytes <= MaxBytes");
+
+    cache.SetMaxBytes(entryBytes / 2);
+    Require(cache.Count() == 0 && cache.TotalBytes() == 0 && cache.TotalBytes() <= cache.MaxBytes(),
+            "SetMaxBytes below existing entry size must evict to satisfy TotalBytes <= MaxBytes");
     cache.SetMaxBytes(0);
-    Require(cache.Count() == 0 && cache.TotalBytes() == 0, "SetMaxBytes(0) evicts all entries");
+    Require(cache.Count() == 0 && cache.TotalBytes() == 0 && !cache.Put({wA, 10, ft1, 1}, {}, picA), "SetMaxBytes(0) clears all and refuses Put");
 
     // QueryWindowSnapshotKey checks live valid vs invalid HWNDs.
     HWND msgWin = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -414,6 +429,119 @@ void TestGenieSceneEvaluation()
             "GenieSceneSnapshot tight overlay bounds mismatch");
 }
 
+void TestSnapshotMatchesLiveIdentity()
+{
+    const HWND w1 = FakeHwnd(0x2001);
+    const HWND w2 = FakeHwnd(0x2002);
+    const FILETIME ft1{1000, 2};
+    const FILETIME ft2{2000, 2};
+
+    const atrium::WindowSnapshotKey captured{w1, 4242, ft1, 0};
+    Require(atrium::SnapshotMatchesLiveIdentity(captured, {w1, 4242, ft1, 9}), "matching HWND, PID, and creationTime must pass regardless of generation");
+    Require(!atrium::SnapshotMatchesLiveIdentity({w1, 0, ft1, 0}, {w1, 4242, ft1, 1}), "uncaptured key (pid == 0) must be rejected");
+    Require(!atrium::SnapshotMatchesLiveIdentity(captured, {w1, 0, ft1, 1}), "invalid live key (pid == 0) must be rejected");
+    Require(!atrium::SnapshotMatchesLiveIdentity(captured, {w1, 4243, ft1, 1}), "recycled HWND with different PID must be rejected");
+    Require(!atrium::SnapshotMatchesLiveIdentity(captured, {w1, 4242, ft2, 1}), "recycled HWND with same PID and different creationTime must be rejected");
+    Require(!atrium::SnapshotMatchesLiveIdentity(captured, {w2, 4242, ft1, 1}), "mismatched non-null HWND must be rejected");
+}
+
+void TestHardwareFlightLaunchFallback()
+{
+    const HWND w1 = FakeHwnd(0x6001);
+
+    // 1. Overlay creation failure invokes callback immediately once, releases transitions, and does not touch timer or state machine.
+    {
+        int cbCalls = 0;
+        int releaseCalls = 0;
+        int timerCalls = 0;
+        int logCalls = 0;
+        std::function<void()> cb = [&] { ++cbCalls; };
+        const bool ok = atrium::PrepareHardwareFlightLaunch(
+            cb, [] { return false; },
+            [&] {
+                ++timerCalls;
+                return true;
+            },
+            [&] { ++releaseCalls; }, [&](const wchar_t*) { ++logCalls; });
+        Require(!ok && cbCalls == 1 && releaseCalls == 1 && timerCalls == 0 && logCalls == 1,
+                "failed overlay creation must invoke callback once, release transitions, and skip timer");
+        Require(!cb, "failed launch must consume callback so it cannot run twice");
+    }
+
+    // 2. State timer setup failure invokes callback immediately once and releases transitions.
+    {
+        int cbCalls = 0;
+        int releaseCalls = 0;
+        int logCalls = 0;
+        std::function<void()> cb = [&] { ++cbCalls; };
+        const bool ok =
+            atrium::PrepareHardwareFlightLaunch(cb, [] { return true; }, [] { return false; }, [&] { ++releaseCalls; }, [&](const wchar_t*) { ++logCalls; });
+        Require(!ok && cbCalls == 1 && releaseCalls == 1 && logCalls == 1, "failed SetTimer must invoke callback once and release transitions");
+        Require(!cb, "failed timer setup must consume callback so it cannot run twice");
+    }
+
+    // 3. Successful resource setup preserves callback for state machine ownership without calling it prematurely.
+    {
+        int cbCalls = 0;
+        int releaseCalls = 0;
+        int logCalls = 0;
+        std::function<void()> cb = [&] { ++cbCalls; };
+        const bool ok =
+            atrium::PrepareHardwareFlightLaunch(cb, [] { return true; }, [] { return true; }, [&] { ++releaseCalls; }, [&](const wchar_t*) { ++logCalls; });
+        Require(ok && cbCalls == 0 && releaseCalls == 0 && logCalls == 0 && static_cast<bool>(cb),
+                "successful launch setup must preserve callback for state machine");
+
+        atrium::GenieFlightStateMachine sm;
+        const uint64_t id = sm.BeginMinimize(w1, 100.0, std::move(cb), true);
+        sm.NotifyCoverPresented(id, 116.0);
+        for (const auto& fn : sm.Tick(116.0))
+            fn();
+        Require(cbCalls == 1, "preserved callback runs strictly once via state machine");
+    }
+
+    // 4. Null callback on failure releases cleanly without crashing.
+    {
+        int releaseCalls = 0;
+        std::function<void()> emptyCb;
+        const bool ok = atrium::PrepareHardwareFlightLaunch(emptyCb, [] { return false; }, [] { return true; }, [&] { ++releaseCalls; }, [](const wchar_t*) {});
+        Require(!ok && releaseCalls == 1, "null callback on failed setup must still release transitions cleanly");
+    }
+}
+
+void TestCoverReadyNotifyInvariants()
+{
+    const HWND w1 = FakeHwnd(0x7001);
+    atrium::GenieFlightStateMachine sm;
+    int minCalls = 0;
+    const uint64_t id = sm.BeginMinimize(w1, 100.0, [&] { ++minCalls; }, true);
+
+    std::unordered_set<uint64_t> reportedFirstFrames;
+    std::unordered_set<uint64_t> reportedPourDone;
+
+    // Texture upload / draw skipped: must NOT emit CoverReady so window is not minimized over a blank frame.
+    const atrium::GeniePresentedFlags failedDraw = atrium::EvaluateGenieFlightNotify(id, false, false, reportedFirstFrames, reportedPourDone);
+    Require(!failedDraw.notify && !failedDraw.firstFrame && !reportedFirstFrames.contains(id), "undrawn flight must not emit first-frame CoverReady");
+    Require(sm.Tick(120.0).empty() && minCalls == 0, "CoverWait holds until real draw or 50ms CoverTimeout");
+
+    // 50ms CoverTimeout still releases minimize if draw never succeeds.
+    for (const auto& fn : sm.Tick(150.0))
+        fn();
+    Require(minCalls == 1, "failed-draw flight falls back to 50ms CoverTimeout cleanly");
+
+    // Subsequent successful draw emits first-frame notification once and deduplicates later frames.
+    const atrium::GeniePresentedFlags firstDraw = atrium::EvaluateGenieFlightNotify(id, true, false, reportedFirstFrames, reportedPourDone);
+    Require(firstDraw.notify && firstDraw.firstFrame && !firstDraw.pourDone, "first actual draw emits CoverReady once");
+    const atrium::GeniePresentedFlags secondDraw = atrium::EvaluateGenieFlightNotify(id, true, false, reportedFirstFrames, reportedPourDone);
+    Require(!secondDraw.notify && !secondDraw.firstFrame, "duplicate draw must not re-emit first-frame notification");
+
+    // Pour-finished notification fires even if final frame skipped drawing, and deduplicates afterwards.
+    const uint64_t restoreId = 99;
+    const atrium::GeniePresentedFlags pourDone = atrium::EvaluateGenieFlightNotify(restoreId, false, true, reportedFirstFrames, reportedPourDone);
+    Require(pourDone.notify && !pourDone.firstFrame && pourDone.pourDone, "pourFinished notifies restore completion");
+    const atrium::GeniePresentedFlags pourDoneDup = atrium::EvaluateGenieFlightNotify(restoreId, false, true, reportedFirstFrames, reportedPourDone);
+    Require(!pourDoneDup.notify && !pourDoneDup.pourDone, "duplicate pourFinished must not re-notify");
+}
+
 } // namespace
 
 int main()
@@ -424,6 +552,9 @@ int main()
     TestWindowPictureCache();
     TestGenieFlightStateMachine();
     TestGenieSceneEvaluation();
+    TestSnapshotMatchesLiveIdentity();
+    TestHardwareFlightLaunchFallback();
+    TestCoverReadyNotifyInvariants();
     if (g_failures > 0)
         return 1;
     std::printf("genie mesh: all checks passed\n");

@@ -55,6 +55,13 @@ struct WindowSnapshotKey {
 // Queries the owning process PID and creation time for `window` to guard against recycled HWND reuse.
 bool QueryWindowSnapshotKey(HWND window, uint64_t generation, WindowSnapshotKey& out);
 
+// Verifies a snapshot's request-time HWND identity still matches the live window before caching.
+inline bool SnapshotMatchesLiveIdentity(const WindowSnapshotKey& captured, const WindowSnapshotKey& live)
+{
+    return captured.pid != 0 && live.pid != 0 && captured.pid == live.pid && CompareFileTime(&captured.creationTime, &live.creationTime) == 0 &&
+           (!captured.window || !live.window || captured.window == live.window);
+}
+
 // Bounded-byte LRU cache of large window snapshots keyed by HWND, PID, and process creation time.
 class WindowPictureCache {
 public:
@@ -70,7 +77,7 @@ public:
 
     explicit WindowPictureCache(size_t maxBytes = kDefaultMaxBytes);
 
-    void Put(const WindowSnapshotKey& key, const RECT& frame, std::shared_ptr<const WindowPicture> picture);
+    bool Put(const WindowSnapshotKey& key, const RECT& frame, std::shared_ptr<const WindowPicture> picture);
     const Entry* Find(HWND window, DWORD pid, FILETIME creationTime, uint64_t minGeneration = 0);
     bool Touch(HWND window, DWORD pid, FILETIME creationTime);
     bool Erase(HWND window);
@@ -106,18 +113,20 @@ public:
     void SignalStop();
     bool WaitStop(DWORD timeoutMs) const;
     struct Result {
-        HWND window;
+        HWND window = nullptr;
         WindowPicture picture;
         WindowPicture large; // ok only if asked for and taken
         unsigned shrinkGen = 0;
+        WindowSnapshotKey key{};
     };
     std::vector<Result> Take();
 
 private:
     struct Job {
-        HWND window;
-        int maxWidth, maxHeight, largeMax;
-        float radius;
+        HWND window = nullptr;
+        int maxWidth = 0, maxHeight = 0, largeMax = 0;
+        float radius = 0.0f;
+        WindowSnapshotKey key{};
     };
     struct ShrinkJob {
         HWND window = nullptr;

@@ -365,8 +365,9 @@ void GenieRenderer::BindFramePipeline(int width, int height)
     ctx->PSSetConstantBuffers(0, 1, &cb);
 }
 
-bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, bool& deviceLost)
+bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, bool& drewFlight, bool& deviceLost)
 {
+    drewFlight = false;
     deviceLost = false;
     if (!f.image || f.image->Empty() || ev.opacity <= 0.002f)
         return true;
@@ -420,6 +421,7 @@ bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& 
     ctx->IASetIndexBuffer(ib_.get(), DXGI_FORMAT_R16_UINT, 0);
     ctx->PSSetShaderResources(0, 1, &srv);
     ctx->DrawIndexed(static_cast<UINT>(mesh.indices.size()), 0, 0);
+    drewFlight = true;
     return true;
 }
 
@@ -458,11 +460,14 @@ GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scen
     if (!EnsureSurface(scene.overlayHwnd, width, height, surfaceLost))
         return {surfaceLost ? RenderStatus::DeviceLost : RenderStatus::Ok, false};
 
+    std::vector<bool> drewFlights(scene.flights.size(), false);
     BindFramePipeline(width, height);
     for (size_t i = 0; i < scene.flights.size(); ++i) {
+        bool drew = false;
         bool deviceLost = false;
-        if (!DrawFlight(scene.flights[i], evals[i], scene.overlayBounds, deviceLost))
+        if (!DrawFlight(scene.flights[i], evals[i], scene.overlayBounds, drew, deviceLost))
             return {deviceLost ? RenderStatus::DeviceLost : RenderStatus::Ok, false};
+        drewFlights[i] = drew;
     }
 
     auto* ctx = gpu_.context.get();
@@ -489,10 +494,9 @@ GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scen
     for (size_t i = 0; i < scene.flights.size(); ++i) {
         const GenieFlightDraw& f = scene.flights[i];
         const GenieFlightEval& ev = evals[i];
-        const bool firstFrame = reportedFirstFrames_.insert(f.flightId).second;
-        const bool pourDone = ev.pourFinished && reportedPourDone_.insert(f.flightId).second;
-        if ((firstFrame || pourDone) && onFramePresented)
-            onFramePresented(f.flightId, nowMs, pourDone);
+        const GeniePresentedFlags flags = EvaluateGenieFlightNotify(f.flightId, drewFlights[i], ev.pourFinished, reportedFirstFrames_, reportedPourDone_);
+        if (flags.notify && onFramePresented)
+            onFramePresented(f.flightId, nowMs, flags.pourDone);
     }
 
     return {RenderStatus::Ok, anyAnimating};

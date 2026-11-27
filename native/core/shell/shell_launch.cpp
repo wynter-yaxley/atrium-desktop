@@ -428,9 +428,30 @@ LaunchResult WaitForLaunch(const std::shared_ptr<LaunchWaitState>& state, DWORD 
     return LaunchResult{LaunchOutcome::TimedOutOrUnknown, WAIT_TIMEOUT, nullptr};
 }
 
+LaunchRoute ResolveRuntimeLaunchRoute(const LaunchRequest& request, PrivilegeMode& modeOut)
+{
+    const bool selfElevated = IsElevatedProcess();
+    modeOut = CurrentPrivilegeMode();
+    if (selfElevated && modeOut == PrivilegeMode::Unknown &&
+        (request.privilege == LaunchPrivilege::ShellDefault || request.privilege == LaunchPrivilege::RequireMedium) && !IsRunAsVerb(request.verb)) {
+        const winrt::handle retryTimer{CreateWaitableTimerW(nullptr, TRUE, nullptr)};
+        for (int attempt = 0; attempt < 2 && modeOut == PrivilegeMode::Unknown; ++attempt) {
+            if (retryTimer) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -100LL * 10000LL; // 100 ms relative
+                if (SetWaitableTimer(retryTimer.get(), &due, 0, nullptr, nullptr, FALSE))
+                    WaitForSingleObject(retryTimer.get(), 100);
+            }
+            (void)ResolveShellProcessIdentity();
+            modeOut = CurrentPrivilegeMode();
+        }
+    }
+    return ResolveLaunchRoute(modeOut, request.privilege, request.kind, request.verb, selfElevated);
+}
+
 } // namespace
 
-LaunchRoute ResolveLaunchRoute(PrivilegeMode mode, LaunchPrivilege privilege, LaunchTargetKind /*kind*/, const std::wstring& verb)
+LaunchRoute ResolveLaunchRoute(PrivilegeMode mode, LaunchPrivilege privilege, LaunchTargetKind /*kind*/, const std::wstring& verb, bool selfElevated)
 {
     if (privilege == LaunchPrivilege::RequestElevation || IsRunAsVerb(verb))
         return LaunchRoute::DirectRunAs;
@@ -443,9 +464,13 @@ LaunchRoute ResolveLaunchRoute(PrivilegeMode mode, LaunchPrivilege privilege, La
     case PrivilegeMode::Standard: return LaunchRoute::DirectCurrentToken;
     case PrivilegeMode::ElevatedUnified:
     case PrivilegeMode::CrossAccountElevated:
-    case PrivilegeMode::Unknown:
-        // Never delegate when Explorer is elevated, cross-account, or unknown; fail closed when Medium is required.
+        // Never delegate when Explorer is elevated or cross-account; fail closed when Medium is required.
         return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;
+    case PrivilegeMode::Unknown:
+        // When elevated and shell identity is unknown, fail closed for both ShellDefault and RequireMedium.
+        if (selfElevated && (privilege == LaunchPrivilege::ShellDefault || privilege == LaunchPrivilege::RequireMedium))
+            return LaunchRoute::BlockedMismatch;
+        return LaunchRoute::DirectCurrentToken;
     }
     return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;
 }
@@ -459,10 +484,12 @@ LaunchResult ShellLaunch(const LaunchRequest& request, DWORD timeoutMs)
     if (request.target.empty())
         return LaunchResult{LaunchOutcome::Failed, ERROR_INVALID_PARAMETER, nullptr};
 
-    const LaunchRoute route = ResolveLaunchRoute(CurrentPrivilegeMode(), request.privilege, request.kind, request.verb);
+    PrivilegeMode mode = PrivilegeMode::Unknown;
+    const LaunchRoute route = ResolveRuntimeLaunchRoute(request, mode);
     if (route == LaunchRoute::BlockedMismatch) {
-        Log(L"launch: blocked medium-only launch of '%s' under current privilege mode", request.target.c_str());
-        return LaunchResult{LaunchOutcome::Failed, ERROR_ACCESS_DENIED, nullptr};
+        const DWORD err = mode == PrivilegeMode::Unknown ? ERROR_ELEVATION_REQUIRED : ERROR_ACCESS_DENIED;
+        Log(L"launch: blocked medium-only launch of '%s' under privilege mode %s (err=%lu)", request.target.c_str(), PrivilegeModeWireName(mode), err);
+        return LaunchResult{LaunchOutcome::Failed, err, nullptr};
     }
 
     auto state = std::make_shared<LaunchWaitState>();
@@ -485,9 +512,10 @@ void ShellLaunchAsync(LaunchRequest request)
     if (request.target.empty())
         return;
 
-    const LaunchRoute route = ResolveLaunchRoute(CurrentPrivilegeMode(), request.privilege, request.kind, request.verb);
+    PrivilegeMode mode = PrivilegeMode::Unknown;
+    const LaunchRoute route = ResolveRuntimeLaunchRoute(request, mode);
     if (route == LaunchRoute::BlockedMismatch) {
-        Log(L"launch: blocked medium-only async launch of '%s' under current privilege mode", request.target.c_str());
+        Log(L"launch: blocked medium-only async launch of '%s' under privilege mode %s", request.target.c_str(), PrivilegeModeWireName(mode));
         return;
     }
 

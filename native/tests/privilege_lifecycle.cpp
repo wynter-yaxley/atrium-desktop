@@ -4,6 +4,7 @@
 #include "settings.h"
 #include "settings_server.h"
 #include "shell/process_integrity.h"
+#include "win32_path.h"
 
 #include <windows.h>
 #include <aclapi.h>
@@ -242,11 +243,33 @@ void CheckPipeAndMutexAcls()
                                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 4096, 4096, 0, pipeSec.Get());
     Check(hijacker.handle == INVALID_HANDLE_VALUE, "second CreateNamedPipeW(FILE_FLAG_FIRST_PIPE_INSTANCE) is rejected");
 
-    HandleCloser unprivilegedServer;
-    unprivilegedServer.handle =
-        CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 2, 4096, 4096, 0, pipeSec.Get());
-    Check(unprivilegedServer.handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED,
-          "second CreateNamedPipeW without FILE_CREATE_PIPE_INSTANCE is denied");
+    const std::wstring negMultiPipe = pipeName + L".NegMulti";
+    constexpr DWORD kMultiOpenMode = PIPE_ACCESS_DUPLEX;
+    constexpr DWORD kMultiPipeMode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    HandleCloser negFirst;
+    negFirst.handle = CreateNamedPipeW(negMultiPipe.c_str(), kMultiOpenMode, kMultiPipeMode, 2, 4096, 4096, 0, pipeSec.Get());
+    Check(negFirst.handle != INVALID_HANDLE_VALUE, "first multi-instance CreateNamedPipeW with tightened ACL succeeds");
+    HandleCloser negSecond;
+    negSecond.handle = CreateNamedPipeW(negMultiPipe.c_str(), kMultiOpenMode, kMultiPipeMode, 2, 4096, 4096, 0, pipeSec.Get());
+    Check(negSecond.handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED,
+          "second identical CreateNamedPipeW(nMaxInstances=2) without FILE_CREATE_PIPE_INSTANCE is denied");
+
+    const auto& selfCtx = SelfSecurityContext();
+    std::wstring allowCreateSddl = L"D:P(A;;0x0012019F;;;" + selfCtx.userSid + L")";
+    if (selfCtx.integrityRid >= SECURITY_MANDATORY_MEDIUM_RID)
+        allowCreateSddl += L"S:(ML;;NW;;;ME)";
+    KernelObjectSecurity allowCreateSec = KernelObjectSecurity::FromSddl(allowCreateSddl);
+    Check(allowCreateSec.Valid(), "FromSddl with FILE_CREATE_PIPE_INSTANCE (0x0012019F) succeeds");
+    if (allowCreateSec.Valid()) {
+        const std::wstring posMultiPipe = pipeName + L".PosMulti";
+        HandleCloser posFirst;
+        posFirst.handle = CreateNamedPipeW(posMultiPipe.c_str(), kMultiOpenMode, kMultiPipeMode, 2, 4096, 4096, 0, allowCreateSec.Get());
+        Check(posFirst.handle != INVALID_HANDLE_VALUE, "first multi-instance CreateNamedPipeW with FILE_CREATE_PIPE_INSTANCE succeeds");
+        HandleCloser posSecond;
+        posSecond.handle = CreateNamedPipeW(posMultiPipe.c_str(), kMultiOpenMode, kMultiPipeMode, 2, 4096, 4096, 0, allowCreateSec.Get());
+        Check(posSecond.handle != INVALID_HANDLE_VALUE,
+              "second identical CreateNamedPipeW(nMaxInstances=2) with FILE_CREATE_PIPE_INSTANCE (0x0012019F) succeeds");
+    }
 
     std::thread serverThread([srv = server.handle] {
         if (ConnectNamedPipe(srv, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
@@ -274,7 +297,11 @@ void CheckPipeAndMutexAcls()
               "duplex client reads from hardened pipe");
     }
     serverThread.join();
+}
 
+void CheckMutexAcl()
+{
+    using namespace atrium;
     KernelObjectSecurity mutexSec = KernelObjectSecurity::CreateSameUserMutex();
     Check(mutexSec.Valid() && mutexSec.Get() != nullptr, "CreateSameUserMutex succeeds");
     const std::wstring mutexName = L"Local\\Atrium.MutexAclTest." + std::to_wstring(GetCurrentProcessId());
@@ -333,6 +360,7 @@ void CheckLifecycleAndSettingsServers()
     std::wstring openedPage;
     std::atomic<int> quitCount{0};
     std::atomic<int> restartCount{0};
+    std::atomic<int> notifyUpdateCount{0};
 
     LifecycleServer lifecycleServer(nullptr, lifecyclePipe,
                                     LifecycleCallbacks{
@@ -343,39 +371,155 @@ void CheckLifecycleAndSettingsServers()
                                                 restartCount.fetch_add(1);
                                                 return true;
                                             },
+                                        .onNotifyUpdateReady = [&] { notifyUpdateCount.fetch_add(1); },
                                         .privilegeModeProvider = [&] { return simulatedMode.load(); },
                                     });
     Check(WaitReady(lifecycleServer), "LifecycleServer becomes ready");
 
+    const std::wstring selfExe = ModulePath();
+    const DWORD selfPid = GetCurrentProcessId();
+
     LifecycleReply pingReply;
-    Check(SendLifecycleCommand(L"ping", {}, &pingReply, lifecyclePipe) && pingReply.ok && pingReply.pong && pingReply.pid == GetCurrentProcessId() &&
+    Check(SendLifecycleCommand(L"ping", {}, &pingReply, lifecyclePipe, 2000, selfPid, selfExe) && pingReply.ok && pingReply.pong && pingReply.pid == selfPid &&
               pingReply.privilegeMode == L"standard" && !pingReply.canDeElevate,
-          "LifecycleServer ping succeeds while SettingsServer client is open");
+          "LifecycleServer ping succeeds with SQOS + server identity verification while SettingsServer client is open");
+
+    LifecycleReply exeOnlyReply;
+    Check(SendLifecycleCommand(L"ping", {}, &exeOnlyReply, lifecyclePipe, 2000, 0, selfExe) && exeOnlyReply.ok && exeOnlyReply.pong,
+          "LifecycleServer ping succeeds when verifying expectedExePath without explicit PID");
+
+    LifecycleReply badPidReply;
+    Check(!SendLifecycleCommand(L"ping", {}, &badPidReply, lifecyclePipe, 500, selfPid + 1, selfExe),
+          "SendLifecycleCommand rejects mismatched expectedPid before sending request");
+
+    LifecycleReply badExeReply;
+    Check(!SendLifecycleCommand(L"ping", {}, &badExeReply, lifecyclePipe, 500, 0, L"C:\\invalid\\NotAtrium.exe"),
+          "SendLifecycleCommand rejects mismatched expectedExePath before sending request");
+
+    LifecycleReply defaultExeReply;
+    Check(!SendLifecycleCommand(L"ping", {}, &defaultExeReply, lifecyclePipe, 500),
+          "SendLifecycleCommand rejects non-Atrium.exe server when expectedExePath defaults to Atrium.exe");
 
     LifecycleReply openReply;
-    Check(SendLifecycleCommand(L"open-settings", L"widgets", &openReply, lifecyclePipe) && openReply.ok && openReply.status == L"accepted" &&
-              openedPage == L"widgets",
+    Check(SendLifecycleCommand(L"open-settings", L"widgets", &openReply, lifecyclePipe, 2000, selfPid, selfExe) && openReply.ok &&
+              openReply.status == L"accepted" && openedPage == L"widgets",
           "LifecycleServer open-settings dispatches page");
 
+    LifecycleReply notifyReply;
+    Check(SendLifecycleCommand(L"notify-update-ready", {}, &notifyReply, lifecyclePipe, 2000, selfPid, selfExe) && notifyReply.ok &&
+              notifyReply.status == L"accepted" && notifyUpdateCount.load() == 1,
+          "LifecycleServer notify-update-ready dispatches callback");
+
     LifecycleReply denyRestart;
-    Check(SendLifecycleCommand(L"restart-standard", {}, &denyRestart, lifecyclePipe) && !denyRestart.ok && denyRestart.error == L"cannot_deelevate" &&
-              restartCount.load() == 0,
+    Check(SendLifecycleCommand(L"restart-standard", {}, &denyRestart, lifecyclePipe, 2000, selfPid, selfExe) && !denyRestart.ok &&
+              denyRestart.error == L"cannot_deelevate" && restartCount.load() == 0,
           "LifecycleServer rejects restart-standard when not ElevatedSplit");
 
     simulatedMode.store(PrivilegeMode::ElevatedSplit);
     LifecycleReply splitPing;
-    Check(SendLifecycleCommand(L"ping", {}, &splitPing, lifecyclePipe) && splitPing.ok && splitPing.privilegeMode == L"elevated_split" &&
-              splitPing.canDeElevate,
+    Check(SendLifecycleCommand(L"ping", {}, &splitPing, lifecyclePipe, 2000, selfPid, selfExe) && splitPing.ok &&
+              splitPing.privilegeMode == L"elevated_split" && splitPing.canDeElevate,
           "LifecycleServer ping reflects ElevatedSplit canDeElevate=true");
 
     LifecycleReply allowRestart;
-    Check(SendLifecycleCommand(L"restart-standard", {}, &allowRestart, lifecyclePipe) && allowRestart.ok && allowRestart.status == L"accepted" &&
-              restartCount.load() == 1 && quitCount.load() == 1,
+    Check(SendLifecycleCommand(L"restart-standard", {}, &allowRestart, lifecyclePipe, 2000, selfPid, selfExe) && allowRestart.ok &&
+              allowRestart.status == L"accepted" && restartCount.load() == 1 && quitCount.load() == 1,
           "LifecycleServer allows restart-standard in ElevatedSplit and signals quit");
 
     LifecycleReply quitReply;
-    Check(SendLifecycleCommand(L"quit", {}, &quitReply, lifecyclePipe) && quitReply.ok && quitReply.status == L"accepted" && quitCount.load() == 2,
+    Check(SendLifecycleCommand(L"quit", {}, &quitReply, lifecyclePipe, 2000, selfPid, selfExe) && quitReply.ok && quitReply.status == L"accepted" &&
+              quitCount.load() == 2,
           "LifecycleServer quit replies accepted immediately while SettingsServer client remains open");
+}
+
+void CheckLifecyclePausedAndStalledCases()
+{
+    using namespace atrium;
+    const std::wstring selfExe = ModulePath();
+    const DWORD selfPid = GetCurrentProcessId();
+
+    // P1-4: paused client that writes ping and never reads reply must not stall LifecycleServer teardown.
+    {
+        const std::wstring pausedPipe = L"\\\\.\\pipe\\Atrium.Lifecycle.PausedTest." + std::to_wstring(selfPid) + L"." + std::to_wstring(GetTickCount64());
+        auto pausedServer = std::make_unique<LifecycleServer>(nullptr, pausedPipe);
+        Check(WaitReady(*pausedServer), "Paused-client LifecycleServer becomes ready");
+        HandleCloser pausedClient;
+        pausedClient.handle = ConnectMessagePipe(pausedPipe);
+        Check(pausedClient.handle != INVALID_HANDLE_VALUE, "Paused client connects to LifecycleServer");
+        if (pausedClient.handle != INVALID_HANDLE_VALUE) {
+            const char pingPayload[] = R"({"cmd":"ping"})";
+            DWORD written = 0;
+            Check(WriteFile(pausedClient.handle, pingPayload, DWORD(sizeof(pingPayload) - 1), &written, nullptr) != FALSE,
+                  "Paused client writes ping without reading reply");
+            HandleCloser pauseTimer;
+            pauseTimer.handle = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+            if (pauseTimer.handle) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -30LL * 10000LL; // 30 ms relative
+                if (SetWaitableTimer(pauseTimer.handle, &due, 0, nullptr, nullptr, FALSE))
+                    WaitForSingleObject(pauseTimer.handle, 30);
+            }
+        }
+        const ULONGLONG stopStart = GetTickCount64();
+        pausedServer.reset();
+        const ULONGLONG stopElapsed = GetTickCount64() - stopStart;
+        Check(stopElapsed < 500, "LifecycleServer teardown completes in < 500ms even with paused unread client");
+    }
+
+    // P1-5: stalled mock pipe server must be aborted inside bounded overlapped timeoutMs.
+    KernelObjectSecurity pipeSec = KernelObjectSecurity::CreateSameUserPipe();
+    Check(pipeSec.Valid(), "CreateSameUserPipe succeeds for stalled mock server");
+    if (!pipeSec.Valid())
+        return;
+    const std::wstring stalledPipe = L"\\\\.\\pipe\\Atrium.Lifecycle.StalledTest." + std::to_wstring(selfPid) + L"." + std::to_wstring(GetTickCount64());
+    HandleCloser mockSrv;
+    mockSrv.handle = CreateNamedPipeW(stalledPipe.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096, 0, pipeSec.Get());
+    Check(mockSrv.handle != INVALID_HANDLE_VALUE, "Stalled mock pipe created");
+    HandleCloser stopEvent;
+    stopEvent.handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (mockSrv.handle == INVALID_HANDLE_VALUE || !stopEvent.handle)
+        return;
+    std::thread mockThread([srv = mockSrv.handle, stop = stopEvent.handle] {
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent)
+            return;
+        bool connected = ConnectNamedPipe(srv, &ov) != FALSE;
+        if (!connected && GetLastError() == ERROR_PIPE_CONNECTED)
+            connected = true;
+        else if (!connected && GetLastError() == ERROR_IO_PENDING) {
+            HANDLE hs[] = {ov.hEvent, stop};
+            DWORD unused = 0;
+            if (WaitForMultipleObjects(2, hs, FALSE, 2000) == WAIT_OBJECT_0)
+                connected = GetOverlappedResult(srv, &ov, &unused, FALSE) != FALSE;
+            else
+                CancelIoEx(srv, &ov);
+        }
+        if (connected) {
+            ResetEvent(ov.hEvent);
+            char buf[256]{};
+            DWORD read = 0;
+            if (!ReadFile(srv, buf, sizeof(buf), &read, &ov) && GetLastError() == ERROR_IO_PENDING) {
+                HANDLE hs[] = {ov.hEvent, stop};
+                if (WaitForMultipleObjects(2, hs, FALSE, 2000) != WAIT_OBJECT_0)
+                    CancelIoEx(srv, &ov);
+            }
+            // Intentionally stall without writing a reply until test signals stop.
+            WaitForSingleObject(stop, 2000);
+            DisconnectNamedPipe(srv);
+        }
+        CloseHandle(ov.hEvent);
+    });
+
+    const ULONGLONG reqStart = GetTickCount64();
+    LifecycleReply stalledReply;
+    const bool sent = SendLifecycleCommand(L"ping", {}, &stalledReply, stalledPipe, 150, selfPid, selfExe);
+    const ULONGLONG reqElapsed = GetTickCount64() - reqStart;
+    Check(!sent && reqElapsed < 400, "SendLifecycleCommand aborts stalled mock pipe server within < 400ms");
+
+    SetEvent(stopEvent.handle);
+    mockThread.join();
 }
 
 void CheckGuardInstanceGeneration()
@@ -385,15 +529,20 @@ void CheckGuardInstanceGeneration()
     const std::wstring genPath = (temp.path / L"instance.gen").wstring();
 
     Check(ReadInstanceGeneration(genPath) == 0, "missing generation file reads as 0");
-    const uint64_t g1 = AdvanceInstanceGeneration(genPath);
-    Check(g1 == 1 && ReadInstanceGeneration(genPath) == 1, "first AdvanceInstanceGeneration writes 1");
-    const uint64_t g2 = AdvanceInstanceGeneration(genPath);
-    Check(g2 == 2 && ReadInstanceGeneration(genPath) == 2, "second AdvanceInstanceGeneration writes 2");
+    const std::optional<uint64_t> g1 = AdvanceInstanceGeneration(genPath);
+    Check(g1.has_value() && *g1 == 1 && ReadInstanceGeneration(genPath) == 1 && ActiveInstanceGeneration() == 1, "first AdvanceInstanceGeneration writes 1");
+    const std::optional<uint64_t> g2 = AdvanceInstanceGeneration(genPath);
+    Check(g2.has_value() && *g2 == 2 && ReadInstanceGeneration(genPath) == 2 && ActiveInstanceGeneration() == 2, "second AdvanceInstanceGeneration writes 2");
 
-    Check(ShouldGuardUndoLeftover(g2, ReadInstanceGeneration(genPath)), "matching generation allows guard undo");
-    Check(!ShouldGuardUndoLeftover(g1, ReadInstanceGeneration(genPath)), "stale generation skips guard undo");
+    // Persisting to a directory path fails cleanly and leaves ActiveInstanceGeneration unchanged.
+    const std::optional<uint64_t> failed = AdvanceInstanceGeneration(temp.path.wstring());
+    Check(!failed.has_value() && ActiveInstanceGeneration() == 2 && ReadInstanceGeneration(genPath) == 2,
+          "AdvanceInstanceGeneration fails cleanly without advancing in-memory generation on disk failure");
+
+    Check(ShouldGuardUndoLeftover(*g2, ReadInstanceGeneration(genPath)), "matching generation allows guard undo");
+    Check(!ShouldGuardUndoLeftover(*g1, ReadInstanceGeneration(genPath)), "stale generation skips guard undo");
     Check(ShouldGuardUndoLeftover(0, ReadInstanceGeneration(genPath)), "legacy zero generation allows guard undo");
-    Check(ShouldGuardUndoLeftover(g2, 0), "missing active generation allows guard undo");
+    Check(ShouldGuardUndoLeftover(*g2, 0), "missing active generation allows guard undo");
 }
 
 void CheckDesktopAgentLaunchArgs()
@@ -476,7 +625,9 @@ int main()
     winrt::init_apartment();
     CheckIntegrityAndPrivilegeClassification();
     CheckPipeAndMutexAcls();
+    CheckMutexAcl();
     CheckLifecycleAndSettingsServers();
+    CheckLifecyclePausedAndStalledCases();
     CheckGuardInstanceGeneration();
     CheckDesktopAgentLaunchArgs();
     CheckGuardAgentPidFile();

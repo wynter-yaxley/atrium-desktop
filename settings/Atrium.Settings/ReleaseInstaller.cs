@@ -1,7 +1,10 @@
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 
 namespace Atrium.Settings;
@@ -263,14 +266,52 @@ internal static class ReleaseInstaller
         NotifyReady();
     }
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint processId);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindow(string cls, string? title);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint process);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint message, UIntPtr wp, IntPtr lp);
+
+    [SupportedOSPlatform("windows")]
+    internal static bool TryNotifyReadyViaPipe(string pipeName, string expectedCoreExe, int timeoutMs = 1000)
+    {
+        try
+        {
+            using var pipe = new NamedPipeClientStream(
+                ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification);
+            pipe.Connect(timeoutMs);
+            if (OperatingSystem.IsWindows())
+                pipe.ReadMode = PipeTransmissionMode.Message;
+            if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out uint serverPid) || serverPid == 0)
+                return false;
+            if (!string.Equals(CoreClient.TryGetProcessPath((int)serverPid), expectedCoreExe, StringComparison.OrdinalIgnoreCase))
+                return false;
+            byte[] payload = Encoding.UTF8.GetBytes("""{"cmd":"notify-update-ready"}""");
+            using var cts = new CancellationTokenSource(timeoutMs);
+            pipe.WriteAsync(payload, 0, payload.Length, cts.Token).GetAwaiter().GetResult();
+            pipe.FlushAsync(cts.Token).GetAwaiter().GetResult();
+            byte[] reply = new byte[1024];
+            int read = pipe.ReadAsync(reply, 0, reply.Length, cts.Token).GetAwaiter().GetResult();
+            return read > 0;
+        }
+        catch (Exception e) when (e is TimeoutException or IOException or UnauthorizedAccessException
+            or OperationCanceledException or PlatformNotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
     private static void NotifyReady()
     {
+        string? corePath = CoreClient.CoreExe();
+        if (string.IsNullOrEmpty(corePath)) return;
+        string lifecyclePipe = "Atrium.Lifecycle." + Process.GetCurrentProcess().SessionId;
+        if (TryNotifyReadyViaPipe(lifecyclePipe, corePath)) return;
         IntPtr host = FindWindow("AtriumCoreHost", null);
         if (host == IntPtr.Zero || GetWindowThreadProcessId(host, out uint pid) == 0) return;
-        if (string.Equals(CoreClient.TryGetProcessPath((int)pid), CoreClient.CoreExe(), StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(CoreClient.TryGetProcessPath((int)pid), corePath, StringComparison.OrdinalIgnoreCase))
             PostMessage(host, 0x8000 + 11, UIntPtr.Zero, IntPtr.Zero);
     }
 

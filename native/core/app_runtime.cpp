@@ -195,7 +195,7 @@ void InitializeDesktopAgent()
             g_app.tray->NotifyRemoteChanged(true);
     };
     cb.onDragOver = [](POINT pt) -> AgentDragOverResult {
-        if (g_app.desktopAgentStopping.load() || !g_app.displaysReady)
+        if (g_app.desktopAgentStopping.load())
             return {};
         HWND host = g_app.host;
         if (!host)
@@ -524,6 +524,11 @@ void InitializeSubsystems(HINSTANCE instance, Settings& settings)
                                                                         PostMessageW(g_app.host, WM_CLOSE, 0, 0);
                                                                 },
                                                             .onRestartStandard = [] { return g_app.onRestartStandard ? g_app.onRestartStandard() : false; },
+                                                            .onNotifyUpdateReady =
+                                                                [host = g_app.host] {
+                                                                    if (host)
+                                                                        PostMessageW(host, WM_UPDATE_READY, 0, 0);
+                                                                },
                                                         });
     BindStartMenuCallbacks(settings);
 }

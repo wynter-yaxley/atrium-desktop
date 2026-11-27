@@ -5,10 +5,15 @@
 #include "shell/tray_host.h"
 
 #include <windows.h>
+#include <unknwn.h>
+#include <winrt/base.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace atrium {
@@ -66,6 +71,7 @@ enum class AgentCommandType { Ping, SetTrayHosting, SetTrayPlaces, TraySend, Tra
 
 struct AgentCommandMessage {
     AgentCommandType type = AgentCommandType::Ping;
+    uint64_t opId = 0;
     bool hosting = false;
     RECT anchor{};
     std::wstring key;
@@ -88,6 +94,7 @@ enum class AgentEventType { TraySnapshot, TrayYield, DragOver, DragLeave, Drop }
 
 struct AgentEventMessage {
     AgentEventType type = AgentEventType::TraySnapshot;
+    uint64_t opId = 0;
     AgentTraySnapshot snapshot;
     bool yielded = false;
     TrayHostYieldReason yieldReason = TrayHostYieldReason::None;
@@ -180,8 +187,93 @@ struct DesktopAgentSupervisorPolicy {
     }
 };
 
+struct AgentPeerIdentity {
+    DWORD pid = 0;
+    FILETIME creationTime{};
+    std::wstring imagePath;
+    ProcessSecurityContext security;
+    bool valid = false;
+};
+
+class RecentOpTracker {
+public:
+    static constexpr size_t kMaxSeenOps = 64;
+
+    bool MarkSeenIfNew(uint64_t opId)
+    {
+        if (opId == 0)
+            return true;
+        if (seen_.contains(opId))
+            return false;
+        if (order_.size() >= kMaxSeenOps) {
+            seen_.erase(order_.front());
+            order_.pop_front();
+        }
+        order_.push_back(opId);
+        seen_.insert(opId);
+        return true;
+    }
+
+    void Clear()
+    {
+        order_.clear();
+        seen_.clear();
+    }
+
+private:
+    std::deque<uint64_t> order_;
+    std::unordered_set<uint64_t> seen_;
+};
+
+class TraySnapshotAckState {
+public:
+    void Reset()
+    {
+        confirmedSession_ = 0;
+        confirmedVersions_.clear();
+    }
+
+    bool IsConfirmed(uint64_t evtSession, uint64_t imageVersion)
+    {
+        if (confirmedSession_ != evtSession) {
+            confirmedSession_ = evtSession;
+            confirmedVersions_.clear();
+        }
+        return imageVersion != 0 && confirmedVersions_.contains(imageVersion);
+    }
+
+    void RecordAck(uint64_t evtSession, const AgentTraySnapshot& snapshot, bool ackOk)
+    {
+        if (!ackOk)
+            return;
+        if (confirmedSession_ != evtSession) {
+            confirmedSession_ = evtSession;
+            confirmedVersions_.clear();
+        }
+        std::unordered_set<uint64_t> next;
+        for (const auto& icon : snapshot.icons) {
+            if (icon.imageVersion != 0 && (!icon.pixels.empty() || confirmedVersions_.contains(icon.imageVersion)))
+                next.insert(icon.imageVersion);
+        }
+        confirmedVersions_ = std::move(next);
+    }
+
+    bool HasUnconfirmedWithEmptyPixels(uint64_t evtSession, const AgentTraySnapshot& snapshot)
+    {
+        return std::ranges::any_of(snapshot.icons, [&](const AgentTrayIconDto& icon) {
+            return icon.imageVersion != 0 && icon.pixels.empty() && !IsConfirmed(evtSession, icon.imageVersion);
+        });
+    }
+
+private:
+    uint64_t confirmedSession_ = 0;
+    std::unordered_set<uint64_t> confirmedVersions_;
+};
+
 HANDLE CreateSameUserNamedPipeServer(const std::wstring& pipeName, DWORD bufferSize = 64 * 1024);
 bool VerifyNamedPipeClientSameUser(HANDLE pipe);
+bool VerifyNamedPipePeerProcess(HANDLE pipe, bool isServerSide, const std::wstring& expectedImagePath, bool requireNonElevated, AgentPeerIdentity& out,
+                                winrt::handle* procOut = nullptr);
 bool ConnectNamedPipeOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent);
 bool ReadPipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeoutMs, std::string& messageOut, bool& disconnectedOut);
 inline bool ReadPipeMessageOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, std::string& messageOut, bool& disconnectedOut)

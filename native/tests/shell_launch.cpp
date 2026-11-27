@@ -16,7 +16,7 @@ bool Require(bool condition, const char* message)
     return false;
 }
 
-LaunchRoute ExpectedRoute(PrivilegeMode mode, LaunchPrivilege privilege, const std::wstring& verb)
+LaunchRoute ExpectedRoute(PrivilegeMode mode, LaunchPrivilege privilege, const std::wstring& verb, bool selfElevated)
 {
     if (privilege == LaunchPrivilege::RequestElevation || _wcsicmp(verb.c_str(), L"runas") == 0)
         return LaunchRoute::DirectRunAs;
@@ -27,7 +27,11 @@ LaunchRoute ExpectedRoute(PrivilegeMode mode, LaunchPrivilege privilege, const s
     case PrivilegeMode::Standard: return LaunchRoute::DirectCurrentToken;
     case PrivilegeMode::ElevatedUnified:
     case PrivilegeMode::CrossAccountElevated:
-    case PrivilegeMode::Unknown: return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;
+        return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;
+    case PrivilegeMode::Unknown:
+        if (selfElevated && (privilege == LaunchPrivilege::ShellDefault || privilege == LaunchPrivilege::RequireMedium))
+            return LaunchRoute::BlockedMismatch;
+        return LaunchRoute::DirectCurrentToken;
     }
     return LaunchRoute::BlockedMismatch;
 }
@@ -49,16 +53,18 @@ bool CheckExhaustiveRoutingMatrix()
     };
     const std::array<std::wstring, 5> verbs{L"", L"open", L"properties", L"runas", L"RunAs"};
 
-    for (PrivilegeMode mode : kModes) {
-        for (LaunchPrivilege priv : kPrivileges) {
-            for (LaunchTargetKind kind : kKinds) {
-                for (const std::wstring& verb : verbs) {
-                    const LaunchRoute actual = ResolveLaunchRoute(mode, priv, kind, verb);
-                    const LaunchRoute expected = ExpectedRoute(mode, priv, verb);
-                    if (actual != expected) {
-                        std::cerr << "Route mismatch: mode=" << int(mode) << " priv=" << int(priv) << " kind=" << int(kind) << " actual=" << int(actual)
-                                  << " expected=" << int(expected) << '\n';
-                        return false;
+    for (bool selfElevated : {false, true}) {
+        for (PrivilegeMode mode : kModes) {
+            for (LaunchPrivilege priv : kPrivileges) {
+                for (LaunchTargetKind kind : kKinds) {
+                    for (const std::wstring& verb : verbs) {
+                        const LaunchRoute actual = ResolveLaunchRoute(mode, priv, kind, verb, selfElevated);
+                        const LaunchRoute expected = ExpectedRoute(mode, priv, verb, selfElevated);
+                        if (actual != expected) {
+                            std::cerr << "Route mismatch: selfElevated=" << selfElevated << " mode=" << int(mode) << " priv=" << int(priv)
+                                      << " kind=" << int(kind) << " actual=" << int(actual) << " expected=" << int(expected) << '\n';
+                            return false;
+                        }
                     }
                 }
             }
@@ -69,25 +75,46 @@ bool CheckExhaustiveRoutingMatrix()
 
 bool CheckKeySecurityInvariants()
 {
-    return Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable) ==
+    return Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable, {}, true) ==
                        LaunchRoute::ExplorerComMedium,
                    "ElevatedSplit + ShellDefault routes through ExplorerComMedium") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::RequireMedium, LaunchTargetKind::AppUserModelId) ==
+           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::RequireMedium, LaunchTargetKind::AppUserModelId, {}, true) ==
                        LaunchRoute::ExplorerComMedium,
                    "ElevatedSplit + RequireMedium + AppUserModelId routes through ExplorerComMedium") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedUnified, LaunchPrivilege::RequireMedium, LaunchTargetKind::Executable) ==
+           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedUnified, LaunchPrivilege::RequireMedium, LaunchTargetKind::Executable, {}, true) ==
                        LaunchRoute::BlockedMismatch,
                    "ElevatedUnified + RequireMedium fails closed as BlockedMismatch") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::CrossAccountElevated, LaunchPrivilege::RequireMedium, LaunchTargetKind::Uri) ==
+           Require(ResolveLaunchRoute(PrivilegeMode::CrossAccountElevated, LaunchPrivilege::RequireMedium, LaunchTargetKind::Uri, {}, true) ==
                        LaunchRoute::BlockedMismatch,
                    "CrossAccountElevated + RequireMedium fails closed as BlockedMismatch") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::RequireMedium, LaunchTargetKind::Document) == LaunchRoute::BlockedMismatch,
-                   "Unknown + RequireMedium fails closed as BlockedMismatch") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::Standard, LaunchPrivilege::RequireMedium, LaunchTargetKind::Shortcut) == LaunchRoute::DirectCurrentToken,
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::RequireMedium, LaunchTargetKind::Document, {}, true) ==
+                       LaunchRoute::BlockedMismatch,
+                   "Unknown + RequireMedium + selfElevated fails closed as BlockedMismatch") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable, {}, true) ==
+                       LaunchRoute::BlockedMismatch,
+                   "Unknown + ShellDefault + selfElevated fails closed as BlockedMismatch") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable, {}, false) ==
+                       LaunchRoute::DirectCurrentToken,
+                   "Unknown + ShellDefault + !selfElevated launches with DirectCurrentToken") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::RequireMedium, LaunchTargetKind::Document, {}, false) ==
+                       LaunchRoute::DirectCurrentToken,
+                   "Unknown + RequireMedium + !selfElevated launches with DirectCurrentToken") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::Inherit, LaunchTargetKind::Executable, {}, true) ==
+                       LaunchRoute::DirectCurrentToken,
+                   "Unknown + Inherit + selfElevated stays on DirectCurrentToken") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::RequestElevation, LaunchTargetKind::Executable, {}, true) ==
+                       LaunchRoute::DirectRunAs,
+                   "Unknown + RequestElevation + selfElevated routes to DirectRunAs") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Unknown, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable, L"runas", true) ==
+                       LaunchRoute::DirectRunAs,
+                   "Unknown + runas + selfElevated routes to DirectRunAs") &&
+           Require(ResolveLaunchRoute(PrivilegeMode::Standard, LaunchPrivilege::RequireMedium, LaunchTargetKind::Shortcut, {}, false) ==
+                       LaunchRoute::DirectCurrentToken,
                    "Standard + RequireMedium launches with DirectCurrentToken") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::Inherit, LaunchTargetKind::Executable) == LaunchRoute::DirectCurrentToken,
+           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::Inherit, LaunchTargetKind::Executable, {}, true) ==
+                       LaunchRoute::DirectCurrentToken,
                    "Inherit explicitly stays on DirectCurrentToken") &&
-           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable, L"runas") ==
+           Require(ResolveLaunchRoute(PrivilegeMode::ElevatedSplit, LaunchPrivilege::ShellDefault, LaunchTargetKind::Executable, L"runas", true) ==
                        LaunchRoute::DirectRunAs,
                    "Explicit runas verb routes to DirectRunAs");
 }

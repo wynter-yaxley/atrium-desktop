@@ -167,6 +167,7 @@ public:
     // A hosted icon only (the shell protocol has these; Explorer's buttons do not):
     // the middle button, and the pointer resting on an icon (null: on none).
     void MiddleClick(const TrayIcon& icon, RECT cell = {});
+    HostSendStatus SendHosted(const std::wstring& key, tray::HostAction action, POINT at, RECT cell);
     void Hover(const TrayIcon* icon, RECT cell = {});
     void SetHostPlaces(RECT anchor)
     {
@@ -208,7 +209,6 @@ private:
     void RunClickJob(IUIAutomation* uia, const Job& job, const tray::ShellSession& session, ULONGLONG findStart);
     void RunRefreshJob(WorkerState& ws, const tray::ShellSession& session, ULONGLONG findStart);
     void RebuildSnapshot(bool forceNotify);
-    HostSendStatus SendHosted(const std::wstring& key, tray::HostAction action, POINT at, RECT cell);
     bool ClickHosted(const TrayIcon& icon, tray::HostAction action, RECT cell = {}, bool allowProgramWake = false);
     void EnqueueUrgent(Job job);
     HWND notify_;

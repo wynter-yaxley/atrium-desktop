@@ -1647,19 +1647,48 @@ finally
 
             try
             {
-                IntPtr secondInstance = CreateNamedPipeW(
-                    fullPipePath,
-                    PipeAccessDuplex | FileFlagOverlapped,
-                    PipeTypeMessage | PipeReadmodeMessage | PipeWait | PipeRejectRemoteClients,
-                    2,
-                    16384,
-                    16384,
-                    0,
-                    ref sa);
-                int secondErr = Marshal.GetLastWin32Error();
-                if (secondInstance != IntPtr.Zero && secondInstance != new IntPtr(-1)) CloseHandle(secondInstance);
-                Require(secondInstance == new IntPtr(-1) && secondErr == 5 /* ERROR_ACCESS_DENIED */,
-                    $"Second pipe instance without FILE_CREATE_PIPE_INSTANCE must be denied (err={secondErr}).");
+                string negPipePath = $@"\\.\pipe\{pipeName}.NegMulti";
+                const uint MultiOpenMode = PipeAccessDuplex | FileFlagOverlapped;
+                const uint MultiPipeMode = PipeTypeMessage | PipeReadmodeMessage | PipeWait | PipeRejectRemoteClients;
+                IntPtr negFirst = CreateNamedPipeW(negPipePath, MultiOpenMode, MultiPipeMode, 2, 16384, 16384, 0, ref sa);
+                Require(negFirst != IntPtr.Zero && negFirst != new IntPtr(-1),
+                    $"First multi-instance CreateNamedPipeW with tightened SDDL failed ({Marshal.GetLastWin32Error()}).");
+                try
+                {
+                    IntPtr negSecond = CreateNamedPipeW(negPipePath, MultiOpenMode, MultiPipeMode, 2, 16384, 16384, 0, ref sa);
+                    int secondErr = Marshal.GetLastWin32Error();
+                    if (negSecond != IntPtr.Zero && negSecond != new IntPtr(-1)) CloseHandle(negSecond);
+                    Require(negSecond == new IntPtr(-1) && secondErr == 5 /* ERROR_ACCESS_DENIED */,
+                        $"Second identical pipe instance (nMaxInstances=2) without FILE_CREATE_PIPE_INSTANCE must be denied (err={secondErr}).");
+                }
+                finally { CloseHandle(negFirst); }
+
+                string posSddl = $"D:P(A;;0x0012019F;;;{userSid})S:(ML;;NW;;;ME)";
+                Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(posSddl, 1u, out IntPtr posSd, out _),
+                    $"ConvertStringSecurityDescriptorToSecurityDescriptorW(0x0012019F) failed ({Marshal.GetLastWin32Error()}).");
+                try
+                {
+                    var posSa = new SecurityAttributes
+                    {
+                        NLength = Marshal.SizeOf<SecurityAttributes>(),
+                        LpSecurityDescriptor = posSd,
+                        BInheritHandle = false,
+                    };
+                    string posPipePath = $@"\\.\pipe\{pipeName}.PosMulti";
+                    IntPtr posFirst = CreateNamedPipeW(posPipePath, MultiOpenMode, MultiPipeMode, 2, 16384, 16384, 0, ref posSa);
+                    Require(posFirst != IntPtr.Zero && posFirst != new IntPtr(-1),
+                        $"First multi-instance pipe with FILE_CREATE_PIPE_INSTANCE failed ({Marshal.GetLastWin32Error()}).");
+                    try
+                    {
+                        IntPtr posSecond = CreateNamedPipeW(posPipePath, MultiOpenMode, MultiPipeMode, 2, 16384, 16384, 0, ref posSa);
+                        int posErr = Marshal.GetLastWin32Error();
+                        Require(posSecond != IntPtr.Zero && posSecond != new IntPtr(-1),
+                            $"Second pipe (nMaxInstances=2) with FILE_CREATE_PIPE_INSTANCE must succeed (err={posErr}).");
+                        CloseHandle(posSecond);
+                    }
+                    finally { CloseHandle(posFirst); }
+                }
+                finally { LocalFree(posSd); }
 
                 var serverTask = Task.Run(() =>
                 {
@@ -1691,6 +1720,51 @@ finally
             {
                 CloseHandle(rawPipe);
             }
+
+            // Verify ReleaseInstaller.TryNotifyReadyViaPipe sends notify-update-ready to matching server and rejects mismatch before write.
+            string notifyPipeName = "Atrium.Test.NotifyReady." + Guid.NewGuid().ToString("N");
+            string notifyPipePath = $@"\\.\pipe\{notifyPipeName}";
+            IntPtr notifyPipe = CreateNamedPipeW(
+                notifyPipePath,
+                PipeAccessDuplex | FileFlagOverlapped | FileFlagFirstPipeInstance,
+                PipeTypeMessage | PipeReadmodeMessage | PipeWait | PipeRejectRemoteClients,
+                1, 16384, 16384, 0, ref sa);
+            Require(notifyPipe != IntPtr.Zero && notifyPipe != new IntPtr(-1), "NotifyReady test pipe creation failed.");
+            try
+            {
+                var notifyTask = Task.Run(() =>
+                {
+                    if (OperatingSystem.IsWindows())
+                        ServeSingleOverlappedMessage(notifyPipe, """{"cmd":"notify-update-ready"}""", """{"ok":true,"status":"accepted"}""");
+                });
+                bool notified = ReleaseInstaller.TryNotifyReadyViaPipe(notifyPipeName, Environment.ProcessPath!, 3000);
+                Require(notified, "ReleaseInstaller.TryNotifyReadyViaPipe must succeed against matching server executable.");
+                await notifyTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+                bool sawAnyBytesOnReject = false;
+                var rejectTask = Task.Run(() =>
+                {
+                    if (!OperatingSystem.IsWindows()) return;
+                    using var ev = new ManualResetEvent(false);
+                    var ov = new NativeOverlapped { EventHandle = ev.SafeWaitHandle.DangerousGetHandle() };
+                    try
+                    {
+                        FinishOverlapped(notifyPipe, ev, ref ov, ConnectNamedPipe(notifyPipe, ref ov), "ConnectNamedPipe");
+                        ev.Reset();
+                        byte[] buf = new byte[64];
+                        if (ReadFile(notifyPipe, buf, (uint)buf.Length, out uint immRead, ref ov))
+                            sawAnyBytesOnReject = immRead > 0;
+                        else if (Marshal.GetLastWin32Error() == 997 /* ERROR_IO_PENDING */ && ev.WaitOne(5000))
+                            sawAnyBytesOnReject = GetOverlappedResult(notifyPipe, ref ov, out uint asyncRead, false) && asyncRead > 0;
+                    }
+                    finally { DisconnectNamedPipe(notifyPipe); }
+                });
+                bool rejected = !ReleaseInstaller.TryNotifyReadyViaPipe(notifyPipeName, @"C:\invalid\WrongAtrium.exe", 3000);
+                await rejectTask.WaitAsync(TimeSpan.FromSeconds(5));
+                Require(rejected && !sawAnyBytesOnReject,
+                    "ReleaseInstaller.TryNotifyReadyViaPipe must reject mismatched server executable before writing any bytes.");
+            }
+            finally { CloseHandle(notifyPipe); }
         }
         finally
         {

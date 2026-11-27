@@ -49,6 +49,31 @@ uint64_t ParseGuardGenerationFromCommandLine()
     return generation;
 }
 
+DWORD VerifiedAtriumWindowPid(HWND window)
+{
+    if (!window)
+        return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (!pid)
+        return 0;
+    const std::wstring image = ProcessImagePath(pid);
+    const size_t slash = image.find_last_of(L"\\/");
+    const std::wstring base = slash == std::wstring::npos ? image : image.substr(slash + 1);
+    return (!image.empty() && FoldCase(base) == L"atrium.exe") ? pid : 0;
+}
+
+bool AdvanceGenerationOrRelease(HANDLE mutex, int& exitCode, const wchar_t* reason)
+{
+    if (AdvanceInstanceGeneration())
+        return true;
+    Log(L"core: could not advance instance generation (%s); exiting", reason);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    exitCode = 1;
+    return false;
+}
+
 bool SignalOtherOpenSettings(HWND other)
 {
     if (other && PostMessageW(other, WM_OPEN_SETTINGS, 0, 0) != 0)
@@ -56,15 +81,14 @@ bool SignalOtherOpenSettings(HWND other)
     const DWORD err = other ? GetLastError() : ERROR_ACCESS_DENIED;
     if (other && err != ERROR_ACCESS_DENIED)
         return false;
+    const DWORD expectedPid = SameExecutableWindow(other) ? VerifiedAtriumWindowPid(other) : 0;
     LifecycleReply reply;
-    return SendLifecycleCommand(L"open-settings", {}, &reply) && reply.ok;
+    return SendLifecycleCommand(L"open-settings", {}, &reply, {}, 2000, expectedPid) && reply.ok;
 }
 
 bool QuitOtherInstance(HWND other, DWORD timeoutMs)
 {
-    DWORD pid = 0;
-    if (other)
-        GetWindowThreadProcessId(other, &pid);
+    DWORD pid = VerifiedAtriumWindowPid(other);
     if (!pid) {
         LifecycleReply ping;
         if (SendLifecycleCommand(L"ping", {}, &ping) && ping.ok)
@@ -76,7 +100,7 @@ bool QuitOtherInstance(HWND other, DWORD timeoutMs)
         const DWORD err = other ? GetLastError() : ERROR_ACCESS_DENIED;
         if (!other || err == ERROR_ACCESS_DENIED) {
             LifecycleReply reply;
-            sent = SendLifecycleCommand(L"quit", {}, &reply) && reply.ok;
+            sent = SendLifecycleCommand(L"quit", {}, &reply, {}, 2000, pid) && reply.ok;
         }
     }
     if (!sent) {
@@ -92,7 +116,7 @@ bool QuitOtherInstance(HWND other, DWORD timeoutMs)
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         while (GetTickCount64() < deadline) {
             LifecycleReply ping;
-            if (!SendLifecycleCommand(L"ping", {}, &ping, {}, 250) || !ping.ok) {
+            if (!SendLifecycleCommand(L"ping", {}, &ping, {}, 250, pid) || !ping.ok) {
                 exited = true;
                 break;
             }
@@ -205,7 +229,8 @@ HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
         return nullptr;
     }
     if (mutex && err != ERROR_ALREADY_EXISTS) {
-        AdvanceInstanceGeneration();
+        if (!AdvanceGenerationOrRelease(mutex, exitCode, L"initial"))
+            return nullptr;
         return mutex;
     }
     HWND other = FindWindowW(kHostClass, nullptr);
@@ -227,7 +252,8 @@ HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
         const DWORD wait = WaitForSingleObject(mutex, 15000);
         if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
             WaitForGuard();
-            AdvanceInstanceGeneration();
+            if (!AdvanceGenerationOrRelease(mutex, exitCode, L"exiting takeover"))
+                return nullptr;
             Log(L"core: took over from an exiting instance");
             return mutex;
         }
@@ -245,7 +271,8 @@ HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
         exitCode = 0;
         return nullptr;
     }
-    AdvanceInstanceGeneration();
+    if (!AdvanceGenerationOrRelease(mutex, exitCode, L"replacement takeover"))
+        return nullptr;
     Log(L"core: took over from %s", same ? L"an existing instance" : L"the copy at another location");
     return mutex;
 }

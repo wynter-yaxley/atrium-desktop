@@ -104,6 +104,27 @@ std::vector<std::function<void()>> DrainGenieShutdownRestores(FlightRange& fligh
     return restores;
 }
 
+// Prepares overlay and timer resources before queuing a hardware flight; on failure, releases the window and runs `cb` once.
+template<class EnsureOverlayFn, class StartTimerFn, class ReleaseFn, class LogFn> inline bool
+PrepareHardwareFlightLaunch(std::function<void()>& cb, EnsureOverlayFn&& ensureOverlay, StartTimerFn&& startTimer, ReleaseFn&& release, LogFn&& logFailure)
+{
+    if (!std::forward<EnsureOverlayFn>(ensureOverlay)()) {
+        std::forward<LogFn>(logFailure)(L"genie: overlay creation failed; completing flight callback immediately");
+        std::forward<ReleaseFn>(release)();
+        if (cb)
+            std::exchange(cb, nullptr)();
+        return false;
+    }
+    if (!std::forward<StartTimerFn>(startTimer)()) {
+        std::forward<LogFn>(logFailure)(L"genie: state timer setup failed; completing flight callback immediately");
+        std::forward<ReleaseFn>(release)();
+        if (cb)
+            std::exchange(cb, nullptr)();
+        return false;
+    }
+    return true;
+}
+
 class GenieMinimize {
 public:
     // target: the icon of the window's app on a bar (screen px), else none; skip: a window another

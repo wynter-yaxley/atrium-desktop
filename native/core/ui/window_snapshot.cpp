@@ -331,14 +331,14 @@ bool QueryWindowSnapshotKey(HWND window, uint64_t generation, WindowSnapshotKey&
 
 WindowPictureCache::WindowPictureCache(size_t maxBytes) : maxBytes_(maxBytes) {}
 
-void WindowPictureCache::Put(const WindowSnapshotKey& key, const RECT& frame, std::shared_ptr<const WindowPicture> picture)
+bool WindowPictureCache::Put(const WindowSnapshotKey& key, const RECT& frame, std::shared_ptr<const WindowPicture> picture)
 {
     if (!key.window || !picture || !picture->ok)
-        return;
-    Erase(key.window);
-    if (maxBytes_ == 0)
-        return;
+        return false;
     const size_t bytes = picture->image.ByteSize() + picture->shadow.ByteSize();
+    if (maxBytes_ == 0 || bytes > maxBytes_)
+        return false;
+    Erase(key.window);
     Entry entry;
     entry.key = key;
     entry.frame = frame;
@@ -348,6 +348,7 @@ void WindowPictureCache::Put(const WindowSnapshotKey& key, const RECT& frame, st
     totalBytes_ += bytes;
     entries_.emplace(key.window, std::move(entry));
     EvictToBudget();
+    return true;
 }
 
 const WindowPictureCache::Entry* WindowPictureCache::Find(HWND window, DWORD pid, FILETIME creationTime, uint64_t minGeneration)
@@ -405,8 +406,6 @@ void WindowPictureCache::SetMaxBytes(size_t maxBytes)
 void WindowPictureCache::EvictToBudget()
 {
     while (totalBytes_ > maxBytes_ && !entries_.empty()) {
-        if (maxBytes_ > 0 && entries_.size() == 1)
-            break;
         auto lru = entries_.begin();
         for (auto it = std::next(entries_.begin()); it != entries_.end(); ++it)
             if (it->second.lastUsedSeq < lru->second.lastUsedSeq)
@@ -497,6 +496,8 @@ void WindowSnapshots::Request(HWND window, int maxWidth, int maxHeight, float ra
     // PrintWindow waits for the window's thread: a hung one would hold the worker and its bitmap for good.
     if (!window || IsIconic(window) || IsHungAppWindow(window))
         return;
+    WindowSnapshotKey snapKey{};
+    QueryWindowSnapshotKey(window, 0, snapKey);
     std::unique_lock lk(lock_);
     if (stop_ || !notify_)
         return;
@@ -510,6 +511,7 @@ void WindowSnapshots::Request(HWND window, int maxWidth, int maxHeight, float ra
                 job.maxHeight = maxHeight;
                 job.largeMax = largeMax;
                 job.radius = radius;
+                job.key = snapKey;
                 queue_.erase(it);
                 queue_.push_front(job);
                 break;
@@ -524,7 +526,7 @@ void WindowSnapshots::Request(HWND window, int maxWidth, int maxHeight, float ra
         queue_.pop_back();
     }
     pending_.insert(window);
-    const Job job{window, maxWidth, maxHeight, largeMax, radius};
+    const Job job{window, maxWidth, maxHeight, largeMax, radius, snapKey};
     if (urgent)
         queue_.push_front(job);
     else
@@ -592,7 +594,7 @@ void WindowSnapshots::Worker()
             pending_.erase(job.window);
             if (stop_ || !notify_)
                 break;
-            done_.push_back(Result{job.window, std::move(p), std::move(large)});
+            done_.push_back(Result{job.window, std::move(p), std::move(large), 0, job.key});
             PostMessageW(notify_, message_, 0, 0);
         } else {
             WindowPicture shrunk = Smaller(*sjob.large, sjob.largeMax);

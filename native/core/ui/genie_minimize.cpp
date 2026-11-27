@@ -158,16 +158,17 @@ GenieMinimize::GenieMinimize(HINSTANCE instance, std::function<std::optional<REC
             RunRestores();
         } else if (m == WM_GENIE_PICTURE) {
             for (WindowSnapshots::Result& r : snapshots_.Take()) {
-                if (!r.large.ok || !pictureMeta_.contains(r.window))
+                if (!r.large.ok || !pictureMeta_.contains(r.window) || r.key.pid == 0)
                     continue;
                 WindowSnapshotKey key{};
-                if (!QueryWindowSnapshotKey(r.window, ++nextPictureGen_, key))
+                if (!QueryWindowSnapshotKey(r.window, ++nextPictureGen_, key) || !SnapshotMatchesLiveIdentity(r.key, key))
                     continue;
                 PictureMeta& meta = EnsureProcessMeta(r.window, key);
                 const RECT frame = IsIconic(r.window) ? meta.frame : Frame(r.window);
-                pictureCache_.Put(key, frame, std::make_shared<const WindowPicture>(std::move(r.large)));
-                meta.frame = frame;
-                meta.pictureId = ++nextPictureId_;
+                if (pictureCache_.Put(key, frame, std::make_shared<const WindowPicture>(std::move(r.large)))) {
+                    meta.frame = frame;
+                    meta.pictureId = ++nextPictureId_;
+                }
                 if (r.window == pending_)
                     RunPending();
             }
@@ -527,14 +528,22 @@ bool GenieMinimize::Restore(HWND window, std::function<void()> restore)
 
 void GenieMinimize::LaunchHardwareFlight(HWND window, const CachedPictureHit& hit, const RECT& to, std::function<void()> cb, bool isRestore, bool waitForCover)
 {
-    EnsureOverlayWindow();
+    const bool ready = PrepareHardwareFlightLaunch(
+        cb,
+        [this] {
+            EnsureOverlayWindow();
+            return hwOverlay_ != nullptr;
+        },
+        [this] { return SetTimer(hwOverlay_, kStateTimer, kStateMs, nullptr) != 0; }, [this, window] { Release(window); },
+        [](const wchar_t* msg) { Log(L"%s", msg); });
+    if (!ready)
+        return;
+
     const double nowMs = ClockMs();
     const uint64_t id =
         isRestore ? stateMachine_.BeginRestore(window, nowMs, std::move(cb)) : stateMachine_.BeginMinimize(window, nowMs, std::move(cb), waitForCover);
     hwFlights_.push_back(HardwareFlight{id, hit.pictureId, hit.picture, hit.frame, to, window, isRestore, false, false, nowMs});
     PublishHardwareFlights();
-    if (hwOverlay_)
-        SetTimer(hwOverlay_, kStateTimer, kStateMs, nullptr);
 }
 
 void GenieMinimize::PublishHardwareFlights()

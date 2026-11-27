@@ -629,25 +629,9 @@ HostSendStatus TrayModel::SendHosted(const std::wstring& key, tray::HostAction a
     agent->Hover(L"", at);
     bool higher = false;
     const HostSendStatus status = agent->Send(key, action, at, cell, &higher);
-    if (status != HostSendStatus::NotSent || !higher)
-        return status;
-    for (const HostIcon& icon : agent->Icons()) {
-        if (icon.key != key || !icon.callback || !icon.hwnd || !IsWindow(icon.hwnd))
-            continue;
-        AllowSetForegroundWindow(icon.pid);
-        const std::vector<UINT> seq = tray::CallbackSequence(action, icon.version);
-        size_t sent = 0;
-        WPARAM wp = 0;
-        LPARAM lp = 0;
-        for (UINT note : seq) {
-            tray::EncodeCallback(icon.version, icon.uid, note, at, wp, lp);
-            if (!SendNotifyMessageW(icon.hwnd, icon.callback, wp, lp))
-                break;
-            ++sent;
-        }
-        return sent == 0 ? HostSendStatus::NotSent : sent == seq.size() ? HostSendStatus::Sent : HostSendStatus::Partial;
-    }
-    return HostSendStatus::NotSent;
+    if (status == HostSendStatus::NotSent && higher)
+        Log(L"tray: hosted send skipped for higher-integrity target; falling back to Explorer UIA");
+    return status;
 }
 
 void TrayModel::MiddleClick(const TrayIcon& icon, RECT cell)
