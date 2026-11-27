@@ -1,13 +1,6 @@
-// The Windows key alone opens Atrium's start menu (setting winKeyStart), Win +
-// 1..9, 0 the bar's apps (winNumbers); both off by default. It listens on the
-// app's one keyboard hook (shell/keyboard_hook.h, on a thread of its own) and
-// holds the key back as it goes down: when another key follows, the two go on
-// to Windows together (Win + E and every other shortcut work as before); a
-// digit is kept and `notify` hears of it; when the key comes up alone, Windows
-// never saw it, so its start menu stays shut and `notify` hears of it instead
-// (or, without winKeyStart, the key goes on to Windows after all). Over an
-// elevated window, whose input Atrium may not send to, the key is left alone.
-// Nothing is injected into Explorer.
+// Pass the physical Windows key down to the next hook so third-party shortcuts
+// can see it. If it comes up alone, mask the system Start menu and release the
+// key before opening Atrium Start. Ordinary combinations stay physical.
 #pragma once
 
 #include <windows.h>
@@ -16,65 +9,65 @@
 
 namespace atrium {
 
+enum class WinKeyUse { Alone, Forwarded, BarDigit };
+
 struct WinKeyAction {
-    bool swallow = false, notify = false, replayAlone = false, replayCombo = false;
+    bool swallow = false, notify = false, maskRelease = false;
     WPARAM notifyParam = 0;
-    DWORD winVk = 0, winScan = 0;
-    bool winExtended = false;
 };
 
 struct WinKeyState {
-    bool held = false, passed = false, used = false, extended = false;
-    DWORD digit = 0, key = 0, scan = 0;
-    ULONGLONG lastDownMs = 0;
+    DWORD key = 0, digit = 0;
+    WinKeyUse use = WinKeyUse::Alone;
 };
 
-// Pure state-machine step for WinKey::OnKey. `winAsyncDown` is queried only when `s.held && s.passed` (swallowed keys never set GetAsyncKeyState).
-inline WinKeyAction StepWinKey(WinKeyState& s, DWORD vk, DWORD scan, bool extended, bool down, ULONGLONG nowMs, bool winAsyncDown, bool elevated, bool modified,
-                               bool alone, bool numbers)
+inline bool IsWindowsKey(DWORD vk) { return vk == VK_LWIN || vk == VK_RWIN; }
+
+// Ignore the current key-up when checking for stale state: the low-level hook
+// runs before Windows applies that event to its asynchronous key state.
+inline bool LostWindowsKey(const WinKeyState& s, DWORD vk, bool down, bool winAsyncDown) { return s.key != 0 && (vk != s.key || down) && !winAsyncDown; }
+
+inline WinKeyAction StepWinKey(WinKeyState& s, DWORD vk, bool down, bool winAsyncDown, bool elevated, bool modified, bool injected, bool alone, bool numbers)
 {
-    const bool win = vk == VK_LWIN || vk == VK_RWIN;
-    if (s.held && s.passed && (vk != s.key || down) && !winAsyncDown)
-        s = WinKeyState{};
-    if (s.digit && vk != s.digit && (!s.held || (!win && down)))
+    const bool win = IsWindowsKey(vk);
+    if (win && injected)
+        return {};
+    if (LostWindowsKey(s, vk, down, winAsyncDown))
+        s = {};
+    if (s.digit && vk != s.digit && (!s.key || (!win && down)))
         s.digit = 0;
     if (win && down) {
-        if (s.held && !s.passed && nowMs - s.lastDownMs > 2000)
-            s = WinKeyState{};
-        if (!s.held) {
-            s.held = true;
-            s.used = false;
+        if (!s.key) {
             s.key = vk;
-            s.scan = scan;
-            s.extended = extended;
-            s.passed = elevated;
+            s.use = elevated || modified ? WinKeyUse::Forwarded : WinKeyUse::Alone;
+        } else if (vk != s.key) {
+            s.use = WinKeyUse::Forwarded;
         }
-        s.lastDownMs = nowMs;
-        return {.swallow = !s.passed};
+        return {};
     }
     if (win) {
-        const bool held = s.held && vk == s.key && !s.passed;
-        if (s.held && vk == s.key)
-            s.held = false;
-        if (held && !s.used)
-            return alone ? WinKeyAction{.swallow = true, .notify = true} :
-                           WinKeyAction{.swallow = true, .replayAlone = true, .winVk = s.key, .winScan = s.scan, .winExtended = s.extended};
-        return {.swallow = held};
+        if (vk != s.key)
+            return {};
+        s.key = 0;
+        const bool notify = alone && s.use == WinKeyUse::Alone;
+        return {.notify = notify, .maskRelease = notify || s.use == WinKeyUse::BarDigit};
     }
-    if (s.digit && vk == s.digit) {
+    if (s.digit && vk == s.digit && !injected) {
         if (!down)
             s.digit = 0;
         return {.swallow = true};
     }
-    if (!down || !s.held || s.passed)
+    if (!down || !s.key || s.use == WinKeyUse::Forwarded)
         return {};
-    if (vk >= '0' && vk <= '9' && numbers && !modified) {
-        s.used = true;
+    if (numbers && vk >= '0' && vk <= '9' && !modified && !injected) {
+        s.use = WinKeyUse::BarDigit;
         s.digit = vk;
-        return {.swallow = true, .notify = true, .notifyParam = vk == '0' ? 10 : vk - '0'};
+        return {.swallow = true, .notify = true, .notifyParam = vk == '0' ? 10 : WPARAM(vk - '0')};
     }
-    s.passed = true;
-    return {.swallow = true, .replayCombo = true, .winVk = s.key, .winScan = s.scan, .winExtended = s.extended};
+    // KwikPaste can consume the physical V before Atrium sees it. Its Start
+    // suppression key is also a non-Win key and cancels a pending solo tap here.
+    s.use = WinKeyUse::Forwarded;
+    return {};
 }
 
 class WinKey {
