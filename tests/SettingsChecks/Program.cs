@@ -1741,6 +1741,26 @@ finally
                 Require(notified, "ReleaseInstaller.TryNotifyReadyViaPipe must succeed against matching server executable.");
                 await notifyTask.WaitAsync(TimeSpan.FromSeconds(5));
 
+                var unknownCmdTask = Task.Run(() =>
+                {
+                    if (OperatingSystem.IsWindows())
+                        ServeSingleOverlappedMessage(notifyPipe, """{"cmd":"notify-update-ready"}""", """{"ok":false,"error":"unknown_command"}""");
+                });
+                bool unknownCmdAccepted = ReleaseInstaller.TryNotifyReadyViaPipe(notifyPipeName, Environment.ProcessPath!, 3000);
+                await unknownCmdTask.WaitAsync(TimeSpan.FromSeconds(5));
+                Require(!unknownCmdAccepted,
+                    "ReleaseInstaller.TryNotifyReadyViaPipe must return false when server replies unknown_command.");
+
+                var malformedTask = Task.Run(() =>
+                {
+                    if (OperatingSystem.IsWindows())
+                        ServeSingleOverlappedMessage(notifyPipe, """{"cmd":"notify-update-ready"}""", "{malformed");
+                });
+                bool malformedAccepted = ReleaseInstaller.TryNotifyReadyViaPipe(notifyPipeName, Environment.ProcessPath!, 3000);
+                await malformedTask.WaitAsync(TimeSpan.FromSeconds(5));
+                Require(!malformedAccepted,
+                    "ReleaseInstaller.TryNotifyReadyViaPipe must return false on malformed JSON reply.");
+
                 bool sawAnyBytesOnReject = false;
                 var rejectTask = Task.Run(() =>
                 {

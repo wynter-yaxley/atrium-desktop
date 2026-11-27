@@ -223,9 +223,10 @@ void InitializeDesktopAgent()
         if (!g_app.desktopAgentStopping.load() && g_app.host)
             PostMessageW(g_app.host, WM_ATRIUM_AGENT_DRAG_LEAVE, 0, 0);
     };
-    cb.onDropFiles = [](const std::wstring& key, const std::vector<std::wstring>& paths) {
-        if (!g_app.desktopAgentStopping.load() && g_app.host)
-            PostOwned(g_app.host, WM_ATRIUM_AGENT_DROP_FILES, 0, std::make_unique<RemoteDropPayload>(RemoteDropPayload{key, paths}));
+    cb.onDropFilesAccepted = [](const std::wstring& key, const std::vector<std::wstring>& paths) -> bool {
+        if (g_app.desktopAgentStopping.load() || !g_app.host || key.empty() || paths.empty())
+            return false;
+        return PostOwned(g_app.host, WM_ATRIUM_AGENT_DROP_FILES, 0, std::make_unique<RemoteDropPayload>(RemoteDropPayload{key, paths}));
     };
     DesktopAgentClientOptions opts;
     opts.corePid = GetCurrentProcessId();

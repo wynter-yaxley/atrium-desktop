@@ -270,10 +270,40 @@ private:
     std::unordered_set<uint64_t> confirmedVersions_;
 };
 
+inline AgentTrayIconDto BuildAgentTrayIconDto(const HostIcon& src, ULONGLONG nowMs, uint64_t evtSession, size_t rawPixelBudget, size_t& pixelBudgetUsed,
+                                              TraySnapshotAckState& ackState, bool& deferredBitmapOut)
+{
+    AgentTrayIconDto dto;
+    dto.key = src.key, dto.hwnd = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src.hwnd));
+    dto.uid = src.uid, dto.callback = src.callback, dto.version = src.version, dto.showTip = src.showTip;
+    dto.tip = src.tip, dto.exe = src.exe, dto.pid = src.pid, dto.imageVersion = src.imageVersion;
+    dto.hidden = src.hidden, dto.added = src.added, dto.flashing = src.flash.until > nowMs;
+    if (src.image && !src.image->Empty() && src.imageVersion != 0) {
+        const size_t byteSize = src.image->ByteSize();
+        const bool dimsOk = src.image->width > 0 && src.image->height > 0 && src.image->width <= kMaxAgentIconDimension &&
+                            src.image->height <= kMaxAgentIconDimension &&
+                            byteSize == static_cast<size_t>(src.image->width) * static_cast<size_t>(src.image->height) * 4;
+        if (!dimsOk) {
+            dto.imageVersion = 0;
+        } else if (!ackState.IsConfirmed(evtSession, src.imageVersion)) {
+            if (pixelBudgetUsed + byteSize <= rawPixelBudget) {
+                dto.width = src.image->width, dto.height = src.image->height, dto.pixels = src.image->Bytes();
+                pixelBudgetUsed += byteSize;
+            } else {
+                deferredBitmapOut = true;
+            }
+        }
+    } else {
+        dto.imageVersion = 0;
+    }
+    return dto;
+}
+
 HANDLE CreateSameUserNamedPipeServer(const std::wstring& pipeName, DWORD bufferSize = 64 * 1024);
 bool VerifyNamedPipeClientSameUser(HANDLE pipe);
 bool VerifyNamedPipePeerProcess(HANDLE pipe, bool isServerSide, const std::wstring& expectedImagePath, bool requireNonElevated, AgentPeerIdentity& out,
                                 winrt::handle* procOut = nullptr);
+bool VerifyLaunchedProcessMatchesPeer(HANDLE launchedProc, const AgentPeerIdentity& peer);
 bool ConnectNamedPipeOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent);
 bool ReadPipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeoutMs, std::string& messageOut, bool& disconnectedOut);
 inline bool ReadPipeMessageOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, std::string& messageOut, bool& disconnectedOut)
@@ -282,7 +312,8 @@ inline bool ReadPipeMessageOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEv
 }
 bool WritePipeMessageOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, const std::string& message);
 HANDLE ConnectSameUserPipeClient(const std::wstring& pipeName, DWORD timeoutMs, HANDLE quitEvent = nullptr);
-bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent = nullptr);
+bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent = nullptr,
+                               bool* writeCompletedOut = nullptr);
 bool SendNamedPipeOneShot(const std::wstring& pipeName, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent = nullptr);
 
 } // namespace atrium

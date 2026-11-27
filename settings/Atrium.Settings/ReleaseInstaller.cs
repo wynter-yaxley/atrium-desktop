@@ -293,7 +293,23 @@ internal static class ReleaseInstaller
             pipe.FlushAsync(cts.Token).GetAwaiter().GetResult();
             byte[] reply = new byte[1024];
             int read = pipe.ReadAsync(reply, 0, reply.Length, cts.Token).GetAwaiter().GetResult();
-            return read > 0;
+            if (read <= 0)
+                return false;
+            try
+            {
+                using var doc = JsonDocument.Parse(reply.AsMemory(0, read));
+                var root = doc.RootElement;
+                return root.ValueKind == JsonValueKind.Object
+                    && root.TryGetProperty("ok", out var ok)
+                    && ok.ValueKind == JsonValueKind.True
+                    && root.TryGetProperty("status", out var status)
+                    && status.ValueKind == JsonValueKind.String
+                    && string.Equals(status.GetString(), "accepted", StringComparison.Ordinal);
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
         }
         catch (Exception e) when (e is TimeoutException or IOException or UnauthorizedAccessException
             or OperationCanceledException or PlatformNotSupportedException)

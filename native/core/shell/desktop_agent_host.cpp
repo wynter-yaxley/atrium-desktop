@@ -236,6 +236,14 @@ private:
         if (!IsCorePeer(pipe, false, L"Evt"))
             return CloseHandle(pipe), false;
         evtPipe_ = pipe, evtSession_.fetch_add(1);
+        bool postResync = false;
+        {
+            std::lock_guard lock(evtPushMutex_);
+            if (resyncNeeded_)
+                resyncNeeded_ = false, postResync = true;
+        }
+        if (postResync && hostHwnd_)
+            PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
         return true;
     }
     bool SendEvent(const AgentEventMessage& msg, AgentEventReply& replyOut, DWORD timeoutMs, uint64_t* sessionOut = nullptr);
@@ -254,7 +262,7 @@ private:
             msg.yielded = trayHost_->Yielded(), msg.yieldReason = trayHost_->YieldReason();
         QueueEvtPush(std::move(msg), false);
     }
-    void SyncDropBars(const std::vector<AgentBarRect>& bars);
+    bool SyncDropBars(const std::vector<AgentBarRect>& bars);
     void DestroyAllOverlays()
     {
         if (dropTimerActive_ && hostHwnd_)
@@ -368,7 +376,7 @@ private:
     std::atomic<uint64_t> evtSession_{0};
     std::mutex evtPushMutex_;
     std::condition_variable evtPushCv_;
-    bool pendingSnapshot_ = false, pendingSnapshotDeferred_ = false, pendingYield_ = false;
+    bool pendingSnapshot_ = false, pendingSnapshotDeferred_ = false, pendingYield_ = false, resyncNeeded_ = false;
     AgentEventMessage queuedSnapshot_, queuedYield_;
     std::thread cmdThread_, evtPushThread_;
 };
@@ -430,6 +438,10 @@ int DesktopAgentHostApp::Run()
         return Cleanup(), OleUninitialize(), 1;
     evtPushThread_ = std::thread([this] { EvtPushLoop(); });
     cmdThread_ = std::thread([this] { CmdServerLoop(); });
+    if (options_.onReadyForTest) {
+        HWND hwnd = hostHwnd_;
+        options_.onReadyForTest([hwnd] { PostMessageW(hwnd, kMsgTraySnapshot, 0, 0); }, [hwnd] { PostMessageW(hwnd, kMsgTrayYield, 0, 0); });
+    }
 
     HANDLE waitHandles[3] = {coreProc_.get(), quitEvent_.get(), options_.stopEvent};
     const DWORD handleCount = options_.stopEvent ? 3U : 2U;
@@ -516,16 +528,16 @@ AgentCommandReply DesktopAgentHostApp::ExecuteStaCommand(const AgentCommandMessa
             return reply.error = L"tray_host_disabled", reply;
         reply.sendStatus = trayHost_->Send(cmd.key, cmd.action, cmd.at, cmd.cell);
         if (reply.sendStatus != HostSendStatus::Sent) {
-            for (const auto& icon : trayHost_->Icons()) {
-                if (icon.key == cmd.key && WindowHasHigherIntegrity(icon.hwnd)) {
-                    reply.higherIntegrity = true;
-                    break;
-                }
-            }
+            reply.higherIntegrity =
+                std::ranges::any_of(trayHost_->Icons(), [&](const auto& icon) { return icon.key == cmd.key && WindowHasHigherIntegrity(icon.hwnd); });
         }
         return reply.ok = true, reply;
     case AgentCommandType::TrayHover: return trayHost_ ? trayHost_->Hover(cmd.key, cmd.at, cmd.cell) : (void)0, reply.ok = true, reply;
-    case AgentCommandType::SyncDropBars: SyncDropBars(cmd.bars), reply.ok = true; break;
+    case AgentCommandType::SyncDropBars:
+        reply.ok = SyncDropBars(cmd.bars);
+        if (!reply.ok)
+            reply.error = L"overlay_sync_failed";
+        break;
     case AgentCommandType::Ping:
     case AgentCommandType::Quit: break;
     }
@@ -642,6 +654,9 @@ void DesktopAgentHostApp::EvtPushLoop()
             }
             if (needResend && hostHwnd_)
                 PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
+        } else if (!ok || !reply.ok) {
+            std::lock_guard lock(evtPushMutex_);
+            resyncNeeded_ = true;
         }
     }
     winrt::uninit_apartment();
@@ -692,35 +707,16 @@ void DesktopAgentHostApp::PushTraySnapshot()
         const size_t limit = (std::min)(icons.size(), kMaxAgentTrayIcons);
         msg.snapshot.icons.reserve(limit);
         std::lock_guard imgLock(imageVersionsMutex_);
-        for (size_t i = 0; i < limit; ++i) {
-            const HostIcon& src = icons[i];
-            AgentTrayIconDto dto;
-            dto.key = src.key, dto.hwnd = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src.hwnd));
-            dto.uid = src.uid, dto.callback = src.callback, dto.version = src.version, dto.showTip = src.showTip;
-            dto.tip = src.tip, dto.exe = src.exe, dto.pid = src.pid, dto.imageVersion = src.imageVersion;
-            dto.hidden = src.hidden, dto.added = src.added, dto.flashing = src.flash.until > now;
-            if (src.image && !src.image->Empty() && src.imageVersion != 0) {
-                const size_t byteSize = src.image->ByteSize();
-                const bool dimsOk = src.image->width > 0 && src.image->height > 0 && src.image->width <= kMaxAgentIconDimension &&
-                                    src.image->height <= kMaxAgentIconDimension &&
-                                    byteSize == static_cast<size_t>(src.image->width) * static_cast<size_t>(src.image->height) * 4;
-                if (!snapshotAckState_.IsConfirmed(session, src.imageVersion)) {
-                    if (dimsOk && pixelBudgetUsed + byteSize <= kSnapshotRawPixelBudget) {
-                        dto.width = src.image->width, dto.height = src.image->height, dto.pixels = src.image->Bytes();
-                        pixelBudgetUsed += byteSize;
-                    } else if (dimsOk) {
-                        deferredBitmap = true;
-                    }
-                }
-            }
-            msg.snapshot.icons.push_back(std::move(dto));
-        }
+        for (size_t i = 0; i < limit; ++i)
+            msg.snapshot.icons.push_back(
+                BuildAgentTrayIconDto(icons[i], now, session, kSnapshotRawPixelBudget, pixelBudgetUsed, snapshotAckState_, deferredBitmap));
     }
     QueueEvtPush(std::move(msg), true, deferredBitmap);
 }
 
-void DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
+bool DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
 {
+    bool allOk = true;
     std::unordered_set<uint64_t> activeIds;
     for (const auto& bar : bars) {
         if (!bar.visible || IsRectEmpty(&bar.rect) || activeIds.size() >= kMaxAgentDropBars)
@@ -729,19 +725,24 @@ void DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
         const int w = bar.rect.right - bar.rect.left, h = bar.rect.bottom - bar.rect.top;
         if (auto it = overlays_.find(bar.id); it != overlays_.end()) {
             it->second.rect = bar.rect;
-            SetWindowPos(it->second.hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE);
+            if (!SetWindowPos(it->second.hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE))
+                allOk = false;
             continue;
         }
         HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT, kOverlayWindowClass,
                                     L"", WS_POPUP, bar.rect.left, bar.rect.top, w, h, nullptr, nullptr, instance_, nullptr);
-        if (!hwnd)
-            continue;
-        auto target = winrt::make_self<AgentDropTarget>(this, bar.id);
-        if (FAILED(RegisterDragDrop(hwnd, target.get()))) {
-            DestroyWindow(hwnd);
+        if (!hwnd) {
+            allOk = false;
             continue;
         }
-        SetWindowPos(hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        auto target = winrt::make_self<AgentDropTarget>(this, bar.id);
+        if (options_.failOverlaySyncForTest || FAILED(RegisterDragDrop(hwnd, target.get()))) {
+            DestroyWindow(hwnd);
+            allOk = false;
+            continue;
+        }
+        if (!SetWindowPos(hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW))
+            allOk = false;
         overlays_.emplace(bar.id, DropOverlay{bar.id, bar.rect, hwnd, std::move(target), true});
     }
     for (auto it = overlays_.begin(); it != overlays_.end();)
@@ -750,6 +751,7 @@ void DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
         SetTimer(hostHwnd_, kDropPollTimerId, kDropPollMs, nullptr), dropTimerActive_ = true;
     else if (overlays_.empty() && dropTimerActive_ && hostHwnd_)
         KillTimer(hostHwnd_, kDropPollTimerId), dropTimerActive_ = false;
+    return allOk;
 }
 
 void DesktopAgentHostApp::OnDropPollTimer()

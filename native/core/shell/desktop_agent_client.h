@@ -75,6 +75,8 @@ private:
         bool flashing = false;
     };
 
+    enum class SendCommandOutcome { Succeeded, RejectedBeforeWrite, FailedOrTimedOutAfterWrite };
+
     void EvtServerLoop();
     void ServeEvtPipe(HANDLE pipe);
     AgentEventReply HandleEvent(const AgentEventMessage& evt);
@@ -83,7 +85,7 @@ private:
     bool SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut);
     void ReplayDesiredState();
     void ClearAgentStateOnExit();
-    bool SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs);
+    SendCommandOutcome SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs);
     void CloseCmdPipeLocked();
 
     DesktopAgentCallbacks callbacks_;

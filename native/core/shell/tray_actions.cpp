@@ -667,8 +667,11 @@ bool TrayModel::ClickHosted(const TrayIcon& icon, tray::HostAction hostAction, R
     POINT at{};
     GetCursorPos(&at);
     const HostSendStatus status = SendHosted(icon.hostKey, hostAction, at, cell);
-    if (status == HostSendStatus::Sent || status == HostSendStatus::Partial)
+    if (status != HostSendStatus::NotSent) {
+        if (status == HostSendStatus::Unknown)
+            Log(L"tray: hosted click outcome uncertain; skipping Explorer fallback to avoid duplicate click");
         return true;
+    }
     const tray::Action action = hostAction == tray::HostAction::Right              ? tray::Action::Right :
                                 hostAction == tray::HostAction::Double             ? tray::Action::Double :
                                 hostAction == tray::HostAction::DoubleContinuation ? tray::Action::DoubleContinuation :

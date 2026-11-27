@@ -400,10 +400,24 @@ void CheckLifecycleAndSettingsServers()
     Check(!SendLifecycleCommand(L"ping", {}, &defaultExeReply, lifecyclePipe, 500),
           "SendLifecycleCommand rejects non-Atrium.exe server when expectedExePath defaults to Atrium.exe");
 
+    LifecycleReply pidWithBadExeReply;
+    Check(!SendLifecycleCommand(L"ping", {}, &pidWithBadExeReply, lifecyclePipe, 500, selfPid, L"C:\\invalid\\NotAtrium.exe"),
+          "SendLifecycleCommand rejects matching expectedPid when expectedExePath mismatches");
+
+    LifecycleReply pidWithDefaultExeReply;
+    Check(!SendLifecycleCommand(L"ping", {}, &pidWithDefaultExeReply, lifecyclePipe, 500, selfPid, L""),
+          "SendLifecycleCommand rejects matching expectedPid on non-Atrium.exe server when expectedExePath is empty");
+
     LifecycleReply openReply;
     Check(SendLifecycleCommand(L"open-settings", L"widgets", &openReply, lifecyclePipe, 2000, selfPid, selfExe) && openReply.ok &&
               openReply.status == L"accepted" && openedPage == L"widgets",
           "LifecycleServer open-settings dispatches page");
+
+    LifecycleReply zeroTimeoutReply;
+    const int notifyBeforeZeroTimeout = notifyUpdateCount.load();
+    Check(!SendLifecycleCommand(L"notify-update-ready", {}, &zeroTimeoutReply, lifecyclePipe, 0, selfPid, selfExe) &&
+              notifyUpdateCount.load() == notifyBeforeZeroTimeout,
+          "SendLifecycleCommand with timeoutMs=0 fails cleanly without sending request to ready server");
 
     LifecycleReply notifyReply;
     Check(SendLifecycleCommand(L"notify-update-ready", {}, &notifyReply, lifecyclePipe, 2000, selfPid, selfExe) && notifyReply.ok &&

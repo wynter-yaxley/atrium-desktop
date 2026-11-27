@@ -81,17 +81,19 @@ bool SignalOtherOpenSettings(HWND other)
     const DWORD err = other ? GetLastError() : ERROR_ACCESS_DENIED;
     if (other && err != ERROR_ACCESS_DENIED)
         return false;
-    const DWORD expectedPid = SameExecutableWindow(other) ? VerifiedAtriumWindowPid(other) : 0;
+    const std::wstring selfExe = ModulePath();
+    const bool sameOrUnknown = !other || SameExecutableWindow(other, selfExe);
+    const DWORD expectedPid = (other && sameOrUnknown) ? VerifiedAtriumWindowPid(other) : 0;
     LifecycleReply reply;
-    return SendLifecycleCommand(L"open-settings", {}, &reply, {}, 2000, expectedPid) && reply.ok;
+    return SendLifecycleCommand(L"open-settings", {}, &reply, {}, 2000, expectedPid, sameOrUnknown ? selfExe : L"") && reply.ok;
 }
 
-bool QuitOtherInstance(HWND other, DWORD timeoutMs)
+bool QuitOtherInstance(HWND other, DWORD timeoutMs, const std::wstring& expectedExePath = {})
 {
     DWORD pid = VerifiedAtriumWindowPid(other);
     if (!pid) {
         LifecycleReply ping;
-        if (SendLifecycleCommand(L"ping", {}, &ping) && ping.ok)
+        if (SendLifecycleCommand(L"ping", {}, &ping, {}, 2000, 0, expectedExePath) && ping.ok)
             pid = ping.pid;
     }
     HANDLE process = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
@@ -100,7 +102,7 @@ bool QuitOtherInstance(HWND other, DWORD timeoutMs)
         const DWORD err = other ? GetLastError() : ERROR_ACCESS_DENIED;
         if (!other || err == ERROR_ACCESS_DENIED) {
             LifecycleReply reply;
-            sent = SendLifecycleCommand(L"quit", {}, &reply, {}, 2000, pid) && reply.ok;
+            sent = SendLifecycleCommand(L"quit", {}, &reply, {}, 2000, pid, expectedExePath) && reply.ok;
         }
     }
     if (!sent) {
@@ -116,7 +118,7 @@ bool QuitOtherInstance(HWND other, DWORD timeoutMs)
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         while (GetTickCount64() < deadline) {
             LifecycleReply ping;
-            if (!SendLifecycleCommand(L"ping", {}, &ping, {}, 250, pid) || !ping.ok) {
+            if (!SendLifecycleCommand(L"ping", {}, &ping, {}, 250, pid, expectedExePath) || !ping.ok) {
                 exited = true;
                 break;
             }
@@ -208,10 +210,11 @@ std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch, HINSTANC
         return launch.guardPid ? RunGuard(launch.guardPid, kHostClass, ParseGuardGenerationFromCommandLine()) : 1;
     if (!launch.exitRequested)
         return std::nullopt;
-    HWND other = FindWindowForExecutable(kHostClass);
+    const std::wstring selfExe = ModulePath();
+    HWND other = FindWindowForExecutable(kHostClass, selfExe);
     if (!other)
         return 0;
-    return QuitOtherInstance(other, 10000) ? 0 : 1;
+    return QuitOtherInstance(other, 10000, selfExe) ? 0 : 1;
 }
 
 HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
@@ -233,8 +236,9 @@ HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
             return nullptr;
         return mutex;
     }
+    const std::wstring selfExe = ModulePath();
     HWND other = FindWindowW(kHostClass, nullptr);
-    const bool same = other && SameExecutableWindow(other);
+    const bool same = other && SameExecutableWindow(other, selfExe);
     if ((same || !other) && !replace) {
         SignalOtherOpenSettings(other);
         if (mutex)
@@ -247,7 +251,7 @@ HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
         (same || !other ||
          MessageBoxW(nullptr, Tr(L"Atrium is running from another location. Quit it and use the version in this folder?"), L"Atrium",
                      MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES))
-        replaced = QuitOtherInstance(other, 15000);
+        replaced = QuitOtherInstance(other, 15000, (same || !other) ? selfExe : L"");
     if (!replaced && replace && mutex && err == ERROR_ALREADY_EXISTS) {
         const DWORD wait = WaitForSingleObject(mutex, 15000);
         if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {

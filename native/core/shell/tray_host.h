@@ -38,7 +38,7 @@
 namespace atrium {
 
 enum class TrayHostYieldReason { None, OtherProcess, RapidLoss, StartAllBack };
-enum class HostSendStatus { NotSent, Partial, Sent };
+enum class HostSendStatus { NotSent, Partial, Sent, Unknown };
 
 const wchar_t* YieldReasonName(TrayHostYieldReason reason);
 // Every Shell_TrayWnd in z-order with its program, logged when that changes (#146).

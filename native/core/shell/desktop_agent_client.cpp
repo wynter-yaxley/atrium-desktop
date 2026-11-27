@@ -181,8 +181,16 @@ HostSendStatus DesktopAgentClient::Send(const std::wstring& key, tray::HostActio
     cmd.at = at;
     cmd.cell = cell;
     AgentCommandReply reply;
-    if (!SendCommand(cmd, &reply, kCmdTimeoutMs) || !reply.ok)
+    const SendCommandOutcome outcome = SendCommand(cmd, &reply, kCmdTimeoutMs);
+    if (outcome == SendCommandOutcome::RejectedBeforeWrite)
         return HostSendStatus::NotSent;
+    if (outcome == SendCommandOutcome::FailedOrTimedOutAfterWrite)
+        return HostSendStatus::Unknown;
+    if (!reply.ok) {
+        if (reply.error == L"tray_host_disabled" || reply.error == L"invalid_command")
+            return HostSendStatus::NotSent;
+        return HostSendStatus::Unknown;
+    }
     if (higherIntegrityOut)
         *higherIntegrityOut = reply.higherIntegrity;
     return reply.sendStatus;
@@ -229,7 +237,7 @@ void DesktopAgentClient::SyncDropBars(const std::vector<AgentBarRect>& bars)
     cmd.type = AgentCommandType::SyncDropBars;
     cmd.bars = bars;
     AgentCommandReply reply;
-    if (SendCommand(cmd, &reply, kFastCmdTimeoutMs) && reply.ok) {
+    if (SendCommand(cmd, &reply, kFastCmdTimeoutMs) == SendCommandOutcome::Succeeded && reply.ok) {
         std::lock_guard lock(stateMutex_);
         if (desiredDropBars_ == bars)
             confirmedDropBars_ = bars;
@@ -244,22 +252,23 @@ void DesktopAgentClient::CloseCmdPipeLocked()
     }
 }
 
-bool DesktopAgentClient::SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs)
+DesktopAgentClient::SendCommandOutcome DesktopAgentClient::SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs)
 {
     if (replyOut)
         *replyOut = {};
     if (!quitEvent_)
-        return false;
+        return SendCommandOutcome::RejectedBeforeWrite;
     const std::string payload = SerializeAgentCommand(cmd);
     if (payload.empty() || payload.size() > kMaxAgentMessageBytes)
-        return false;
+        return SendCommandOutcome::RejectedBeforeWrite;
     const int maxAttempts = (cmd.type == AgentCommandType::TraySend) ? 1 : 2;
     const std::wstring exePath = ModulePath();
     const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
+    bool anyWriteCompleted = false;
     std::lock_guard lock(cmdPipeMutex_);
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         if (WaitForSingleObject(quitEvent_, 0) != WAIT_TIMEOUT)
-            return false;
+            break;
         if (cmdPipe_ == INVALID_HANDLE_VALUE) {
             DWORD expectedPid = 0;
             FILETIME expectedCreation{};
@@ -269,30 +278,33 @@ bool DesktopAgentClient::SendCommand(const AgentCommandMessage& cmd, AgentComman
                 expectedCreation = activeAgentCreationTime_;
             }
             if (expectedPid == 0 || exePath.empty())
-                return false;
+                break;
             HANDLE pipe = ConnectSameUserPipeClient(cmdPipeName_, timeoutMs, quitEvent_);
             if (pipe == INVALID_HANDLE_VALUE)
-                return false;
+                break;
             AgentPeerIdentity peer;
             if (!VerifyNamedPipePeerProcess(pipe, false, exePath, requireNonElevated, peer) ||
                 (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) || peer.pid != expectedPid ||
                 CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
                 Log(L"desktop agent client: rejected reconnected Cmd peer pid=%lu (expected %lu)", peer.pid, expectedPid);
                 CloseHandle(pipe);
-                return false;
+                break;
             }
             cmdPipe_ = pipe;
         }
         std::string rawReply;
         AgentCommandReply parsed;
-        if (SendPipeRequestOverlapped(cmdPipe_, payload, rawReply, timeoutMs, quitEvent_) && ValidateAndParseAgentCommandReply(rawReply, parsed)) {
+        bool writeCompleted = false;
+        const bool reqOk = SendPipeRequestOverlapped(cmdPipe_, payload, rawReply, timeoutMs, quitEvent_, &writeCompleted);
+        anyWriteCompleted = anyWriteCompleted || writeCompleted;
+        if (reqOk && ValidateAndParseAgentCommandReply(rawReply, parsed)) {
             if (replyOut)
                 *replyOut = std::move(parsed);
-            return true;
+            return SendCommandOutcome::Succeeded;
         }
         CloseCmdPipeLocked();
     }
-    return false;
+    return anyWriteCompleted ? SendCommandOutcome::FailedOrTimedOutAfterWrite : SendCommandOutcome::RejectedBeforeWrite;
 }
 
 void DesktopAgentClient::EvtServerLoop()
@@ -487,6 +499,15 @@ bool DesktopAgentClient::SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut)
         launchedHandle.attach(result.process);
     }
 
+    const DWORD launchedPid = launchedHandle ? GetProcessId(launchedHandle.get()) : 0;
+    FILETIME launchedCreation{}, exitT{}, kernelT{}, userT{};
+    const bool hasLaunchedCreation =
+        launchedHandle && launchedPid != 0 && GetProcessTimes(launchedHandle.get(), &launchedCreation, &exitT, &kernelT, &userT) != FALSE;
+    if (launchedHandle && !hasLaunchedCreation) {
+        Log(L"desktop agent client: launched process handle missing queryable identity");
+        return false;
+    }
+
     const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
     const ULONGLONG deadline = GetTickCount64() + options_.pingWaitMs;
     while (WaitForSingleObject(quitEvent_, 0) == WAIT_TIMEOUT) {
@@ -499,7 +520,9 @@ bool DesktopAgentClient::SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut)
             AgentPeerIdentity peer;
             winrt::handle verifiedProc;
             if (!VerifyNamedPipePeerProcess(pipe, false, exePath, requireNonElevated, peer, &verifiedProc) ||
-                (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId())) {
+                (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) ||
+                (launchedHandle && (!VerifyLaunchedProcessMatchesPeer(launchedHandle.get(), peer) || peer.pid != launchedPid ||
+                                    CompareFileTime(&peer.creationTime, &launchedCreation) != 0))) {
                 Log(L"desktop agent client: rejected Cmd pipe peer pid=%lu", peer.pid);
                 CloseHandle(pipe);
                 return false;
@@ -517,7 +540,8 @@ bool DesktopAgentClient::SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut)
             AgentCommandMessage ping;
             ping.type = AgentCommandType::Ping;
             AgentCommandReply reply;
-            if (SendCommand(ping, &reply, 200) && reply.ok && reply.pid == peer.pid && (generation_ == 0 || reply.generation == generation_)) {
+            if (SendCommand(ping, &reply, 200) == SendCommandOutcome::Succeeded && reply.ok && reply.pid == peer.pid &&
+                (generation_ == 0 || reply.generation == generation_)) {
                 pidOut = peer.pid;
                 procOut = std::move(verifiedProc);
                 return true;
@@ -572,7 +596,7 @@ void DesktopAgentClient::ReplayDesiredState()
         cmd.type = AgentCommandType::SyncDropBars;
         cmd.bars = bars;
         AgentCommandReply reply;
-        if (SendCommand(cmd, &reply, kFastCmdTimeoutMs) && reply.ok) {
+        if (SendCommand(cmd, &reply, kFastCmdTimeoutMs) == SendCommandOutcome::Succeeded && reply.ok) {
             std::lock_guard lock(stateMutex_);
             if (desiredDropBars_ == bars)
                 confirmedDropBars_ = std::move(bars);

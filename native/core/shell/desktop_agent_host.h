@@ -17,6 +17,8 @@ struct DesktopAgentHostOptions {
     DWORD staTaskTimeoutMs = 5000;
     HANDLE stopEvent = nullptr;
     std::function<void(const AgentCommandMessage&)> onBeforeStaCommandForTest;
+    bool failOverlaySyncForTest = false;
+    std::function<void(std::function<void()> pushSnapshot, std::function<void()> pushYield)> onReadyForTest;
 };
 
 int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride = nullptr, const wchar_t* evtPipeOverride = nullptr);

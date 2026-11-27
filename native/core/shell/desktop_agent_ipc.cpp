@@ -60,7 +60,6 @@ bool ReadBool(const json::JsonObject& o, const wchar_t* k, bool& out, bool req =
 {
     return !o.HasKey(k) ? !req : (o.GetNamedValue(k).ValueType() == json::JsonValueType::Boolean && (out = o.GetNamedBoolean(k), true));
 }
-
 bool ReadString(const json::JsonObject& o, const wchar_t* k, std::wstring& out, size_t maxLen, bool req = true)
 {
     if (!o.HasKey(k))
@@ -71,7 +70,6 @@ bool ReadString(const json::JsonObject& o, const wchar_t* k, std::wstring& out, 
     std::wstring s(v.GetString());
     return s.size() <= maxLen && (out = std::move(s), true);
 }
-
 bool ReadInt64(const json::JsonObject& o, const wchar_t* k, int64_t& out, bool req = true)
 {
     if (!o.HasKey(k))
@@ -82,16 +80,13 @@ bool ReadInt64(const json::JsonObject& o, const wchar_t* k, int64_t& out, bool r
     const double d = v.GetNumber();
     return std::isfinite(d) && std::floor(d) == d && d >= -9007199254740991.0 && d <= 9007199254740991.0 && (out = static_cast<int64_t>(d), true);
 }
-
 template<class T> bool ReadInt(const json::JsonObject& o, const wchar_t* k, T& out, bool req = true)
 {
     int64_t v = 0;
     if (!ReadInt64(o, k, v, req))
         return false;
-    if (!o.HasKey(k))
-        return true;
-    return v >= static_cast<int64_t>((std::numeric_limits<T>::min)()) && v <= static_cast<int64_t>((std::numeric_limits<T>::max)()) &&
-           (out = static_cast<T>(v), true);
+    return !o.HasKey(k) || (v >= static_cast<int64_t>((std::numeric_limits<T>::min)()) && v <= static_cast<int64_t>((std::numeric_limits<T>::max)()) &&
+                            (out = static_cast<T>(v), true));
 }
 
 bool ReadUint64(const json::JsonObject& o, const wchar_t* k, uint64_t& out, bool req = true)
@@ -118,29 +113,24 @@ bool GetNamedObj(const json::JsonObject& o, const wchar_t* k, json::JsonObject& 
 {
     return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Object && (out = o.GetNamedObject(k), true);
 }
-
 bool GetNamedArr(const json::JsonObject& o, const wchar_t* k, json::JsonArray& out)
 {
     return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Array && (out = o.GetNamedArray(k), true);
 }
-
 json::JsonObject RectToJson(const RECT& r)
 {
     json::JsonObject o;
     return SetNum(o, L"left", r.left), SetNum(o, L"top", r.top), SetNum(o, L"right", r.right), SetNum(o, L"bottom", r.bottom), o;
 }
-
 bool JsonToRect(const json::JsonObject& o, RECT& out)
 {
     return ReadInt(o, L"left", out.left) && ReadInt(o, L"top", out.top) && ReadInt(o, L"right", out.right) && ReadInt(o, L"bottom", out.bottom);
 }
-
 json::JsonObject PointToJson(POINT pt)
 {
     json::JsonObject o;
     return SetNum(o, L"x", pt.x), SetNum(o, L"y", pt.y), o;
 }
-
 bool JsonToPoint(const json::JsonObject& obj, POINT& out) { return ReadInt(obj, L"x", out.x) && ReadInt(obj, L"y", out.y); }
 
 constexpr std::array<std::pair<tray::HostAction, const wchar_t*>, 9> kActionMap{{{tray::HostAction::Left, L"left"},
@@ -152,8 +142,8 @@ constexpr std::array<std::pair<tray::HostAction, const wchar_t*>, 9> kActionMap{
                                                                                  {tray::HostAction::PopupOpen, L"popup-open"},
                                                                                  {tray::HostAction::PopupClose, L"popup-close"},
                                                                                  {tray::HostAction::Open, L"open"}}};
-constexpr std::array<std::pair<HostSendStatus, const wchar_t*>, 3> kSendStatusMap{
-    {{HostSendStatus::Sent, L"sent"}, {HostSendStatus::Partial, L"partial"}, {HostSendStatus::NotSent, L"not-sent"}}};
+constexpr std::array<std::pair<HostSendStatus, const wchar_t*>, 4> kSendStatusMap{
+    {{HostSendStatus::Sent, L"sent"}, {HostSendStatus::Partial, L"partial"}, {HostSendStatus::NotSent, L"not-sent"}, {HostSendStatus::Unknown, L"unknown"}}};
 constexpr std::array<std::pair<TrayHostYieldReason, const wchar_t*>, 4> kYieldReasonMap{{{TrayHostYieldReason::None, L"none"},
                                                                                          {TrayHostYieldReason::OtherProcess, L"other-process"},
                                                                                          {TrayHostYieldReason::RapidLoss, L"rapid-loss"},
@@ -382,17 +372,13 @@ bool VerifyPipeOwnerSameUser(HANDLE pipe, const std::wstring& expectedSid)
 {
     PSID ownerSid = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
-    if (GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &ownerSid, nullptr, nullptr, nullptr, &sd) != ERROR_SUCCESS || !ownerSid) {
-        if (sd)
-            LocalFree(sd);
-        return false;
-    }
+    if (GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &ownerSid, nullptr, nullptr, nullptr, &sd) != ERROR_SUCCESS || !ownerSid)
+        return sd ? (LocalFree(sd), false) : false;
     wchar_t* sidText = nullptr;
     const bool ownerOk = ConvertSidToStringSidW(ownerSid, &sidText) && sidText && _wcsicmp(sidText, expectedSid.c_str()) == 0;
     if (sidText)
         LocalFree(sidText);
-    LocalFree(sd);
-    return ownerOk;
+    return LocalFree(sd), ownerOk;
 }
 
 bool VerifyConnectedServerSameUser(HANDLE pipe)
@@ -684,15 +670,23 @@ bool VerifyNamedPipePeerProcess(HANDLE pipe, bool isServerSide, const std::wstri
     return true;
 }
 
+bool VerifyLaunchedProcessMatchesPeer(HANDLE launchedProc, const AgentPeerIdentity& peer)
+{
+    if (!launchedProc || launchedProc == INVALID_HANDLE_VALUE || !peer.valid || peer.pid == 0)
+        return false;
+    const DWORD launchedPid = GetProcessId(launchedProc);
+    FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
+    return launchedPid != 0 && peer.pid == launchedPid && GetProcessTimes(launchedProc, &creation, &exitTime, &kernelTime, &userTime) &&
+           CompareFileTime(&peer.creationTime, &creation) == 0;
+}
+
 bool ConnectNamedPipeOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent)
 {
     ResetEvent(ov.hEvent);
     if (ConnectNamedPipe(pipe, &ov))
         return true;
     DWORD bytes = 0, error = GetLastError();
-    if (error == ERROR_IO_PENDING)
-        return WaitOverlapped(pipe, ov, quitEvent, INFINITE, bytes, error);
-    return error == ERROR_PIPE_CONNECTED || error == ERROR_SUCCESS;
+    return error == ERROR_IO_PENDING ? WaitOverlapped(pipe, ov, quitEvent, INFINITE, bytes, error) : (error == ERROR_PIPE_CONNECTED || error == ERROR_SUCCESS);
 }
 
 bool ReadPipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeoutMs, std::string& messageOut, bool& disconnectedOut)
@@ -771,9 +765,11 @@ HANDLE ConnectSameUserPipeClient(const std::wstring& pipeName, DWORD timeoutMs, 
     }
 }
 
-bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent)
+bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent, bool* writeCompletedOut)
 {
     replyOut.clear();
+    if (writeCompletedOut)
+        *writeCompletedOut = false;
     const winrt::handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     if (pipe == INVALID_HANDLE_VALUE || request.empty() || request.size() > kMaxAgentMessageBytes || !event)
         return false;
@@ -782,6 +778,8 @@ bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::str
     ov.hEvent = event.get();
     if (!WritePipeMessageTimed(pipe, ov, quitEvent, RemainingTimeout(deadline, timeoutMs), request))
         return false;
+    if (writeCompletedOut)
+        *writeCompletedOut = true;
     bool disconnected = false;
     const DWORD remaining = RemainingTimeout(deadline, timeoutMs);
     return ReadPipeMessageTimed(pipe, ov, quitEvent, remaining > 0 ? remaining : 1, replyOut, disconnected);

@@ -191,7 +191,7 @@ void DrainPipeClient(HANDLE pipe, OVERLAPPED& ov, HANDLE quit, DWORD timeoutMs)
 bool WaitClientOverlapped(HANDLE pipe, OVERLAPPED& ov, ULONGLONG deadlineMs, DWORD& bytes, DWORD& error)
 {
     const DWORD remaining = RemainingMs(deadlineMs);
-    if (WaitForSingleObject(ov.hEvent, remaining) != WAIT_OBJECT_0) {
+    if (remaining == 0 || WaitForSingleObject(ov.hEvent, remaining) != WAIT_OBJECT_0) {
         CancelIoEx(pipe, &ov);
         GetOverlappedResult(pipe, &ov, &bytes, TRUE);
         error = ERROR_TIMEOUT;
@@ -239,9 +239,9 @@ bool VerifyPipeServerIdentity(HANDLE pipe, DWORD expectedPid, const std::wstring
         return false;
     if (_wcsicmp(server.userSid.c_str(), self.userSid.c_str()) != 0)
         return false;
-    if (!expectedExePath.empty() && !exeOk)
+    if (!exeOk)
         return false;
-    return expectedPid != 0 || exeOk;
+    return true;
 }
 
 bool VerifyImpersonatedClientSid(HANDLE pipe, const std::wstring& expectedSid)
@@ -292,6 +292,8 @@ bool ParseLifecycleReply(const std::string& raw, LifecycleReply& out)
 HANDLE OpenLifecyclePipe(const std::wstring& pipeName, ULONGLONG deadlineMs, DWORD expectedPid, const std::wstring& expectedExePath)
 {
     for (;;) {
+        if (RemainingMs(deadlineMs) == 0)
+            return INVALID_HANDLE_VALUE;
         HANDLE pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
                                   SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION | FILE_FLAG_OVERLAPPED, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) {
@@ -498,6 +500,10 @@ bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page, Lif
 
     OVERLAPPED ov{};
     ov.hEvent = event.handle;
+    if (RemainingMs(deadlineMs) == 0) {
+        CloseHandle(pipe);
+        return false;
+    }
     DWORD written = 0;
     if (!WriteFile(pipe, payload.data(), DWORD(payload.size()), &written, &ov)) {
         DWORD err = GetLastError();
@@ -514,6 +520,10 @@ bool SendLifecycleCommand(const std::wstring& cmd, const std::wstring& page, Lif
     std::string reply;
     std::string chunk(kBuffer, '\0');
     for (;;) {
+        if (RemainingMs(deadlineMs) == 0) {
+            CloseHandle(pipe);
+            return false;
+        }
         ResetEvent(ov.hEvent);
         DWORD read = 0;
         DWORD err = ERROR_SUCCESS;
