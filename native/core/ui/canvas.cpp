@@ -379,8 +379,13 @@ void Canvas::ImageQuad(const std::wstring& key, const IconImage& image, D2D1_REC
     const D2D1::Matrix4x4F m(a / w, d / w, 0, g / w, bx / ht, e / ht, 0, h / ht, 0, 0, 1, 0, p[0].x, p[0].y, 0, 1);
     const D2D1_RECT_F dest = D2D1::RectF(0, 0, w, ht);
     // A slice pours into a few pixels near the icon: bilinear alone picks single source rows and
-    // the picture breaks into stripes. Multi-sample averages four, which the fade then hides.
-    d2d_->DrawBitmap(b, &dest, opacity * alpha_, D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR, &source, &m);
+    // the picture breaks into stripes. Multi-sample averages four, which the fade then hides, but it
+    // costs several times as much; a slice still near its own size (the first frames of a pour, the
+    // last of a restore) reads fine with bilinear, so only heavy squeezes take the expensive mode.
+    const float leftH = std::abs(p[3].y - p[0].y), rightH = std::abs(p[2].y - p[1].y);
+    const float targetH = leftH > rightH ? leftH : rightH;
+    const bool squeezed = ht > targetH * 4.0f;
+    d2d_->DrawBitmap(b, &dest, opacity * alpha_, squeezed ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR : D2D1_INTERPOLATION_MODE_LINEAR, &source, &m);
 }
 
 bool Canvas::Cached(const std::wstring& key) const
