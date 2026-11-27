@@ -478,6 +478,7 @@ void InitializeSubsystems(HINSTANCE instance, Settings& settings)
         });
     };
     g_app.genie = std::make_unique<GenieMinimize>(instance, GenieIconTarget, [](HWND window) { return g_app.stage && g_app.stage->OwnsMinimize(window); });
+    g_app.genie->SetHardwareHost(g_app.bar.get());
     TaskModel::SetWindowSteps([](HWND w, std::function<void()> step) { return g_app.genie && g_app.genie->Minimize(w, std::move(step)); },
                               [](HWND w, std::function<void()> step) { return g_app.genie && g_app.genie->Restore(w, std::move(step)); });
     g_app.status = std::make_unique<SystemStatusReader>(g_app.host, WM_STATUS, WM_VOLUME);
@@ -602,8 +603,10 @@ void ShutdownApp(HANDLE mutex, std::thread& startupThread)
         g_app.chrome->RestoreForExit();
     g_app.stage->RestoreAll();
     g_app.stage->SignalSnapshotStop();
-    if (g_app.genie)
+    if (g_app.genie) {
+        g_app.genie->SetHardwareHost(nullptr);
         g_app.genie->SignalSnapshotStop();
+    }
     g_app.winKey.reset(), g_app.imeWatcher.reset(), g_app.status.reset();
     g_app.preview->Close();
     std::vector<Bar*> stopBars;

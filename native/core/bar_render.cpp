@@ -225,6 +225,33 @@ struct BarRender {
         ++stats.snapCopies;
     }
 
+    void CopyLatestGenieScene()
+    {
+        const uint64_t seq = bar.genieSeq_.load(std::memory_order_acquire);
+        if (seq == seenGenieSeq)
+            return;
+        std::lock_guard g(bar.genieLock_);
+        genieSnap = bar.genieScene_;
+        seenGenieSeq = genieSnap.seq;
+    }
+
+    bool RenderGenieStep(GenieRenderer& genieRenderer, Bar::SessionEnd& stop)
+    {
+        CopyLatestGenieScene();
+        const GenieRenderer::RenderResult gr = genieRenderer.Render(genieSnap, ClockMs(), [&](uint64_t flightId, double /*nowMs*/, bool pourFinished) {
+            if (genieSnap.overlayHwnd) {
+                const LPARAM lParam = static_cast<LPARAM>((genieSnap.epoch << 1) | (pourFinished ? 1ULL : 0ULL));
+                PostMessageW(genieSnap.overlayHwnd, WM_GENIE_FRAME_PRESENTED, static_cast<WPARAM>(flightId), lParam);
+            }
+        });
+        genieActive = gr.active;
+        if (gr.status == GenieRenderer::RenderStatus::DeviceLost) {
+            stop = Bar::SessionEnd::Retry;
+            return false;
+        }
+        return true;
+    }
+
     Bar::SessionEnd WaitForInitialSnapshot()
     {
         HANDLE first[] = {bar.quit_, bar.wake_};
@@ -339,8 +366,8 @@ struct BarRender {
         return true;
     }
 
-    bool RenderHiddenSessionStep(const Gpu& gpu, GlassRenderer& renderer, BackdropSource& capture, PanelGlassHost& panelHost, ID3D11Texture2D* frame,
-                                 bool needScreen, LARGE_INTEGER t0, Bar::SessionEnd& stop)
+    bool RenderHiddenSessionStep(const Gpu& gpu, GlassRenderer& renderer, BackdropSource& capture, PanelGlassHost& panelHost, GenieRenderer& genieRenderer,
+                                 ID3D11Texture2D* frame, bool needScreen, LARGE_INTEGER t0, Bar::SessionEnd& stop)
     {
         bar.capturePolicy_.ResetBlackTimer();
         // Retire the bar's reads even while hidden. Otherwise its last pending
@@ -375,6 +402,8 @@ struct BarRender {
             stop = ToSessionEnd(pr.status);
             return false;
         }
+        if (!RenderGenieStep(genieRenderer, stop))
+            return false;
         if (DeviceLost(gpu, L"hidden")) {
             stop = Bar::SessionEnd::Retry;
             return false;
@@ -509,11 +538,11 @@ struct BarRender {
         return true;
     }
 
-    bool StepFrame(const Gpu& gpu, BackdropSource& capture, GlassRenderer& renderer, BarPainter& painter, PanelGlassHost& panelHost, const HANDLE* handles,
-                   bool& pendingSnap, Bar::SessionEnd& stop)
+    bool StepFrame(const Gpu& gpu, BackdropSource& capture, GlassRenderer& renderer, BarPainter& painter, PanelGlassHost& panelHost,
+                   GenieRenderer& genieRenderer, const HANDLE* handles, bool& pendingSnap, Bar::SessionEnd& stop)
     {
         const bool owed = barOwed || owedBody || owedMusic || panelHost.InkDue() || panelHost.AnyOwed();
-        const bool paced = animating || panelsMoving || owed;
+        const bool paced = animating || panelsMoving || owed || genieActive;
         const bool readback = renderer.ReadbackPending() || panelHost.AnyReadbackPending();
         const bool pollCapture = (!paused && capture.RequiresPolling()) || panelHost.AnyCaptureRequiresPolling();
         if (WaitNextRenderTick(paced, readback, anyScreenPaused, pollCapture, snap.settings.showClock, snap.settings.showClockSeconds, pendingSnap, handles,
@@ -550,7 +579,7 @@ struct BarRender {
         if (ProbeCaptureRecovery(gpu, needPrimaryScreen, capture.KeepsOwnWindowsOut(), GetTickCount64(), stop))
             return false;
         if (!snap.visible)
-            return RenderHiddenSessionStep(gpu, renderer, capture, panelHost, frame, needPrimaryScreen, t0, stop);
+            return RenderHiddenSessionStep(gpu, renderer, capture, panelHost, genieRenderer, frame, needPrimaryScreen, t0, stop);
         if (wasHidden) {
             wasHidden = false;
             readyStalledSinceMs = 0;
@@ -596,6 +625,8 @@ struct BarRender {
             stop = Bar::SessionEnd::Retry;
             return false;
         }
+        if (!RenderGenieStep(genieRenderer, stop))
+            return false;
         return true;
     }
 
@@ -620,11 +651,12 @@ struct BarRender {
             gpu, captureMonitor, bar.wake_, bar.frame_, remote, bar.debugCapturable_, capture->KeepsOwnWindowsOut(),
             [this](const Gpu& g, HWND hwnd, int width, int height, bool desktop) { return bar.TryCreatePanelGlass(g, hwnd, width, height, desktop); },
             [this](bool visible) { return bar.ShowOwnWindowsToCapture(visible); });
+        GenieRenderer genieRenderer(gpu);
         Log(L"render: started on %s, window %ldx%ld", gpu.adapterName.c_str(), snap.window.right - snap.window.left, snap.window.bottom - snap.window.top);
 
         HANDLE handles[] = {bar.quit_, bar.wake_, bar.frame_};
         bool pendingSnap = !snap.visible;
-        while (StepFrame(gpu, *capture, renderer, painter, panelHost, handles, pendingSnap, stop)) {}
+        while (StepFrame(gpu, *capture, renderer, painter, panelHost, genieRenderer, handles, pendingSnap, stop)) {}
         return stop;
     }
 
@@ -650,6 +682,9 @@ struct BarRender {
     RECT backdropAt{};
     bool missedFrame = false;
     bool panelsMoving = false, barOwed = false, paused = false, anyScreenPaused = false, wasHidden = false;
+    bool genieActive = false;
+    GenieSceneSnapshot genieSnap;
+    uint64_t seenGenieSeq = 0;
     bool wasGlass = false, wasBody = false, wasMusic = false;
     bool owedBody = false, owedMusic = false, pendingBackdropDirty = false;
     double readyStalledSinceMs = 0;

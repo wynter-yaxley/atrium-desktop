@@ -19,6 +19,7 @@
 #include "near_hover.h"
 #include "render/bar_painter.h"
 #include "render/capture_policy.h"
+#include "render/genie_renderer.h"
 #include "render/glass_panel.h"
 #include "settings.h"
 #include "shell/task_model.h"
@@ -47,7 +48,7 @@ class Surface;
 // Every Atrium window's capture exclusion again (remote-control mode changed). UI thread.
 void RefreshCaptureExclusion();
 
-class Bar : public GlassHost {
+class Bar : public GlassHost, public GenieHost {
 public:
     // debugCapturable: development only. Leaves the bar visible to screen capture
     // and freezes the backdrop after the first frame so the glass never samples
@@ -107,6 +108,10 @@ public:
     bool Seen() const { return visible_ && !tucked_; } // on screen, not tucked away
     // Glass layers of popup windows (GlassHost).
     void SetPanel(const GlassPanel& panel) override;
+    // Hardware Genie overlay (UI thread).
+    void SetGenieOverlay(HWND hwnd, uint64_t epoch) override;
+    void SubmitGenieFlights(GenieSceneSnapshot scene) override;
+    void ClearGenieFlights() override;
     // Signals the render thread to stop without waiting.
     void SignalStopRendering();
     // Waits (at most `timeoutMs`) for a signaled render thread while pumping UI messages.
@@ -258,6 +263,7 @@ private:
     std::unique_ptr<GlassRenderer> TryCreatePanelGlass(const Gpu& gpu, HWND hwnd, int width, int height, bool desktop) const;
     void RenderThread();
     SessionEnd RenderSession();
+    void NotifyGenieDeviceLost();
     void SetRegion(bool extended); // input region: the shape, plus the room above it while magnified
     static void CALLBACK WinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD thread, DWORD time);
     void GuardStacking(const wchar_t* why);
@@ -373,6 +379,11 @@ private:
     std::mutex lock_;
     Snapshot snapshot_;
     std::atomic<uint64_t> publishSeq_{0};
+    std::mutex genieLock_;
+    GenieSceneSnapshot genieScene_;
+    std::atomic<uint64_t> genieSeq_{0};
+    HWND genieOverlay_ = nullptr;
+    uint64_t genieEpoch_ = 0;
     HANDLE wake_ = nullptr;  // snapshot changed
     HANDLE quit_ = nullptr;
     HANDLE frame_ = nullptr; // a capture frame arrived

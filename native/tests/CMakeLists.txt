@@ -229,6 +229,10 @@ add_executable(genie_quad_tests genie_quad.cpp)
 target_link_libraries(genie_quad_tests PRIVATE atrium_core_lib)
 add_test(NAME genie_quad COMMAND genie_quad_tests)
 
+add_executable(genie_mesh_tests genie_mesh.cpp)
+target_link_libraries(genie_mesh_tests PRIVATE atrium_core_lib)
+add_test(NAME genie_mesh COMMAND genie_mesh_tests)
+
 add_executable(privilege_lifecycle_tests privilege_lifecycle.cpp)
 target_link_libraries(privilege_lifecycle_tests PRIVATE atrium_core_lib)
 add_test(NAME privilege_lifecycle COMMAND privilege_lifecycle_tests)

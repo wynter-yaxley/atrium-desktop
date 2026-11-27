@@ -302,7 +302,119 @@ WindowPicture Capture(HWND window, int maxWidth, int maxHeight, float radius, in
     return {};
 }
 
+bool SameFileTime(FILETIME a, FILETIME b) { return a.dwLowDateTime == b.dwLowDateTime && a.dwHighDateTime == b.dwHighDateTime; }
+
 } // namespace
+
+bool QueryWindowSnapshotKey(HWND window, uint64_t generation, WindowSnapshotKey& out)
+{
+    out = {};
+    if (!window || !IsWindow(window))
+        return false;
+    DWORD pid = 0;
+    if (GetWindowThreadProcessId(window, &pid) == 0 || pid == 0)
+        return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc)
+        return false;
+    FILETIME creation{};
+    FILETIME exitTime{};
+    FILETIME kernel{};
+    FILETIME user{};
+    const bool gotTimes = GetProcessTimes(proc, &creation, &exitTime, &kernel, &user) != FALSE;
+    CloseHandle(proc);
+    if (!gotTimes)
+        return false;
+    out = WindowSnapshotKey{window, pid, creation, generation};
+    return true;
+}
+
+WindowPictureCache::WindowPictureCache(size_t maxBytes) : maxBytes_(maxBytes) {}
+
+void WindowPictureCache::Put(const WindowSnapshotKey& key, const RECT& frame, std::shared_ptr<const WindowPicture> picture)
+{
+    if (!key.window || !picture || !picture->ok)
+        return;
+    Erase(key.window);
+    if (maxBytes_ == 0)
+        return;
+    const size_t bytes = picture->image.ByteSize() + picture->shadow.ByteSize();
+    Entry entry;
+    entry.key = key;
+    entry.frame = frame;
+    entry.picture = std::move(picture);
+    entry.byteSize = bytes;
+    entry.lastUsedSeq = ++nextSeq_;
+    totalBytes_ += bytes;
+    entries_.emplace(key.window, std::move(entry));
+    EvictToBudget();
+}
+
+const WindowPictureCache::Entry* WindowPictureCache::Find(HWND window, DWORD pid, FILETIME creationTime, uint64_t minGeneration)
+{
+    const auto it = entries_.find(window);
+    if (it == entries_.end())
+        return nullptr;
+    if (it->second.key.pid != pid || !SameFileTime(it->second.key.creationTime, creationTime)) {
+        totalBytes_ -= it->second.byteSize;
+        entries_.erase(it);
+        return nullptr;
+    }
+    if (it->second.key.generation < minGeneration)
+        return nullptr;
+    it->second.lastUsedSeq = ++nextSeq_;
+    return &it->second;
+}
+
+bool WindowPictureCache::Touch(HWND window, DWORD pid, FILETIME creationTime)
+{
+    const auto it = entries_.find(window);
+    if (it == entries_.end())
+        return false;
+    if (it->second.key.pid != pid || !SameFileTime(it->second.key.creationTime, creationTime)) {
+        totalBytes_ -= it->second.byteSize;
+        entries_.erase(it);
+        return false;
+    }
+    it->second.lastUsedSeq = ++nextSeq_;
+    return true;
+}
+
+bool WindowPictureCache::Erase(HWND window)
+{
+    const auto it = entries_.find(window);
+    if (it == entries_.end())
+        return false;
+    totalBytes_ -= it->second.byteSize;
+    entries_.erase(it);
+    return true;
+}
+
+void WindowPictureCache::Clear()
+{
+    entries_.clear();
+    totalBytes_ = 0;
+}
+
+void WindowPictureCache::SetMaxBytes(size_t maxBytes)
+{
+    maxBytes_ = maxBytes;
+    EvictToBudget();
+}
+
+void WindowPictureCache::EvictToBudget()
+{
+    while (totalBytes_ > maxBytes_ && !entries_.empty()) {
+        if (maxBytes_ > 0 && entries_.size() == 1)
+            break;
+        auto lru = entries_.begin();
+        for (auto it = std::next(entries_.begin()); it != entries_.end(); ++it)
+            if (it->second.lastUsedSeq < lru->second.lastUsedSeq)
+                lru = it;
+        totalBytes_ -= lru->second.byteSize;
+        entries_.erase(lru);
+    }
+}
 
 WindowPicture Smaller(const WindowPicture& picture, int largeMax)
 {

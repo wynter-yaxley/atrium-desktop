@@ -24,6 +24,8 @@ atrium_shader(glass.hlsl ps_5_0 PS g_GlassPS glass_ps.h)
 atrium_shader(glass.hlsl ps_5_0 PSBasic g_GlassBasicPS glass_basic_ps.h)
 atrium_shader(compare.hlsl cs_5_0 CS g_CompareCS compare_cs.h)
 atrium_shader(backdrop_edge.hlsl ps_5_0 PS g_BackdropEdgePS backdrop_edge_ps.h)
+atrium_shader(genie.hlsl vs_5_0 VS g_GenieVS genie_vs.h)
+atrium_shader(genie.hlsl ps_5_0 PS g_GeniePS genie_ps.h)
 add_custom_target(atrium_shaders DEPENDS ${shader_headers})
 
 add_library(atrium_core_lib STATIC
@@ -159,6 +161,7 @@ add_library(atrium_core_lib STATIC
     render/window_capture.cpp
     render/desktop_backdrop.cpp
     render/desktop_wallpaper.cpp
+    render/genie_renderer.cpp
     render/glass_renderer.cpp
     render/glass_panel.cpp
     render/panel_glass_host.cpp

@@ -35,7 +35,7 @@ constexpr wchar_t kInputClass[] = L"AtriumBarInput";
 std::map<HWINEVENTHOOK, Bar*> g_guards; // each display has its own stacking guard
 std::atomic<uint64_t> g_nextDropBarId{1};
 struct CaptureWindows {
-    HWND visual, input;
+    HWND visual, input, genieOverlay;
     bool visible;
 };
 std::map<Bar*, CaptureWindows> g_capturePolicies; // UI-thread only
@@ -47,6 +47,8 @@ void ApplyCapturePolicies()
     for (const auto& [bar, windows] : g_capturePolicies) {
         SetCaptureExclusion(windows.visual, visible);
         SetCaptureExclusion(windows.input, visible);
+        if (windows.genieOverlay)
+            SetCaptureExclusion(windows.genieOverlay, visible);
     }
     Surface::SetCaptureVisible(visible);
 }
@@ -111,7 +113,7 @@ Bar::Bar(HINSTANCE instance, bool debugCapturable, std::wstring display)
         Log(L"bar: --debug-capturable, Atrium shows in screenshots (with Windows.Graphics.Capture, the backdrop freezes after the first frame)");
     SetCaptureExclusion(visual_, captureVisible_);
     SetCaptureExclusion(input_, captureVisible_);
-    g_capturePolicies[this] = {visual_, input_, debugCapturable_};
+    g_capturePolicies[this] = {visual_, input_, nullptr, debugCapturable_};
     ApplyCapturePolicies();
 
     // A compact Dock-style label, using the same material and adaptive ink as
@@ -481,6 +483,70 @@ void Bar::SetPanel(const GlassPanel& panel)
     Publish(false);
 }
 
+void Bar::SetGenieOverlay(HWND hwnd, uint64_t epoch)
+{
+    {
+        std::lock_guard g(genieLock_);
+        genieOverlay_ = hwnd;
+        genieEpoch_ = epoch;
+        genieScene_.overlayHwnd = hwnd;
+        genieScene_.epoch = epoch;
+        ++genieScene_.seq;
+        genieSeq_.store(genieScene_.seq, std::memory_order_release);
+    }
+    if (const auto it = g_capturePolicies.find(this); it != g_capturePolicies.end()) {
+        it->second.genieOverlay = hwnd;
+        ApplyCapturePolicies();
+    }
+    WakeRender();
+}
+
+void Bar::SubmitGenieFlights(GenieSceneSnapshot scene)
+{
+    {
+        std::lock_guard g(genieLock_);
+        scene.seq = genieScene_.seq + 1;
+        if (!scene.overlayHwnd)
+            scene.overlayHwnd = genieOverlay_;
+        if (scene.epoch == 0)
+            scene.epoch = genieEpoch_;
+        genieScene_ = std::move(scene);
+        genieSeq_.store(genieScene_.seq, std::memory_order_release);
+    }
+    WakeRender();
+}
+
+void Bar::ClearGenieFlights()
+{
+    {
+        std::lock_guard g(genieLock_);
+        genieScene_.flights.clear();
+        genieScene_.overlayBounds = {};
+        genieScene_.overlayHwnd = nullptr;
+        ++genieScene_.seq;
+        genieSeq_.store(genieScene_.seq, std::memory_order_release);
+    }
+    WakeRender();
+}
+
+void Bar::NotifyGenieDeviceLost()
+{
+    HWND hwnd = nullptr;
+    uint64_t epoch = 0;
+    bool hadFlights = false;
+    {
+        std::lock_guard g(genieLock_);
+        hwnd = genieOverlay_;
+        epoch = genieEpoch_;
+        hadFlights = !genieScene_.flights.empty();
+        genieScene_.flights.clear();
+        ++genieScene_.seq;
+        genieSeq_.store(genieScene_.seq, std::memory_order_release);
+    }
+    if (hwnd && hadFlights)
+        PostMessageW(hwnd, WM_GENIE_DEVICE_LOST, static_cast<WPARAM>(epoch), 0);
+}
+
 void CALLBACK Bar::WinEvent(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
 {
     auto found = g_guards.find(hook);
@@ -696,6 +762,8 @@ void Bar::RenderThread()
         } catch (const winrt::hresult_error& e) {
             Log(L"render: 0x%08X %s; rebuilding in 1 s", static_cast<unsigned>(e.code()), e.message().c_str());
         }
+        if (end == SessionEnd::Retry)
+            NotifyGenieDeviceLost();
         if (end == SessionEnd::Exit || (end == SessionEnd::Retry && WaitForSingleObject(quit_, 1000) != WAIT_TIMEOUT))
             break;
     }

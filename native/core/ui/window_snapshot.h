@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -43,6 +44,51 @@ WindowPicture Smaller(const WindowPicture& picture, int largeMax);
 // Builds a premultiplied rounded snapshot from BGRA pixels (`sw` x `sh`, byte `stride`)
 // at size `tw` x `th`, preserving legacy area-average math without full-image temp buffers.
 WindowPicture BuildWindowPictureFromBgra(const uint8_t* src, int sw, int sh, int stride, int tw, int th, float radius, bool shadow = true);
+
+struct WindowSnapshotKey {
+    HWND window = nullptr;
+    DWORD pid = 0;
+    FILETIME creationTime{};
+    uint64_t generation = 0;
+};
+
+// Queries the owning process PID and creation time for `window` to guard against recycled HWND reuse.
+bool QueryWindowSnapshotKey(HWND window, uint64_t generation, WindowSnapshotKey& out);
+
+// Bounded-byte LRU cache of large window snapshots keyed by HWND, PID, and process creation time.
+class WindowPictureCache {
+public:
+    static constexpr size_t kDefaultMaxBytes = 64ULL * 1024ULL * 1024ULL;
+
+    struct Entry {
+        WindowSnapshotKey key;
+        RECT frame{};
+        std::shared_ptr<const WindowPicture> picture;
+        size_t byteSize = 0;
+        uint64_t lastUsedSeq = 0;
+    };
+
+    explicit WindowPictureCache(size_t maxBytes = kDefaultMaxBytes);
+
+    void Put(const WindowSnapshotKey& key, const RECT& frame, std::shared_ptr<const WindowPicture> picture);
+    const Entry* Find(HWND window, DWORD pid, FILETIME creationTime, uint64_t minGeneration = 0);
+    bool Touch(HWND window, DWORD pid, FILETIME creationTime);
+    bool Erase(HWND window);
+    void Clear();
+
+    size_t TotalBytes() const { return totalBytes_; }
+    size_t Count() const { return entries_.size(); }
+    size_t MaxBytes() const { return maxBytes_; }
+    void SetMaxBytes(size_t maxBytes);
+
+private:
+    void EvictToBudget();
+
+    size_t maxBytes_ = kDefaultMaxBytes;
+    size_t totalBytes_ = 0;
+    uint64_t nextSeq_ = 0;
+    std::unordered_map<HWND, Entry> entries_;
+};
 
 class WindowSnapshots {
 public:

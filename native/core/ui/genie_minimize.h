@@ -10,11 +10,14 @@
 // is there as the window goes. Windows Stage Manager flies itself are left to it.
 #pragma once
 
+#include "render/genie_mesh.h"
+#include "render/genie_renderer.h"
 #include "ui/surface.h"
 #include "ui/window_snapshot.h"
 
 #include <windows.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -110,6 +113,7 @@ public:
     GenieMinimize(const GenieMinimize&) = delete;
     GenieMinimize& operator=(const GenieMinimize&) = delete;
 
+    void SetHardwareHost(GenieHost* host);
     void SetEnabled(bool on);
     void Minimizing(HWND window); // EVENT_SYSTEM_MINIMIZESTART
     // The bar's click (TaskModel::SetWindowSteps): `minimize` runs once a fresh picture of the window is at
@@ -120,10 +124,16 @@ public:
     bool WaitSnapshotStop(DWORD timeoutMs) const { return snapshots_.WaitStop(timeoutMs); }
 
 private:
-    struct Picture {
-        std::shared_ptr<const WindowPicture> large;
+    struct PictureMeta {
+        WindowSnapshotKey key;
         ULONGLONG taken = 0; // asked for or taken
         RECT frame{};        // where the window was, screen px
+        uint64_t pictureId = 0;
+    };
+    struct CachedPictureHit {
+        std::shared_ptr<const WindowPicture> picture;
+        RECT frame{};
+        uint64_t pictureId = 0;
     };
     struct Flight {
         std::shared_ptr<const WindowPicture> picture;
@@ -135,22 +145,52 @@ private:
         bool restoreDue = false;
         bool restoreTransitions = false;
     };
+    struct HardwareFlight {
+        uint64_t id = 0;
+        uint64_t pictureId = 0;
+        std::shared_ptr<const WindowPicture> picture;
+        RECT from{}, to{};
+        HWND window = nullptr;
+        bool isRestore = false;
+        bool restoreTransitions = false;
+        bool holdPrimed = false;
+        double phaseStartMs = 0.0;
+    };
+
+    static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    void EnsureOverlayWindow();
+    void DestroyOverlayWindow();
     void Watch();                                              // kWatchTimer: the window in front, its picture, its animations
     void Release(HWND window, bool restoreTransitions = true); // its own animations back (unless another owner took it)
     void Hold(HWND window);                                    // its own animations off
     void AcquireTransitions(HWND window);
     void ReleaseTransitions(HWND window, bool restoreAttribute);
+    std::optional<CachedPictureHit> LookupCachedPicture(HWND window);
+    bool HasActiveHardwareMinimize(HWND window) const;
     RECT FlightBounds(const RECT& fallback) const;
+    RECT HardwareFlightBounds() const;
     void Arm(const RECT& frame); // the layer on the flights' monitor(s), empty, for a while
     void Shutdown();
     void Launch(Flight f);
+    void LaunchHardwareFlight(HWND window, const CachedPictureHit& hit, const RECT& to, std::function<void()> cb, bool isRestore, bool waitForCover);
+    PictureMeta& EnsureProcessMeta(HWND window, const WindowSnapshotKey& key);
+    std::vector<std::function<void()>> DrainHardwareFlights();
+    void PublishHardwareFlights();
+    void TickHardwareFlights(double nowMs);
+    void OnHardwareFramePresented(uint64_t flightId, uint64_t epoch, bool pourFinished);
+    void OnHardwareDeviceLost(uint64_t epoch);
+    void CancelHardwareFlights();
     void RunPending();            // the bar's minimize, its picture taken (or not in time)
     void RunRestores();           // flights out of the icon that have landed
     void Paint(Canvas& c);
     bool PaintOne(Canvas& c, Flight& f); // true: done
     void PaintFlight(Canvas& c, const Flight& f, float t, float alpha);
 
-    Surface surface_; // over the screen while a window pours into the bar
+    HINSTANCE instance_ = nullptr;
+    Surface surface_; // D2D fallback layer when no hardware GenieHost is attached
+    HWND hwOverlay_ = nullptr;
+    GenieHost* hardwareHost_ = nullptr;
+    uint64_t hardwareEpoch_ = 1;
     WindowSnapshots snapshots_;
     std::function<std::optional<RECT>(HWND)> target_;
     std::function<bool(HWND)> skip_;
@@ -158,8 +198,13 @@ private:
     HWINEVENTHOOK hook_ = nullptr;
     HWND front_ = nullptr, held_ = nullptr; // the window in front; the one whose animations are off
     ULONGLONG frontSince_ = 0;
-    std::unordered_map<HWND, Picture> pictures_;
+    WindowPictureCache pictureCache_;
+    std::unordered_map<HWND, PictureMeta> pictureMeta_;
+    uint64_t nextPictureGen_ = 0;
+    uint64_t nextPictureId_ = 0;
     std::vector<Flight> flights_;
+    std::vector<HardwareFlight> hwFlights_;
+    GenieFlightStateMachine stateMachine_;
     unsigned flightGen_ = 0;
     HWND pending_ = nullptr; // the bar's minimize, waiting for its picture
     std::function<void()> pendingMinimize_;
