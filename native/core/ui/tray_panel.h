@@ -15,6 +15,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace atrium {
@@ -43,8 +44,9 @@ public:
     void Open(RECT anchor, RECT bar, HWND previous);
     HWND Previous() const { return previous_; }
     void Close();
+    void YieldTopmostForPointerFallback();
     bool Visible() const { return surface_.Visible(); }
-    bool MenuSessionActive() const { return menuSession_; }
+    bool MenuSessionActive() const { return sessionMode_ != SessionMode::None; }
     ULONGLONG LastClosed() const { return lastClosed_; }
     void Refresh(); // the model has a new list
     void SetAttention(const std::vector<TaskItem>& tasks);
@@ -57,10 +59,17 @@ public:
     std::function<void()> onSystemTray; // the fallback button
 
 private:
+    enum class SessionMode { None, Menu, Hover };
+    static constexpr UINT_PTR kSettleTimer = 0x5A13, kMenuTimer = 0x5A19;
+    static constexpr UINT kSettleMs = 150, kMenuPollMs = 120, kOutsideClickMsg = WM_APP + 0x5A;
     struct Hit {
         D2D1_RECT_F rect;
         std::wstring id;
     };
+    static std::optional<size_t> IconIndex(std::wstring_view id);
+    static void FollowMenuAt(POINT at, const std::wstring& exe, DWORD preferredPid);
+    static void StopMenuFollow();
+    static bool MatchesIconProcess(DWORD pid, const TrayIcon& icon);
     void Paint(Canvas& c);
     void PaintIconCell(Canvas& c, size_t i, float plateR, int iconPx);
     void PaintFooter(Canvas& c, float w, float footTop, float divider);
@@ -69,10 +78,18 @@ private:
     void OnMouseDownMessage(POINT pt);
     void OnMouseUpMessage(UINT m, POINT pt);
     void OnOutsideMouseDown(LPARAM l);
+    void HandleDeactivate(HWND activating);
+    void HandleSettleTimer();
+    void HandleMenuSessionTimer();
+    void HandleHoverSessionTimer();
     void StartMenuSession(const TrayIcon& icon);
-    void EndMenuSession();
+    void StartHoverSession(const TrayIcon& icon, HWND popup);
+    void EndPopupSession();
+    void RestoreTopmostIfYielded();
     bool IsPointInActiveMenu(POINT screenPt) const;
+    bool IsPointInActivePopup(POINT screenPt) const;
     bool IsActiveMenuOpen() const;
+    bool IsActiveHoverPopupOpen() const;
     void Place();
     std::wstring HitAt(POINT pt) const;
     void Activate(const std::wstring& id, bool right);
@@ -110,11 +127,14 @@ private:
     float radius_ = 30;
     ULONGLONG lastClosed_ = 0;
     bool private_ = false;
-    bool menuSession_ = false;
+    SessionMode sessionMode_ = SessionMode::None;
     bool menuObserved_ = false;
+    bool hoverSettle_ = false;
+    bool yieldedTopmost_ = false;
     ULONGLONG menuSessionAt_ = 0;
     ULONGLONG panelReenterUntil_ = 0;
     DWORD menuPid_ = 0;
+    HWND hoverPopupHwnd_ = nullptr;
     std::wstring menuExe_;
     int mouseWatcherToken_ = 0;
     std::map<std::wstring, motion::Follow> hoverAnim_;

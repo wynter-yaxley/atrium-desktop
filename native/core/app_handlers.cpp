@@ -218,6 +218,11 @@ void HandleCatalogMessage(bool listChanged)
 
 void HandleTrayIconsMessage(HWND h, WPARAM w)
 {
+    if (w == 6) {
+        if (g_app.trayPanel)
+            g_app.trayPanel->YieldTopmostForPointerFallback();
+        return;
+    }
     if (w == 4 || w == 1) {
         SetTimer(h, kTrayFocusTimer, 600, nullptr);
         return;

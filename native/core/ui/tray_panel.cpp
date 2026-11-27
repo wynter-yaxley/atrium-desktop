@@ -4,16 +4,13 @@
 #include "localization.h"
 #include "log.h"
 #include "motion.h"
-#include "shell/keyboard_hook.h"
 
 #include <commctrl.h>
 #include <shellscalingapi.h>
-#include <shlwapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <cmath>
-#include <string_view>
 
 namespace atrium {
 
@@ -22,24 +19,11 @@ namespace {
 constexpr float kCell = 40, kIcon = 20, kAir = (kCell - kIcon) / 2;
 constexpr float kSplit = 14, kFooterH = 24;
 constexpr double kStageMs = 240, kStaggerMs = 14, kRippleMs = 520;
-constexpr UINT_PTR kRefreshTimer = 0x5452415A, kTipTimer = 0x5A15, kHoverTimer = 0x5A17, kClickTimer = 0x5A11, kSettleTimer = 0x5A13, kMenuTimer = 0x5A19;
-constexpr UINT kHoverMs = 50, kSettleMs = 150, kMenuPollMs = 120, kOutsideClickMsg = WM_APP + 0x5A;
+constexpr UINT_PTR kRefreshTimer = 0x5452415A, kTipTimer = 0x5A15, kHoverTimer = 0x5A17, kClickTimer = 0x5A11;
+constexpr UINT kHoverMs = 50;
 
 D2D1_COLOR_F Alpha(D2D1_COLOR_F c, float a) { return D2D1::ColorF(c.r, c.g, c.b, c.a * a); }
 bool In(const D2D1_RECT_F& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
-
-std::optional<size_t> IconIndex(std::wstring_view id)
-{
-    if (!id.starts_with(L"icon:") || id.size() == 5)
-        return std::nullopt;
-    size_t value = 0;
-    for (wchar_t ch : id.substr(5)) {
-        if (ch < L'0' || ch > L'9' || value > (SIZE_MAX - static_cast<size_t>(ch - L'0')) / 10)
-            return std::nullopt;
-        value = value * 10 + static_cast<size_t>(ch - L'0');
-    }
-    return value;
-}
 
 std::optional<size_t> FindTargetIndex(const std::vector<TrayIcon>& icons, const tray::TargetKey& key)
 {
@@ -58,202 +42,20 @@ std::optional<size_t> FindTargetIndex(const std::vector<TrayIcon>& icons, const 
     return found;
 }
 
-bool ProcessMatchesExe(DWORD pid, const std::wstring& exe)
-{
-    if (!pid || exe.empty())
-        return false;
-    bool same = false;
-    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-        wchar_t buf[32768];
-        DWORD size = DWORD(std::size(buf));
-        if (QueryFullProcessImageNameW(process, 0, buf, &size))
-            same = CompareStringOrdinal(buf, int(size), exe.c_str(), -1, TRUE) == CSTR_EQUAL;
-        CloseHandle(process);
-    }
-    return same;
-}
-
-bool IsCustomMenuStyle(HWND hwnd, const wchar_t* cls)
-{
-    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE), ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    return (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION && (ex & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) && !(ex & WS_EX_APPWINDOW) &&
-           _wcsicmp(cls, L"tooltips_class32") != 0;
-}
-
-struct MenuFollow {
-    HWINEVENTHOOK hook = nullptr;
-    POINT at{}, placed{};
-    std::wstring exe;
-    UINT_PTR timer = 0;
-    DWORD pid = 0, clickInput = 0;
-    ULONGLONG until = 0;
-    HWND menu = nullptr;
-    int moves = 0;
-} g_follow;
-
-void StopFollow()
-{
-    if (g_follow.hook)
-        UnhookWinEvent(g_follow.hook);
-    if (g_follow.timer)
-        KillTimer(nullptr, g_follow.timer);
-    g_follow.hook = nullptr, g_follow.menu = nullptr, g_follow.timer = 0, g_follow.pid = 0;
-}
-
-void CALLBACK FollowExpired(HWND, UINT, UINT_PTR timer, DWORD)
-{
-    if (timer == g_follow.timer && GetTickCount64() >= g_follow.until)
-        StopFollow();
-}
-
-POINT MenuPlace(POINT at, int w, int h)
-{
-    MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mi);
-    return tray::PlaceMenu(at, w, h, mi.rcWork);
-}
-
-bool FollowStillValid()
-{
-    if (GetTickCount64() > g_follow.until)
-        return StopFollow(), false;
-    constexpr int kKeys[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_RETURN, VK_ESCAPE, VK_SPACE};
-    const bool keyDown = std::ranges::any_of(kKeys, [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; });
-    LASTINPUTINFO input{sizeof(input)};
-    POINT cursor{};
-    const SIZE dblClick{GetSystemMetrics(SM_CXDOUBLECLK), GetSystemMetrics(SM_CYDOUBLECLK)};
-    if (!GetLastInputInfo(&input) || !GetCursorPos(&cursor) ||
-        TrayFollowCancelled(input.dwTime, g_follow.clickInput, TrayModel::LastSyntheticInput(), TrayModel::SyntheticPointerInFlight(), g_follow.at, cursor,
-                            dblClick, keyDown)) {
-        StopFollow();
-        return false;
-    }
-    return true;
-}
-
-bool FollowProcessAllowed(DWORD pid, std::wstring& path)
-{
-    if (g_follow.exe.empty())
-        return false;
-    bool elevated = true;
-    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-        wchar_t buf[32768];
-        DWORD size = DWORD(std::size(buf));
-        if (QueryFullProcessImageNameW(process, 0, buf, &size))
-            path.assign(buf, size);
-        HANDLE token = nullptr;
-        if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
-            TOKEN_ELEVATION e{};
-            DWORD got = 0;
-            if (GetTokenInformation(token, TokenElevation, &e, sizeof(e), &got))
-                elevated = e.TokenIsElevated != 0;
-            CloseHandle(token);
-        }
-        CloseHandle(process);
-    }
-    if (elevated || path.empty() || CompareStringOrdinal(path.c_str(), -1, g_follow.exe.c_str(), -1, TRUE) != CSTR_EQUAL)
-        return false;
-    return g_follow.menu || g_follow.pid == 0 || pid == g_follow.pid;
-}
-
-void AdjustMovedMenu(HWND hwnd)
-{
-    RECT r{};
-    if (hwnd != g_follow.menu || !IsWindowVisible(hwnd) || !GetWindowRect(hwnd, &r))
-        return;
-    if ((std::abs(r.left - g_follow.placed.x) > 2 || std::abs(r.top - g_follow.placed.y) > 2) && g_follow.moves < 3) {
-        const POINT p = MenuPlace(g_follow.at, r.right - r.left, r.bottom - r.top);
-        g_follow.placed = p, ++g_follow.moves;
-        SetWindowPos(hwnd, nullptr, p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        Log(L"tray: the menu went to %ld,%ld again: back to %ld,%ld", r.left, r.top, p.x, p.y);
-    }
-}
-
-void PlaceInitialFollowedMenu(HWND hwnd, DWORD pid, const wchar_t* name, const wchar_t* cls, bool nativeMenu)
-{
-    RECT r{};
-    if (GetAncestor(hwnd, GA_ROOT) != hwnd || !IsWindowVisible(hwnd) || !GetWindowRect(hwnd, &r))
-        return;
-    const int w = r.right - r.left, h = r.bottom - r.top;
-    MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(MonitorFromPoint(g_follow.at, MONITOR_DEFAULTTONEAREST), &mi);
-    if (w < 40 || h < 20 || w > (mi.rcWork.right - mi.rcWork.left) * 3 / 5 || h > (mi.rcWork.bottom - mi.rcWork.top) * 19 / 20)
-        return;
-    if (!tray::ShouldMoveFollowedMenu(r, g_follow.at, mi.rcMonitor, mi.rcWork, nativeMenu)) {
-        StopFollow();
-        return;
-    }
-    const POINT p = MenuPlace(g_follow.at, w, h);
-    if (!SetWindowPos(hwnd, nullptr, p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) {
-        Log(L"tray: %s's menu (%s) at %ld,%ld could not be moved (%lu)", name, cls, r.left, r.top, GetLastError());
-        StopFollow();
-        return;
-    }
-    Log(L"tray: %s's menu (%s) moved from %ld,%ld to %ld,%ld", name, cls, r.left, r.top, p.x, p.y);
-    g_follow.menu = hwnd, g_follow.pid = pid, g_follow.placed = p, g_follow.moves = 0, g_follow.until = GetTickCount64() + 800;
-    if (g_follow.timer)
-        KillTimer(nullptr, g_follow.timer);
-    g_follow.timer = SetTimer(nullptr, 0, 800, FollowExpired);
-    if (!g_follow.timer)
-        StopFollow();
-}
-
-void CALLBACK MenuShown(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
-{
-    if ((event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_LOCATIONCHANGE) || !FollowStillValid())
-        return;
-    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF || (!g_follow.menu && event != EVENT_OBJECT_SHOW))
-        return;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    std::wstring path;
-    if (!pid || (g_follow.menu && (hwnd != g_follow.menu || pid != g_follow.pid)) || !FollowProcessAllowed(pid, path))
-        return;
-    wchar_t cls[64]{};
-    if (!GetClassNameW(hwnd, cls, 64))
-        return;
-    const bool nativeMenu = wcscmp(cls, L"#32768") == 0;
-    if (!nativeMenu && !IsCustomMenuStyle(hwnd, cls))
-        return;
-    g_follow.menu ? AdjustMovedMenu(hwnd) : PlaceInitialFollowedMenu(hwnd, pid, PathFindFileNameW(path.c_str()), cls, nativeMenu);
-}
-
-void FollowMenu(POINT at, const std::wstring& exe, DWORD preferredPid)
-{
-    StopFollow();
-    if (exe.empty() || _wcsicmp(PathFindFileNameW(exe.c_str()), L"explorer.exe") == 0)
-        return;
-    LASTINPUTINFO input{sizeof(input)};
-    if (!GetLastInputInfo(&input))
-        return;
-    g_follow.clickInput = input.dwTime, g_follow.at = at, g_follow.exe = exe, g_follow.pid = preferredPid, g_follow.until = GetTickCount64() + 3000;
-    g_follow.hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE, nullptr, MenuShown, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (g_follow.hook)
-        g_follow.timer = SetTimer(nullptr, 0, 3000, FollowExpired);
-    if (!g_follow.timer)
-        StopFollow();
-}
-
-bool IsMenuPopupWindow(HWND root, DWORD menuPid, const std::wstring& menuExe)
-{
-    if (!root || !IsWindowVisible(root))
-        return false;
-    if (g_follow.menu && root == g_follow.menu)
-        return true;
-    wchar_t cls[64]{};
-    if (!GetClassNameW(root, cls, 64))
-        return false;
-    if (wcscmp(cls, L"#32768") == 0)
-        return true;
-    DWORD pid = 0;
-    const DWORD tid = GetWindowThreadProcessId(root, &pid);
-    if (!pid || ((!menuPid || pid != menuPid) && !ProcessMatchesExe(pid, menuExe)))
-        return false;
-    GUITHREADINFO gui{sizeof(gui)};
-    return (GetGUIThreadInfo(tid, &gui) && (gui.flags & GUI_INMENUMODE)) || IsCustomMenuStyle(root, cls);
-}
-
 } // namespace
+
+std::optional<size_t> TrayPanel::IconIndex(std::wstring_view id)
+{
+    if (!id.starts_with(L"icon:") || id.size() == 5)
+        return std::nullopt;
+    size_t value = 0;
+    for (wchar_t ch : id.substr(5)) {
+        if (ch < L'0' || ch > L'9' || value > (SIZE_MAX - static_cast<size_t>(ch - L'0')) / 10)
+            return std::nullopt;
+        value = value * 10 + static_cast<size_t>(ch - L'0');
+    }
+    return value;
+}
 
 TrayPanel::TrayPanel(HINSTANCE instance, TrayModel& model) : surface_(instance, L"Atrium Tray", true), model_(model)
 {
@@ -266,8 +68,8 @@ TrayPanel::TrayPanel(HINSTANCE instance, TrayModel& model) : surface_(instance, 
 
 TrayPanel::~TrayPanel()
 {
-    EndMenuSession();
-    StopFollow();
+    EndPopupSession();
+    StopMenuFollow();
 }
 
 float TrayPanel::Margin() const { return std::clamp(radius_ * 0.65f, 14.f, 22.f); }
@@ -298,14 +100,15 @@ void TrayPanel::Place()
 {
     RECT r = PopupRect(bar_, Size(), PopupAlign::Right);
     if (surface_.Visible())
-        surface_.Move(r, menuSession_); // do not raise the panel over an open app context menu
+        surface_.Move(r, sessionMode_ != SessionMode::None || yieldedTopmost_); // keep open popups/overflow above panel
     else
         surface_.Show(r, true, PopupOrigin(bar_, r, anchor_));
 }
 
 void TrayPanel::Open(RECT anchor, RECT bar, HWND previous)
 {
-    EndMenuSession();
+    yieldedTopmost_ = false, hoverSettle_ = false;
+    EndPopupSession();
     previous_ = previous, anchor_ = anchor, bar_ = bar;
     icons_ = model_.Icons(), columns_ = 0, columns_ = Cols();
     hover_.clear(), pressed_.clear(), hoverAnim_.clear(), openedMs_ = ClockMs();
@@ -318,7 +121,8 @@ void TrayPanel::Open(RECT anchor, RECT bar, HWND previous)
 
 void TrayPanel::Close()
 {
-    EndMenuSession();
+    yieldedTopmost_ = false, hoverSettle_ = false;
+    EndPopupSession();
     model_.Hover(nullptr);
     HideTip();
     for (UINT_PTR id : {kRefreshTimer, kClickTimer, kSettleTimer, kHoverTimer})
@@ -328,52 +132,6 @@ void TrayPanel::Close()
         return;
     surface_.Hide();
     lastClosed_ = GetTickCount64();
-}
-
-void TrayPanel::StartMenuSession(const TrayIcon& icon)
-{
-    EndMenuSession();
-    menuSession_ = true, menuObserved_ = false, menuSessionAt_ = GetTickCount64(), menuPid_ = icon.pid, menuExe_ = icon.exe;
-    if (HWND hwnd = surface_.Hwnd()) {
-        mouseWatcherToken_ = KeyboardHook::Instance().AddMouseDownWatcher(hwnd, kOutsideClickMsg);
-        SetTimer(hwnd, kMenuTimer, kMenuPollMs, nullptr);
-    }
-}
-
-void TrayPanel::EndMenuSession()
-{
-    if (mouseWatcherToken_ > 0) {
-        KeyboardHook::Instance().RemoveMouseDownWatcher(mouseWatcherToken_);
-        mouseWatcherToken_ = 0;
-    }
-    if (HWND hwnd = surface_.Hwnd())
-        KillTimer(hwnd, kMenuTimer);
-    menuSession_ = false, menuObserved_ = false, menuSessionAt_ = 0, panelReenterUntil_ = 0, menuPid_ = 0, menuExe_.clear();
-}
-
-bool TrayPanel::IsPointInActiveMenu(POINT screenPt) const
-{
-    HWND under = WindowFromPoint(screenPt);
-    HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
-    return root && (root == surface_.Hwnd() || (tip_ && root == tip_) || IsMenuPopupWindow(root, menuPid_, menuExe_));
-}
-
-bool TrayPanel::IsActiveMenuOpen() const
-{
-    if (g_follow.menu && IsWindowVisible(g_follow.menu))
-        return true;
-    struct Ctx {
-        DWORD pid;
-        const std::wstring& exe;
-        bool open = false;
-    } ctx{menuPid_, menuExe_};
-    EnumWindows(
-        [](HWND h, LPARAM param) -> BOOL {
-            auto& c = *reinterpret_cast<Ctx*>(param);
-            return IsMenuPopupWindow(h, c.pid, c.exe) ? (c.open = true, FALSE) : TRUE;
-        },
-        reinterpret_cast<LPARAM>(&ctx));
-    return ctx.open;
 }
 
 void TrayPanel::Refresh()
@@ -507,7 +265,7 @@ void TrayPanel::LeaveHover()
             return;
         }
         DWORD pid = 0;
-        if (under && GetWindowThreadProcessId(under, &pid) && pid == icons_[i].pid && pid != GetCurrentProcessId()) {
+        if (under && GetWindowThreadProcessId(under, &pid) && MatchesIconProcess(pid, icons_[i])) {
             SetTimer(surface_.Hwnd(), kHoverTimer, kHoverMs, nullptr);
             return;
         }
@@ -655,12 +413,13 @@ void TrayPanel::Activate(const std::wstring& id, bool right)
     POINT at{};
     GetCursorPos(&at);
     if (right) {
-        FollowMenu(at, selected.exe, selected.pid), lastClick_.reset();
+        FollowMenuAt(at, selected.exe, selected.pid), lastClick_.reset();
         KillTimer(surface_.Hwnd(), kClickTimer), KillTimer(surface_.Hwnd(), kSettleTimer);
+        hoverSettle_ = false;
         StartMenuSession(selected), model_.Click(selected, true, cell);
         return;
     }
-    EndMenuSession();
+    EndPopupSession();
     const bool second = lastClick_ && tray::SameGestureTarget(lastClick_->Target(), selected.Target()) &&
                         GetTickCount64() - lastWhen_ <= GetDoubleClickTime() && std::abs(at.x - lastAt_.x) <= GetSystemMetrics(SM_CXDOUBLECLK) / 2 &&
                         std::abs(at.y - lastAt_.y) <= GetSystemMetrics(SM_CYDOUBLECLK) / 2;
@@ -677,36 +436,19 @@ bool TrayPanel::OnTimerMessage(WPARAM w)
 {
     if (w == kTipTimer)
         return KillTimer(surface_.Hwnd(), kTipTimer), ShowTip(), true;
-    if (w == kSettleTimer) {
-        KillTimer(surface_.Hwnd(), kSettleTimer);
-        HWND fg = GetForegroundWindow();
-        wchar_t cls[64] = {};
-        if (fg)
-            GetClassNameW(fg, cls, 64);
-        const bool shell = !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") || !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd");
-        if (!menuSession_ && fg != surface_.Hwnd() && !shell)
-            Close();
-        return true;
-    }
+    if (w == kSettleTimer)
+        return HandleSettleTimer(), true;
     if (w == kClickTimer)
-        return KillTimer(surface_.Hwnd(), kClickTimer), lastClick_.reset(), !menuSession_ ? Close() : void(), true;
+        return KillTimer(surface_.Hwnd(), kClickTimer), lastClick_.reset(), sessionMode_ == SessionMode::None ? Close() : void(), true;
     if (w == kRefreshTimer)
         return surface_.Visible() ? model_.Refresh() : void(), true;
     if (w == kHoverTimer)
         return LeaveHover(), true;
-    if (w == kMenuTimer && menuSession_) {
-        if (IsActiveMenuOpen())
-            return menuObserved_ = true, true;
-        if (menuObserved_ || GetTickCount64() - menuSessionAt_ >= 3500) {
-            if (GetForegroundWindow() == surface_.Hwnd()) {
-                EndMenuSession();
-            } else if (menuObserved_ && GetTickCount64() < panelReenterUntil_) {
-                SetForegroundWindow(surface_.Hwnd());
-                EndMenuSession();
-            } else {
-                Close();
-            }
-        }
+    if (w == kMenuTimer && sessionMode_ != SessionMode::None) {
+        if (sessionMode_ == SessionMode::Menu)
+            HandleMenuSessionTimer();
+        else
+            HandleHoverSessionTimer();
         return true;
     }
     return false;
@@ -736,20 +478,6 @@ void TrayPanel::OnMouseUpMessage(UINT m, POINT pt)
     pressedIcon_.reset();
 }
 
-void TrayPanel::OnOutsideMouseDown(LPARAM l)
-{
-    if (!surface_.Visible() || !menuSession_)
-        return;
-    const POINT screenPt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-    const RECT panelRect = surface_.Rect();
-    if (PtInRect(&panelRect, screenPt)) {
-        panelReenterUntil_ = GetTickCount64() + 300;
-        return;
-    }
-    if (!IsPointInActiveMenu(screenPt))
-        Close();
-}
-
 bool TrayPanel::Message(UINT m, WPARAM w, LPARAM l, LRESULT& result)
 {
     (void)result;
@@ -760,14 +488,11 @@ bool TrayPanel::Message(UINT m, WPARAM w, LPARAM l, LRESULT& result)
     case WM_TIMER: return OnTimerMessage(w);
     case WM_ACTIVATE:
         if (LOWORD(w) == WA_INACTIVE && surface_.Visible()) {
-            if (!menuSession_) {
-                if (lastClick_ && GetTickCount64() - lastWhen_ <= GetDoubleClickTime())
-                    SetTimer(surface_.Hwnd(), kSettleTimer, kSettleMs, nullptr);
-                else
-                    Close();
-            }
-        } else if (LOWORD(w) != WA_INACTIVE && menuSession_) {
-            EndMenuSession();
+            HandleDeactivate(reinterpret_cast<HWND>(l));
+        } else if (LOWORD(w) != WA_INACTIVE) {
+            if (sessionMode_ != SessionMode::None)
+                EndPopupSession();
+            RestoreTopmostIfYielded();
         }
         return false;
     case WM_MOUSEMOVE:

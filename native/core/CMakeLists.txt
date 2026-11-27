@@ -105,6 +105,7 @@ add_library(atrium_core_lib STATIC
     ui/notification_paint.cpp
     ui/notification_popup.cpp
     ui/tray_panel.cpp
+    ui/tray_panel_popup.cpp
     ui/calendar_panel.cpp
     ui/control_center.cpp
     ui/control_center_paint.cpp

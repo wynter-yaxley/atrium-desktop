@@ -237,6 +237,29 @@ void TestPointerRightFallbackAndActionTarget()
     Check(!ShouldAllowExeForegroundFallback(false), "ordinary tray clicks never fall back to ForegroundExisting by exe");
     Check(ShouldAllowExeForegroundFallback(true), "Dock OpenExisting retains exe foreground wake fallback");
 }
+
+void TestRecordPidAndPopupPolicies()
+{
+    Check(RecordPid(L"uid:14288:131158:1051") == 14288, "RecordPid parses numeric PID from uid identity");
+    Check(RecordPid(L"uid:0:1:2") == 0, "RecordPid rejects zero PID");
+    Check(RecordPid(L"guid:{7120A42D-CB02-4A51-B3B5-58E36E8B14E1}") == 0, "RecordPid ignores guid identities");
+    Check(RecordPid(L"uid:abc:1:2") == 0, "RecordPid rejects non-numeric PID");
+    Check(RecordPid(L"uid:999999999999999:1:2") == 0, "RecordPid rejects overflowing PID");
+    Check(RecordPid(L"uid:42") == 0, "RecordPid rejects malformed uid without second colon");
+
+    Check(ShouldObserveUnattributedMenu(true, false, false, false), "native #32768 menu is always observed");
+    Check(ShouldObserveUnattributedMenu(false, true, true, true), "elevated access-denied popup on right-click is observed");
+    Check(!ShouldObserveUnattributedMenu(false, true, false, true), "elevated popup is ignored for non-right clicks");
+    Check(!ShouldObserveUnattributedMenu(false, true, true, false), "non-popup window is ignored even when access is denied");
+
+    const RECT work{0, 0, 3200, 1920};
+    Check(IsHoverPopupStyle(WS_POPUP, 0, false, {100, 100, 420, 480}, work), "frameless WS_POPUP hover window accepted");
+    Check(IsHoverPopupStyle(WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_TOPMOST, false, {100, 100, 500, 400}, work), "toolwindow hover popup accepted");
+    Check(IsHoverPopupStyle(WS_POPUP, 0, true, {100, 100, 300, 300}, work), "native #32768 accepted");
+    Check(!IsHoverPopupStyle(WS_POPUP | WS_MINIMIZEBOX, 0, false, {100, 100, 400, 300}, work), "window with minimize button rejected");
+    Check(!IsHoverPopupStyle(WS_POPUP, WS_EX_APPWINDOW, false, {100, 100, 400, 300}, work), "app window rejected");
+    Check(!IsHoverPopupStyle(WS_POPUP, 0, false, {0, 0, 2200, 1600}, work), "oversized window rejected as hover popup");
+}
 } // namespace
 
 int main()
@@ -247,6 +270,7 @@ int main()
     TestClassicGesture();
     TestMenuFollow();
     TestPointerRightFallbackAndActionTarget();
+    TestRecordPidAndPopupPolicies();
     if (g_failed)
         return 1;
     std::cout << "tray dispatch: all scenarios passed\n";

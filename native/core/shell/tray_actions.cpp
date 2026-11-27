@@ -263,43 +263,74 @@ struct ResponseState {
     HWND foreground = nullptr;
 };
 
-ResponseState CaptureResponse(const std::wstring& exe)
+enum class ResponseOwner { Unknown, Match, Mismatch, AccessDenied };
+
+ResponseOwner ClassifyResponsePid(DWORD pid, DWORD targetPid, const std::wstring& exe, std::map<DWORD, ResponseOwner>& owned)
+{
+    if (auto it = owned.find(pid); it != owned.end())
+        return it->second;
+    ResponseOwner owner = ResponseOwner::Mismatch;
+    if (targetPid != 0 && pid == targetPid) {
+        owner = ResponseOwner::Match;
+    } else if (!exe.empty()) {
+        if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+            wchar_t path[32768];
+            DWORD size = DWORD(std::size(path));
+            if (QueryFullProcessImageNameW(process, 0, path, &size) && _wcsicmp(path, exe.c_str()) == 0)
+                owner = ResponseOwner::Match;
+            CloseHandle(process);
+        } else if (GetLastError() == ERROR_ACCESS_DENIED) {
+            owner = ResponseOwner::AccessDenied;
+        }
+    }
+    owned.emplace(pid, owner);
+    return owner;
+}
+
+bool IsElevatedPopupCandidate(HWND hwnd, const wchar_t* cls)
+{
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    return (style & WS_POPUP) != 0 && (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) != 0 && (ex & WS_EX_APPWINDOW) == 0 &&
+           _wcsicmp(cls, L"tooltips_class32") != 0 && _wcsicmp(cls, L"Shell_TrayWnd") != 0 && _wcsicmp(cls, L"TopLevelWindowForOverflowXamlIsland") != 0;
+}
+
+ResponseState CaptureResponse(const std::wstring& exe, DWORD targetPid, tray::Action action)
 {
     ResponseState state;
-    if (exe.empty())
+    if (exe.empty() && targetPid == 0 && action != tray::Action::Right)
         return state;
     struct Context {
         const std::wstring& exe;
+        DWORD targetPid;
+        tray::Action action;
         ResponseState& state;
-        std::map<DWORD, bool> owned;
-    } ctx{exe, state, {}};
+        std::map<DWORD, ResponseOwner> owned;
+    } ctx{exe, targetPid, action, state, {}};
     EnumWindows(
         [](HWND h, LPARAM param) -> BOOL {
             auto& c = *reinterpret_cast<Context*>(param);
             if (!IsWindowVisible(h))
                 return TRUE;
+            wchar_t cls[32]{};
+            const bool nativeMenu = GetClassNameW(h, cls, 32) != 0 && wcscmp(cls, L"#32768") == 0;
+            if (nativeMenu)
+                c.state.menus.insert(h);
             DWORD pid = 0;
             const DWORD thread = GetWindowThreadProcessId(h, &pid);
-            auto [it, fresh] = c.owned.try_emplace(pid, false);
-            if (fresh) {
-                if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-                    wchar_t path[32768];
-                    DWORD size = DWORD(std::size(path));
-                    it->second = QueryFullProcessImageNameW(process, 0, path, &size) && _wcsicmp(path, c.exe.c_str()) == 0;
-                    CloseHandle(process);
-                }
-            }
-            if (!it->second)
+            const ResponseOwner owner = pid ? ClassifyResponsePid(pid, c.targetPid, c.exe, c.owned) : ResponseOwner::Mismatch;
+            if (owner != ResponseOwner::Match) {
+                if (tray::ShouldObserveUnattributedMenu(nativeMenu, owner == ResponseOwner::AccessDenied, c.action == tray::Action::Right,
+                                                        IsElevatedPopupCandidate(h, cls)))
+                    c.state.menus.insert(h);
                 return TRUE;
+            }
             c.state.visible.insert(h);
             if (GetForegroundWindow() == h)
                 c.state.foreground = h;
             GUITHREADINFO gui{sizeof(gui)};
             if (GetGUIThreadInfo(thread, &gui) && (gui.flags & GUI_INMENUMODE) && gui.hwndMenuOwner)
                 c.state.menus.insert(gui.hwndMenuOwner);
-            wchar_t cls[32]{};
-            if (GetClassNameW(h, cls, 32) && wcscmp(cls, L"#32768") == 0)
-                c.state.menus.insert(h);
             return TRUE;
         },
         reinterpret_cast<LPARAM>(&ctx));
@@ -319,7 +350,7 @@ bool ResponseChanged(const ResponseState& before, const ResponseState& after, tr
 
 bool ForegroundExisting(const std::wstring& exe, HANDLE stopEvent)
 {
-    const auto state = CaptureResponse(exe);
+    const auto state = CaptureResponse(exe, 0, tray::Action::Left);
     for (HWND h : state.visible) {
         if (GetWindow(h, GW_OWNER) || (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW))
             continue;
@@ -415,7 +446,7 @@ struct TrayPointerDesktop {
     }
 };
 
-HRESULT PointerRightClick(IUIAutomation* uia, const tray_detail::Found& target, HANDLE stopEvent)
+HRESULT PointerRightClick(IUIAutomation* uia, const tray_detail::Found& target, HANDLE stopEvent, HWND notify, UINT msg)
 {
     auto targetEl = target.element.try_as<IUIAutomationElement>();
     if (!targetEl)
@@ -423,6 +454,10 @@ HRESULT PointerRightClick(IUIAutomation* uia, const tray_detail::Found& target, 
     TaskbarClickReveal reveal;
     if (!reveal.active)
         return E_ABORT;
+    if (notify && msg) {
+        DWORD_PTR ack = 0;
+        SendMessageTimeoutW(notify, msg, 6, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 150, &ack);
+    }
     HWND opened = nullptr;
     if (!target.promoted) {
         HWND before = tray_detail::OverflowWindow();
@@ -464,11 +499,11 @@ tray::ResolvedTarget ResolveClickTarget(const TrayIcon& icon, const tray::ShellS
     return resolved;
 }
 
-bool ObserveTrayResponse(const std::wstring& exe, tray::Action action, const ResponseState& before, bool accepted, HANDLE stopEvent)
+bool ObserveTrayResponse(const std::wstring& exe, DWORD targetPid, tray::Action action, const ResponseState& before, bool accepted, HANDLE stopEvent)
 {
     const ULONGLONG until = GetTickCount64() + (!accepted ? 40 : action == tray::Action::Right ? 500 : 280);
     do {
-        if (ResponseChanged(before, CaptureResponse(exe), action))
+        if (ResponseChanged(before, CaptureResponse(exe, targetPid, action), action))
             return true;
         if (!tray_detail::WaitStep(stopEvent, 20))
             return false;
@@ -722,8 +757,9 @@ void TrayModel::RunClickJob(IUIAutomation* uia, const Job& job, const tray::Shel
     };
     tray_detail::Found* target = acquire();
     LogClickBegin(job.action, job.icon, target);
-    const auto before = CaptureResponse(job.icon.exe);
-    auto observe = [&](bool accepted) { return ObserveTrayResponse(job.icon.exe, job.action, before, accepted, stopEvent_); };
+    const DWORD targetPid = job.icon.pid ? job.icon.pid : tray::RecordPid(job.icon.recordId);
+    const auto before = CaptureResponse(job.icon.exe, targetPid, job.action);
+    auto observe = [&](bool accepted) { return ObserveTrayResponse(job.icon.exe, targetPid, job.action, before, accepted, stopEvent_); };
     auto invoke = [&](tray::Route route) { return InvokeTrayRoute(target, session, job.action, route); };
     auto result = tray::Dispatch(job.action, target && target->toolbar, invoke, observe);
     if (target && target->element && result.outcome == tray::Outcome::Unavailable && !result.attempts.empty() &&
@@ -735,7 +771,7 @@ void TrayModel::RunClickJob(IUIAutomation* uia, const Job& job, const tray::Shel
     }
     if (job.action == tray::Action::Right && target && target->element && tray::ShouldAttemptPointerRightFallback(result, target->toolbar != nullptr) &&
         session == tray_detail::ReadShellSession()) {
-        const HRESULT hr = PointerRightClick(uia, *target, stopEvent_);
+        const HRESULT hr = PointerRightClick(uia, *target, stopEvent_, notify_, msg_);
         Log(L"tray: click attempt route=pointer hr=0x%08X", unsigned(hr));
         if (hr == S_OK)
             result.outcome = observe(true) ? tray::Outcome::Observed : tray::Outcome::AcceptedUnconfirmed;

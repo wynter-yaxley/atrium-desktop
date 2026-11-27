@@ -92,7 +92,8 @@ bool ShowOverflow(IUIAutomation* uia, HANDLE stopEvent = nullptr);
 class TrayModel {
 public:
     // Posts msg: 0=list changed, 1=observed app response, 2=verified native popup,
-    // 3=needs user intervention, 4=accepted/unconfirmed (quiet), 5=explicit popup opened.
+    // 3=needs user intervention, 4=accepted/unconfirmed (quiet), 5=explicit popup opened,
+    // 6=yield tray panel topmost Z-order before physical pointer right-click fallback.
     // No HRESULT is treated as an application acknowledgement.
     TrayModel(HWND notify, UINT msg, std::function<std::vector<PinnedApp>()> appNames = {});
     ~TrayModel();
