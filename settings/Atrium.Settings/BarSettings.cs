@@ -36,6 +36,7 @@ internal sealed class BarSettings
     public double Height { get; set; } = 60;
     public double Margin { get; set; } = 10;
     public double IconSize { get; set; } = 30;
+    public double IconSpacing { get; set; } = 5;       // DIP between neighbouring icon plates (apps and right-hand entries)
     public double Magnify { get; set; } = 1.7;         // icon scale under the pointer, 1 = off
     public bool HoverRise { get; set; }               // glass follows the magnification wave (off unless chosen)
     public bool RiseNear { get; set; } = true;         // and for a pointer resting just above the bar
@@ -202,6 +203,7 @@ internal sealed class BarSettings
             ["height"] = Height,
             ["margin"] = Margin,
             ["iconSize"] = IconSize,
+            ["iconSpacing"] = IconSpacing,
             ["magnify"] = Magnify,
             ["hoverRise"] = HoverRise,
             ["riseNear"] = RiseNear,
@@ -339,6 +341,7 @@ internal sealed class BarSettings
         s.Height = Math.Clamp(Num("height", f.Height), 32, 160);
         s.Margin = Math.Clamp(Num("margin", f.Margin), 0, 400);
         s.IconSize = Math.Clamp(Num("iconSize", f.IconSize), 16, 64);
+        s.IconSpacing = Math.Clamp(Num("iconSpacing", f.IconSpacing), 2, 40);
         s.Magnify = Math.Clamp(Num("magnify", f.Magnify), 1, 2);
         s.Tint = f.Tint & 0xFFFFFFu;
         if (o?["tint"] is JsonValue t && t.TryGetValue(out string? ts) && ts is { Length: 7 } && ts[0] == '#' &&
@@ -548,8 +551,9 @@ internal sealed class BarSettings
 
     public bool SameAs(BarSettings o) =>
         SameMaterial(o) && Preset == o.Preset && CornerRadius == o.CornerRadius && Width == o.Width && Height == o.Height &&
-        Margin == o.Margin && IconSize == o.IconSize && Magnify == o.Magnify && HoverRise == o.HoverRise && RiseNear == o.RiseNear &&
-        MagnifyNear == o.MagnifyNear && NearEnter == o.NearEnter && NearLeave == o.NearLeave && AutoWidth == o.AutoWidth && ShowClock == o.ShowClock &&
+        Margin == o.Margin && IconSize == o.IconSize && IconSpacing == o.IconSpacing && Magnify == o.Magnify &&
+        HoverRise == o.HoverRise && RiseNear == o.RiseNear && MagnifyNear == o.MagnifyNear && NearEnter == o.NearEnter &&
+        NearLeave == o.NearLeave && AutoWidth == o.AutoWidth && ShowClock == o.ShowClock &&
         ShowClockSeconds == o.ShowClockSeconds &&
         ShowTray == o.ShowTray && TrayHost == o.TrayHost && StartTray == o.StartTray && StartStatus == o.StartStatus &&
         StartCentered == o.StartCentered && StartWithBar == o.StartWithBar && StartSize == o.StartSize && StartIcon == o.StartIcon &&

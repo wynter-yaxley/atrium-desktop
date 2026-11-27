@@ -38,6 +38,7 @@ struct Settings {
     double height = 60;
     double margin = 10;              // gap above the bottom of the work area
     double iconSize = 30;
+    double iconSpacing = 5;          // gap between neighbouring icon plates (bar and right-hand entries)
     double magnify = 1.7;            // dock magnification under the pointer: icon scale, 1 = off
     bool startTray = true;           // the tray's button in the start menu's capsule
     bool startStatus = true;         // the network, volume and battery buttons there

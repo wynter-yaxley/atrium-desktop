@@ -34,6 +34,7 @@
     "statusStyle": {"type": "enum", "default": "ring", "values": ["ring", "icons"], "fallback": "ring"},
     "controlModules": {"type": "stringArray", "default": ["stage"], "maxCount": 6},
     "iconSize": {"type": "number", "default": 30, "min": 16, "max": 64, "uiMin": 16, "uiMax": 64, "uiScale": 1, "sliderProp": "IconSize"},
+    "iconSpacing": {"type": "number", "default": 5, "min": 2, "max": 40, "uiMin": 2, "uiMax": 40, "uiScale": 1, "sliderProp": "IconSpacing"},
     "magnify": {"type": "number", "default": 1.7, "min": 1, "max": 2, "uiMin": 100, "uiMax": 200, "uiScale": 100, "sliderProp": "Magnify"},
     "hoverRise": {"type": "bool", "default": false},
     "riseNear": {"type": "bool", "default": true},

@@ -239,7 +239,9 @@ Bar::LayoutMetrics Bar::ComputeLayoutMetrics(const RelayoutTarget& target)
     m.barH = Px(st.height, s);
     m.icon = std::clamp(Px(st.iconSize, s), Px(12, s), m.barH - Px(16, s));
     m.plate = std::max(m.icon + Px(4, s), std::min(m.barH - Px(12, s), int(std::lround(m.icon * 1.55))));
-    m.gap = std::max(Px(4, s), int(std::lround(m.icon * 0.18)));
+    // The gap between plates is the user's (two to forty DIP); a bar with too many
+    // apps still tightens it before the plates, and only then overflows.
+    m.gap = std::max(Px(2, s), Px(st.iconSpacing, s));
     m.sepGap = Px(8, s);
     m.mag = float(std::clamp(st.magnify, 1.0, 2.0));
 
