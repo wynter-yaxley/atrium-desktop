@@ -25,11 +25,7 @@ POINT Bar::LayoutPoint(POINT client) const
     return EdgeFrame{edge_, cr}.FromArea(client);
 }
 
-RECT Bar::EdgeZone() const
-{
-    const EdgeFrame f{edge_, window_};
-    return f.ToArea(RECT{LONG(scene_.bar.left), 0, LONG(scene_.bar.right), std::max<LONG>(0, f.FromArea(monitor_).bottom)});
-}
+RECT Bar::EdgeZone() const { return BarEdgeZone(edge_, window_, monitor_, scene_.bar); }
 
 std::wstring Bar::HitTest(POINT pt) const
 {
@@ -379,11 +375,10 @@ void Bar::WatchPointer()
         return;
     }
     POINT p{};
-    GetCursorPos(&p);
-    const RECT zone = EdgeZone();
+    if (!GetCursorPos(&p))
+        return;
     if (!revealed_) {
-        // The screen's edge, along the bar.
-        if (AtDisplayEdge(edge_, p, monitor_) && PtInRect(&zone, p) && !FullScreenInFront(hmonitor_)) {
+        if (InEdgeSummonZone(edge_, p, monitor_) && !FullScreenInFront(hmonitor_)) {
             revealed_ = true;
             leftAt_ = 0;
             UpdateAutoHide();
@@ -391,7 +386,7 @@ void Bar::WatchPointer()
         return;
     }
     const ULONGLONG now = GetTickCount64();
-    if (PtInRect(&zone, p) || dragging_ || (keepShown && keepShown()) || now < summonGraceUntil_) {
+    if (InEdgeRevealZone(edge_, p, window_, monitor_, scene_.bar) || dragging_ || (keepShown && keepShown()) || now < summonGraceUntil_) {
         leftAt_ = 0;
         return;
     }

@@ -254,6 +254,11 @@ internal static class Loc
         if (Tag == "en") return;
         ApplyTo(root);
         int children = VisualTreeHelper.GetChildrenCount(root);
+        if (children == 0 && root is UserControl uc && uc is not ToggleTile && uc.Content is DependencyObject ucChild)
+        {
+            Localize(ucChild);
+            return;
+        }
         for (int i = 0; i < children; i++)
             Localize(VisualTreeHelper.GetChild(root, i));
     }
@@ -304,7 +309,7 @@ internal static class Loc
                 break;
             case ToggleTile tile:
                 tile.Title = T(tile.Title);
-                tile.Note = T(tile.Note);
+                if (!string.IsNullOrWhiteSpace(tile.Note)) tile.Note = T(tile.Note);
                 tile.SwitchName = T(tile.SwitchName);
                 break;
             case NavLabel nav:
@@ -326,7 +331,10 @@ internal static class Loc
                 break;
         }
         if (ToolTipService.GetToolTip(d) is string tip)
-            ToolTipService.SetToolTip(d, T(tip));
+        {
+            string? resolved = string.IsNullOrWhiteSpace(tip) ? null : T(tip);
+            ToolTipService.SetToolTip(d, string.IsNullOrWhiteSpace(resolved) ? null! : resolved);
+        }
         string name = AutomationProperties.GetName(d);
         if (!string.IsNullOrEmpty(name))
             AutomationProperties.SetName(d, T(name));

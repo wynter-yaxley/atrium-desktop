@@ -1,5 +1,7 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
@@ -8,6 +10,54 @@ namespace Atrium.Settings;
 
 public sealed partial class MainWindow
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorRect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo { public int Size; public MonitorRect Bounds, Work; public uint Flags; }
+
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromRect(IntPtr rect, uint flags);
+    [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW")] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool SetProp(IntPtr hwnd, string name, IntPtr data);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr RemoveProp(IntPtr hwnd, string name);
+    private delegate IntPtr SubclassProc(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, UIntPtr id, UIntPtr data);
+    [DllImport("comctl32.dll")] private static extern bool SetWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id, UIntPtr data);
+    [DllImport("comctl32.dll")] private static extern bool RemoveWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id);
+    [DllImport("comctl32.dll")] private static extern IntPtr DefSubclassProc(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam);
+    private readonly SubclassProc? _updateMessage;
+
+    private void UpdateWindowMinimumSize(uint dpi = 0, IntPtr suggestedRect = 0)
+    {
+        if (AppWindow.Presenter is not OverlappedPresenter presenter) return;
+        if (dpi == 0) dpi = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
+        double scale = (dpi > 0 ? dpi : 96) / 96.0;
+        int minWidth = (int)(980 * scale), minHeight = (int)(680 * scale);
+        int workW = 0, workH = 0;
+        if (suggestedRect != IntPtr.Zero)
+        {
+            nint monitor = MonitorFromRect(suggestedRect, 2 /* MONITOR_DEFAULTTONEAREST */);
+            var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
+            {
+                workW = info.Work.Right - info.Work.Left;
+                workH = info.Work.Bottom - info.Work.Top;
+            }
+        }
+        else if (DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary) is { } area)
+        {
+            workW = area.WorkArea.Width;
+            workH = area.WorkArea.Height;
+        }
+        if (workW > 0 && workH > 0)
+        {
+            minWidth = Math.Min(minWidth, workW);
+            minHeight = Math.Min(minHeight, workH);
+        }
+        presenter.PreferredMinimumWidth = minWidth;
+        presenter.PreferredMinimumHeight = minHeight;
+    }
+
     // ---- Pages ----
 
     // The navigation's items name their pages (Tag): the bar's parts sit under it, numbered after the others.
@@ -61,13 +111,6 @@ public sealed partial class MainWindow
         if (_page >= 10) ShowModulePreview(_page);
     }
 
-    private void OnStageScrollWrapToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StageScrollWrap = StageScrollWrapSwitch.IsOn;
-        Changed();
-    }
-
     private void ActivatePageAfterLoad(int index)
     {
         if (_mains[index] == DesignStack)
@@ -89,6 +132,7 @@ public sealed partial class MainWindow
         }
         if (_mains[index] == MainStage) ShowStagePreview(true);
         if (_mains[index] == MainDisplays) RefreshDisplays();
+        if (_mains[index] == MainSystem) EnsureAdminCard();
         if (index >= 10) EnterModulePage(index);
         else LeaveModulePages();
         ContinuousCorners.Install(_mains[index]);
@@ -193,5 +237,58 @@ public sealed partial class MainWindow
     private void OnLocalizeTemplate(object sender, RoutedEventArgs e)
     {
         if (sender is DependencyObject root) Loc.Localize(root);
+    }
+
+    private async void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    {
+        args.Cancel = true;
+        await CloseRequestedAsync();
+    }
+
+    // Window.Close does not raise AppWindow.Closing. Both the title-bar close
+    // and update button explicitly use the same save/exit path before calling it.
+    private async Task CloseRequestedAsync()
+    {
+        if (_closePending) return;
+        if (_coreChanging) { _closeAfterCore = true; return; }
+        if (_dialog != null) // a close while a dialog is up dismisses the dialog
+        {
+            _dialog.Hide();
+            return;
+        }
+        _closePending = true;
+        try
+        {
+            if (_session.HasUnsavedChanges)
+            {
+                var dialog = new ContentDialog
+                {
+                    Title = Loc.T("Save changes?"),
+                    Content = Loc.T("Unsaved changes will be discarded when this window closes."),
+                    PrimaryButtonText = Loc.T("Save"),
+                    SecondaryButtonText = Loc.T("Don't save"),
+                    CloseButtonText = Loc.T("Cancel"),
+                    DefaultButton = ContentDialogButton.Primary,
+                };
+                var result = await AskAsync(dialog);
+                if (result == ContentDialogResult.None) { _restartUpdate = null; return; }
+                if (result == ContentDialogResult.Primary && !await SaveAsync()) { _restartUpdate = null; return; }
+            }
+            if (_restartUpdate != null)
+            {
+                try { ReleaseInstaller.Restart(_restartUpdate, _client.Connected); }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+                {
+                    _restartUpdate = null;
+                    MainAbout.UpdateStatusText.Text = error is UnauthorizedAccessException
+                        ? Loc.T("The installation folder is not writable; the update was not installed")
+                        : Loc.F("Could not restart for the update: {0}", error.Message);
+                    return;
+                }
+            }
+            _client.Dispose(); // the core reverts any unsaved preview on disconnect
+            Close();
+        }
+        finally { _closePending = false; }
     }
 }

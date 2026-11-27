@@ -152,6 +152,22 @@ void CheckSettingsCorruptAndFuture(const fs::path& root)
           "SaveSettingsTo reports startupChanged when startOnLogin changes");
     Check(atrium::SaveSettingsTo(cfg.wstring(), startupFlipped, &error, {}, &startupChanged) && !startupChanged,
           "SaveSettingsTo clears startupChanged when startOnLogin is unchanged");
+    atrium::Settings startupModeFlipped = modified;
+    startupModeFlipped.startOnLogin = true;
+    startupModeFlipped.startupMode = L"run";
+    Check(atrium::SaveSettingsTo(cfg.wstring(), startupModeFlipped, &error, {}, &startupChanged), "SaveSettingsTo baseline for startupMode change");
+    startupModeFlipped.startupMode = L"task";
+    Check(atrium::SaveSettingsTo(cfg.wstring(), startupModeFlipped, &error, {}, &startupChanged) && startupChanged,
+          "SaveSettingsTo reports startupChanged when startupMode changes while startOnLogin is true");
+    Check(atrium::SaveSettingsTo(cfg.wstring(), startupModeFlipped, &error, {}, &startupChanged) && !startupChanged,
+          "SaveSettingsTo clears startupChanged when startupMode is unchanged");
+    atrium::Settings disabledModeFlipped = startupModeFlipped;
+    disabledModeFlipped.startOnLogin = false;
+    Check(atrium::SaveSettingsTo(cfg.wstring(), disabledModeFlipped, &error, {}, &startupChanged) && startupChanged,
+          "SaveSettingsTo reports startupChanged when disabling startOnLogin");
+    disabledModeFlipped.startupMode = L"run";
+    Check(atrium::SaveSettingsTo(cfg.wstring(), disabledModeFlipped, &error, {}, &startupChanged) && !startupChanged,
+          "SaveSettingsTo ignores startupMode changes while startOnLogin is false");
 
     const std::string lockedCorrupt = "{broken-backup-must-fail";
     Check(WriteBytes(cfg, lockedCorrupt), "write corrupt file for backup failure test");
@@ -594,29 +610,52 @@ void CheckLogonTaskDecisions()
     const std::wstring otherCmd = L"\"" + otherExe + L"\"";
 
     auto samePlan = [](const StartupPlan& a, const StartupPlan& b) {
-        return a.ok == b.ok && a.removeTask == b.removeTask && a.writeRun == b.writeRun && a.deleteRun == b.deleteRun;
+        return a.ok == b.ok && a.removeTask == b.removeTask && a.writeRun == b.writeRun && a.deleteRun == b.deleteRun && a.createTask == b.createTask;
     };
 
-    Check(samePlan(PlanStartupChange({exe, exeAltCase, {}, false, true}, true), {true, true, true, false}), "enable migrates own legacy task and writes Run");
-    Check(samePlan(PlanStartupChange({exe, exeAltCase, cmd, true, true}, true), {true, true, false, false}),
-          "enable removes own legacy task and skips identical Run");
-    Check(samePlan(PlanStartupChange({exe, otherExe, {}, false, true}, true), {true, false, true, false}),
-          "enable leaves other install task untouched and writes Run");
-    Check(samePlan(PlanStartupChange({exe, {}, cmd, true, true}, true), {true, false, false, false}), "enable is a no-op when Run already matches");
-    Check(samePlan(PlanStartupChange({exe, {}, otherCmd, true, true}, true), {true, false, true, false}), "enable updates stale Run entry to current exe");
+    Check(ParseStartupMode(L"task") == StartupMode::Task && ParseStartupMode(L"run") == StartupMode::Run && ParseStartupMode(L"other") == StartupMode::Run,
+          "ParseStartupMode maps task and falls back to Run");
 
-    Check(samePlan(PlanStartupChange({exe, exeAltCase, cmdAltCase, true, true}, false), {true, true, false, true}),
+    Check(samePlan(PlanStartupChange({exe, exeAltCase, {}, false, true}, true), {true, true, true, false, false}),
+          "enable migrates own legacy task and writes Run");
+    Check(samePlan(PlanStartupChange({exe, exeAltCase, cmd, true, true}, true), {true, true, false, false, false}),
+          "enable removes own legacy task and skips identical Run");
+    Check(samePlan(PlanStartupChange({exe, otherExe, {}, false, true}, true), {true, true, true, false, false}),
+          "enable removes other install task and writes Run");
+    Check(samePlan(PlanStartupChange({exe, {}, cmd, true, true}, true), {true, false, false, false, false}), "enable is a no-op when Run already matches");
+    Check(samePlan(PlanStartupChange({exe, {}, otherCmd, true, true}, true), {true, false, true, false, false}),
+          "enable updates stale Run entry to current exe");
+
+    Check(samePlan(PlanStartupChange({exe, {}, {}, false, true}, true, StartupMode::Task), {true, false, false, false, true}),
+          "task mode creates logon task when neither entry exists");
+    Check(samePlan(PlanStartupChange({exe, {}, cmd, true, true}, true, StartupMode::Task), {true, false, false, true, true}),
+          "task mode migrates Run entry to logon task");
+    Check(samePlan(PlanStartupChange({exe, exeAltCase, {}, false, true}, true, StartupMode::Task), {true, false, false, false, false}),
+          "task mode is a no-op when own task already exists");
+    Check(samePlan(PlanStartupChange({exe, otherExe, cmd, true, true}, true, StartupMode::Task), {true, false, false, true, true}),
+          "task mode replaces other install task and removes Run");
+    Check(samePlan(PlanStartupChange({exe, {}, {}, false, false}, true, StartupMode::Task), {false, false, false, false, false}),
+          "task mode refuses when Run registry read fails");
+
+    Check(samePlan(PlanStartupChange({exe, exeAltCase, cmdAltCase, true, true}, false), {true, true, false, true, false}),
           "disable removes own task and own Run (case-insensitive)");
-    Check(samePlan(PlanStartupChange({exe, exeAltCase, {}, false, true}, false), {true, true, false, false}),
+    Check(samePlan(PlanStartupChange({exe, exeAltCase, {}, false, true}, false), {true, true, false, false, false}),
           "disable removes only own task when Run is absent");
-    Check(samePlan(PlanStartupChange({exe, {}, cmdAltCase, true, true}, false), {true, false, false, true}),
+    Check(samePlan(PlanStartupChange({exe, {}, cmdAltCase, true, true}, false), {true, false, false, true, false}),
           "disable removes only own Run when task is absent");
-    Check(samePlan(PlanStartupChange({exe, {}, {}, false, true}, false), {true, false, false, false}), "disable succeeds when neither entry exists");
-    Check(samePlan(PlanStartupChange({exe, {}, otherCmd, true, true}, false), {false, false, false, false}),
+    Check(samePlan(PlanStartupChange({exe, {}, {}, false, true}, false), {true, false, false, false, false}), "disable succeeds when neither entry exists");
+    Check(samePlan(PlanStartupChange({exe, {}, otherCmd, true, true}, false), {false, false, false, false, false}),
           "disable refuses when Run belongs to another install");
-    Check(samePlan(PlanStartupChange({exe, otherExe, cmd, true, true}, false), {false, false, false, false}),
+    Check(samePlan(PlanStartupChange({exe, otherExe, cmd, true, true}, false), {false, false, false, false, false}),
           "disable refuses when task belongs to another install");
-    Check(samePlan(PlanStartupChange({exe, exe, {}, false, false}, false), {false, false, false, false}), "disable refuses when Run registry read fails");
+    Check(samePlan(PlanStartupChange({exe, exe, {}, false, false}, false), {false, false, false, false, false}),
+          "disable refuses when Run registry read fails");
+    Check(samePlan(PlanStartupChange({exe, {}, {}, false, true, false}, true, StartupMode::Run), {false, false, false, false, false}),
+          "Run mode refuses when Task Scheduler query fails");
+    Check(samePlan(PlanStartupChange({exe, {}, {}, false, true, false}, true, StartupMode::Task), {false, false, false, false, false}),
+          "Task mode refuses when Task Scheduler query fails");
+    Check(samePlan(PlanStartupChange({exe, {}, cmd, true, true, false}, false), {false, false, false, false, false}),
+          "disable refuses when Task Scheduler query fails");
 }
 
 } // namespace

@@ -17,6 +17,7 @@ struct CoreLaunchOptions {
     bool uninstall = false;
     bool exitRequested = false;
     bool debugCapturable = false;
+    bool replace = false;
     bool guard = false;
     DWORD guardPid = 0;
 };
@@ -62,6 +63,8 @@ inline CoreLaunchOptions ParseCoreLaunchOptions(const std::vector<std::wstring>&
             options.uninstall = true;
         else if (arg == L"--debug-capturable")
             options.debugCapturable = true;
+        else if (arg == L"--replace")
+            options.replace = true;
     }
     return options;
 }

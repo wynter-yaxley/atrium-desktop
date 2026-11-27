@@ -62,6 +62,7 @@ inline std::wstring JoinNames(const std::vector<std::wstring>& names)
 struct UsbVolume {
     std::wstring label;
     std::wstring identity; // volume GUID path; distinguishes reuse of one drive letter
+    bool labelRead = false;
 };
 
 struct UsbVolumeSnapshot {

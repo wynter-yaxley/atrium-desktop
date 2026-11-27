@@ -24,6 +24,13 @@ struct MenuEntry {
     IconImage icon;
 };
 
+struct AppMenuExtra {
+    std::wstring label;
+    std::function<void()> run;
+    bool separatorBefore = false;
+    bool keepOpen = false;
+};
+
 // Where the menu goes relative to the point it opens at (screen px): below,
 // above, right or left of it, or centred along the bar's axis. It stays on the work area.
 enum class MenuPlace { Below, BelowCentered, Above, AboveCentered, Right, RightCentered, Left, LeftCentered };

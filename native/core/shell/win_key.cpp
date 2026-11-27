@@ -12,7 +12,7 @@ bool ForegroundElevated()
 {
     DWORD pid = 0;
     HWND fg = GetForegroundWindow();
-    if (!fg || !GetWindowThreadProcessId(fg, &pid) || !pid)
+    if (!fg || !GetWindowThreadProcessId(fg, &pid) || !pid || pid == GetCurrentProcessId())
         return false;
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process)
@@ -54,6 +54,8 @@ WinKey::WinKey(HWND notify, UINT msg, bool alone, bool numbers)
 
 WinKey::~WinKey() { KeyboardHook::Instance().Remove(keyToken_); }
 
+void WinKey::SetStartMenuOpen(bool open) { startMenuOpen_.store(open, std::memory_order_release); }
+
 bool WinKey::OnKey(void* context, DWORD vk, DWORD scan, bool extended, bool down, bool /*injected*/, ULONG_PTR extraInfo)
 {
     WinKey* self = static_cast<WinKey*>(context);
@@ -65,7 +67,8 @@ bool WinKey::OnKey(void* context, DWORD vk, DWORD scan, bool extended, bool down
     const ULONGLONG now = GetTickCount64();
     const bool willReset = s.held && s.passed && (vk != s.key || down) && !winAsync;
     const bool freshWin = win && down && (!s.held || willReset || (!s.passed && now - s.lastDownMs > 2000));
-    const bool elevated = freshWin ? ForegroundElevated() : false;
+    const bool startOpen = self->startMenuOpen_.load(std::memory_order_acquire);
+    const bool elevated = (freshWin && !startOpen) ? ForegroundElevated() : false;
     const bool mod =
         !win && down && s.held && !s.passed && ((GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU)) & 0x8000) != 0;
     const WinKeyAction action = StepWinKey(s, vk, scan, extended, down, now, winAsync, elevated, mod, self->alone_, self->numbers_);

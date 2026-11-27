@@ -155,6 +155,13 @@ bool IsWeChatPid(const std::vector<std::pair<DWORD, std::wstring>>& procs, DWORD
 
 namespace detail {
 
+WeChatBusyState QueryWeChatBusyStateForPid(DWORD pid)
+{
+    if (!pid)
+        return WeChatBusyState::None;
+    return QueryWeChatBusyState({{pid, {}}});
+}
+
 WeChatBusyState QueryWeChatBusyState(const std::vector<std::pair<DWORD, std::wstring>>& procs)
 {
     struct Ctx {
@@ -241,21 +248,25 @@ void DiscoverWeChatProcesses(std::vector<std::pair<DWORD, std::wstring>>& procs)
 } // namespace detail
 
 std::vector<Notice> DiffWeChatRows(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, bool baseline, bool blockOfficial,
-                                   std::map<std::wstring, WeChatChatState>& states)
+                                   std::map<std::wstring, WeChatChatState>& states, bool allowOpenSummary)
 {
     std::vector<Notice> events;
     for (size_t i = 0; i < rows.size(); ++i) {
         const auto& [key, r] = rows[i];
         auto old = states.find(key);
-        const int oldUnread = old != states.end() ? old->second.unread : 0;
+        const bool seenBefore = old != states.end();
+        const int oldUnread = seenBefore ? old->second.unread : 0;
         const bool suppressed = r.muted || r.collapsed || (blockOfficial && r.official);
         // A chat not seen before counts only at the top of the list,
         // where a new message puts it (scrolling brings old ones in).
-        const bool countRose = old != states.end() ? r.unread > oldUnread : (r.unread > 0 && i < 3);
-        const bool saturatedRose = old != states.end() && r.unread >= 99 && oldUnread >= 99 && !r.summary.empty() && r.summary != old->second.summary;
-        const bool rose = baseline && !suppressed && (countRose || saturatedRose);
+        const bool countRose = seenBefore ? r.unread > oldUnread : (r.unread > 0 && i < 3);
+        const bool summaryChanged = seenBefore && !r.summary.empty() && r.summary != old->second.summary;
+        const bool saturatedRose = summaryChanged && r.unread >= 99 && oldUnread >= 99;
+        // An open chat in an unfocused WeChat window keeps unread == 0 while its preview updates.
+        const bool openSummaryRose = allowOpenSummary && summaryChanged && oldUnread == 0 && r.unread == 0;
+        const bool rose = baseline && !suppressed && (countRose || saturatedRose || openSummaryRose);
         // Not gated on baseline: WeChat in front clears it, and reading happens there (#79).
-        const bool read = old != states.end() && oldUnread > 0 && r.unread == 0;
+        const bool read = seenBefore && oldUnread > 0 && r.unread == 0;
         if (rose || read) {
             Notice ev;
             ev.source = L"wechat";
@@ -288,13 +299,14 @@ int SumWeChatUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows)
 
 namespace {
 
-void UpdateUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, bool baseline, bool blockOfficial, bool postCards, const std::wstring& exe,
-                  HWND notify, UINT msg, std::map<std::wstring, WeChatChatState>& states)
+void UpdateUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, bool baseline, bool allowOpenSummary, bool blockOfficial, bool postCards,
+                  DWORD pid, const std::wstring& exe, HWND notify, UINT msg, std::map<std::wstring, WeChatChatState>& states)
 {
-    for (Notice& ev : DiffWeChatRows(rows, baseline, blockOfficial, states)) {
+    for (Notice& ev : DiffWeChatRows(rows, baseline, blockOfficial, states, allowOpenSummary)) {
         if (!postCards)
             continue;
         auto n = std::make_unique<Notice>(std::move(ev));
+        n->pid = pid;
         if (n->unread) {
             n->app = Tr(L"WeChat");
             n->appId = exe;
@@ -305,7 +317,7 @@ void UpdateUnread(const std::vector<std::pair<std::wstring, WeChatRow>>& rows, b
         }
         const bool rose = n->unread;
         if (PostOwned(notify, msg, 0, std::move(n)) && rose)
-            Log(L"wechat: new message");
+            Log(L"wechat: new message (pid %lu)", pid);
     }
 }
 
@@ -342,9 +354,8 @@ void ReadRow(IUIAutomationElement* e, std::vector<std::pair<std::wstring, WeChat
     SysFreeString(name);
 }
 
-bool ReadLiveWindow(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutomationCacheRequest* cache, HWND h, const std::wstring& program,
-                    std::vector<std::pair<std::wstring, WeChatRow>>& rows, std::vector<HeldRow>& held, std::wstring& heldProgram, std::wstring& exe,
-                    HWND& lastMainHwnd)
+bool ReadLiveWindow(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutomationCacheRequest* cache, HWND h,
+                    std::vector<std::pair<std::wstring, WeChatRow>>& rows, std::vector<HeldRow>& held, HWND& lastMainHwnd)
 {
     winrt::com_ptr<IUIAutomationElement> root;
     winrt::com_ptr<IUIAutomationElementArray> all;
@@ -363,25 +374,19 @@ bool ReadLiveWindow(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutoma
     if (n == 0)
         return false;
     held = std::move(elements);
-    heldProgram = exe = program;
     lastMainHwnd = h;
     return true;
 }
 
-bool ReadLiveWindows(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutomationCacheRequest* cache,
-                     const std::vector<std::pair<DWORD, std::wstring>>& procs, std::vector<std::pair<std::wstring, WeChatRow>>& rows,
-                     std::vector<HeldRow>& held, std::wstring& heldProgram, std::wstring& exe, HWND& lastMainHwnd, bool& anyHung)
+bool ReadLiveWindowsForPid(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutomationCacheRequest* cache, DWORD pid,
+                           std::vector<std::pair<std::wstring, WeChatRow>>& rows, std::vector<HeldRow>& held, HWND& lastMainHwnd, bool& anyHung)
 {
-    if (lastMainHwnd) {
-        auto it = std::ranges::find_if(procs, [pid = WindowPid(lastMainHwnd)](const auto& p) { return p.first == pid; });
-        if (it != procs.end() && detail::ShouldReadWeChatWindow(lastMainHwnd, it->first, &anyHung) &&
-            ReadLiveWindow(uia, cells, cache, lastMainHwnd, it->second, rows, held, heldProgram, exe, lastMainHwnd))
+    if (lastMainHwnd && WindowPid(lastMainHwnd) == pid && detail::ShouldReadWeChatWindow(lastMainHwnd, pid, &anyHung) &&
+        ReadLiveWindow(uia, cells, cache, lastMainHwnd, rows, held, lastMainHwnd))
+        return true;
+    for (HWND h : detail::WeChatWindows(pid, anyHung))
+        if (h != lastMainHwnd && ReadLiveWindow(uia, cells, cache, h, rows, held, lastMainHwnd))
             return true;
-    }
-    for (const auto& [p, program] : procs)
-        for (HWND h : detail::WeChatWindows(p, anyHung))
-            if (h != lastMainHwnd && ReadLiveWindow(uia, cells, cache, h, program, rows, held, heldProgram, exe, lastMainHwnd))
-                return true;
     return false;
 }
 
@@ -535,12 +540,16 @@ WeChatThrottleOutput EvaluateWeChatThrottle(const WeChatThrottleInput& in)
     out.nextBusyUntilTick = in.busyUntilTick;
     out.nextSampledWhileBusy = in.sampledWhileBusy;
     out.nextFollowUpTick = in.followUpTick;
+    if (in.busy == WeChatBusyState::None)
+        out.nextSampledWhileBusy = false;
 
     if (in.breakCooldown && (in.busy == WeChatBusyState::ForegroundShown || in.busy == WeChatBusyState::None)) {
         if (in.busy == WeChatBusyState::ForegroundShown) {
             out.nextSampledWhileBusy = true;
             out.nextBusyUntilTick = in.tick + 300;
             out.clearReadingAndBaseline = true;
+            if (in.hasHeld && in.unread == 0)
+                out.waitMs = kBusyWaitMs;
         }
         out.nextFollowUpTick = 0;
         return out;
@@ -548,9 +557,7 @@ WeChatThrottleOutput EvaluateWeChatThrottle(const WeChatThrottleInput& in)
 
     const bool initialSample = in.busy == WeChatBusyState::ForegroundShown && !in.hasHeld && !in.sampledWhileBusy;
     const bool foregroundUnreadSample = in.busy == WeChatBusyState::ForegroundShown && in.unread > 0;
-    if (in.busy == WeChatBusyState::None)
-        out.nextSampledWhileBusy = false;
-    else if (initialSample)
+    if (initialSample)
         out.nextSampledWhileBusy = true;
 
     if (foregroundUnreadSample && !initialSample) {
@@ -563,9 +570,10 @@ WeChatThrottleOutput EvaluateWeChatThrottle(const WeChatThrottleInput& in)
     }
 
     if ((in.busy != WeChatBusyState::None && !initialSample) || (!initialSample && in.tick < in.busyUntilTick)) {
-        if (in.busy != WeChatBusyState::None)
+        if (in.busy != WeChatBusyState::None) {
             out.nextBusyUntilTick = in.tick + 300;
-        out.clearReadingAndBaseline = true;
+            out.clearReadingAndBaseline = true;
+        }
         out.nextFollowUpTick = 0;
         out.waitMs = in.busy != WeChatBusyState::None ? kBusyWaitMs : DWORD(std::min<ULONGLONG>(kBusyWaitMs, in.busyUntilTick - in.tick));
         return out;
@@ -586,47 +594,86 @@ WeChatThrottleOutput EvaluateWeChatThrottle(const WeChatThrottleInput& in)
 
 namespace {
 
-DWORD WeChatPollWait(int state, ULONGLONG followUpTick)
-{
-    const DWORD waitMs = state >= 2 ? 2000 : (state == 1 ? 10000 : 6000);
-    return followUpTick ? std::min(waitMs, GetTickCount64() < followUpTick ? DWORD(followUpTick - GetTickCount64()) : 0) : waitMs;
-}
+struct WeChatInstance {
+    std::wstring exe;
+    HWND lastMainHwnd = nullptr;
+    std::vector<HeldRow> held;
+    std::map<std::wstring, WeChatChatState> states;
+    bool baseline = false;
+    bool reading = false;
+    bool pendingForegroundSync = false;
+    int state = -1; // 0 absent, 1 no list, 2 live, 3 held
+    int unread = 0;
+    ULONGLONG busyUntilTick = 0;
+    ULONGLONG lastRead = 0;
+    ULONGLONG followUpTick = 0;
+    bool sampledWhileBusy = false;
+    WeChatBusyState prevBusy = WeChatBusyState::None;
+};
 
-DWORD WeChatBusyOrThrottleWait(const std::vector<std::pair<DWORD, std::wstring>>& procs, bool hasHeld, int unread, ULONGLONG tick, ULONGLONG& busyUntilTick,
-                               ULONGLONG lastRead, ULONGLONG& followUpTick, bool& sampledWhileBusy, std::atomic<bool>& reading, std::atomic<bool>& wakePending,
-                               bool& baseline, WeChatBusyState& prevBusy)
+void PollWeChatInstance(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutomationCacheRequest* cache, DWORD pid, WeChatInstance& inst,
+                        bool blockOfficial, bool postCards, HWND notify, UINT msg, ULONGLONG tick, bool flashWake, bool& requeueWake, DWORD& nextWaitMs)
 {
-    const WeChatBusyState busy = detail::QueryWeChatBusyState(procs);
-    const bool breakCooldown = ShouldBreakWeChatCooldown(prevBusy, busy);
-    prevBusy = busy;
-    const WeChatThrottleInput input{busy,         hasHeld,      unread, tick, lastRead, busyUntilTick, sampledWhileBusy, wakePending.exchange(false),
-                                    followUpTick, breakCooldown};
+    const WeChatBusyState busy = detail::QueryWeChatBusyStateForPid(pid);
+    const bool breakCooldown = ShouldBreakWeChatCooldown(inst.prevBusy, busy);
+    inst.prevBusy = busy;
+    if (busy == WeChatBusyState::ForegroundShown)
+        inst.pendingForegroundSync = true;
+    const WeChatThrottleInput input{busy,      !inst.held.empty(), inst.unread,  tick, inst.lastRead, inst.busyUntilTick, inst.sampledWhileBusy,
+                                    flashWake, inst.followUpTick,  breakCooldown};
     const WeChatThrottleOutput out = EvaluateWeChatThrottle(input);
-    busyUntilTick = out.nextBusyUntilTick;
-    sampledWhileBusy = out.nextSampledWhileBusy;
-    followUpTick = out.nextFollowUpTick;
-    if (out.clearReadingAndBaseline)
-        reading = baseline = false;
+    inst.busyUntilTick = out.nextBusyUntilTick;
+    inst.sampledWhileBusy = out.nextSampledWhileBusy;
+    inst.followUpTick = out.nextFollowUpTick;
     if (out.requeueFlashWake)
-        wakePending = true;
-    return out.waitMs;
+        requeueWake = true;
+    if (out.waitMs) {
+        nextWaitMs = std::min(nextWaitMs, out.waitMs);
+        return;
+    }
+    inst.lastRead = tick;
+    std::vector<std::pair<std::wstring, WeChatRow>> rows;
+    bool anyHung = false;
+    bool found = ReadLiveWindowsForPid(uia, cells, cache, pid, rows, inst.held, inst.lastMainHwnd, anyHung);
+    bool fromHeld = false;
+    if (!found && !anyHung && !inst.held.empty()) {
+        found = fromHeld = ReadHeldRows(cache, inst.held, rows);
+        if (found && inst.state != 3)
+            Log(L"wechat: pid %lu window hidden, reading the %zu chats held from it", pid, inst.held.size());
+    }
+    if (!found && !anyHung) {
+        if (inst.state != 1)
+            Log(L"wechat: pid %lu chat list is not readable (open its window once)", pid);
+        inst.state = 1;
+        inst.reading = inst.baseline = inst.pendingForegroundSync = false;
+        if (inst.held.empty()) {
+            inst.states.clear();
+            inst.unread = 0;
+        }
+        return;
+    }
+    if (found) {
+        if (inst.state < 2 || (inst.state == 3 && !fromHeld))
+            Log(L"wechat: reading pid %lu chat list (%zu chats in view)", pid, rows.size());
+        inst.state = fromHeld ? 3 : 2;
+        inst.reading = true;
+        // In ForegroundShown suppress all alerts; on first ForegroundShown -> None read, sync open-chat
+        // summary silently while still delivering real unread 0 -> 1 messages arriving right after switching away.
+        const bool syncOnly = busy == WeChatBusyState::ForegroundShown;
+        UpdateUnread(rows, inst.baseline && !syncOnly, !inst.pendingForegroundSync, blockOfficial, postCards, pid, inst.exe, notify, msg, inst.states);
+        inst.unread = SumWeChatUnread(rows);
+        inst.baseline = true;
+        if (busy != WeChatBusyState::ForegroundShown)
+            inst.pendingForegroundSync = false;
+    } else {
+        inst.reading = false;
+    }
 }
 
-void ResetUnreadState(std::map<std::wstring, WeChatChatState>& states, std::atomic<int>& unread, HWND notify, UINT badgeMsg)
+winrt::com_ptr<IUIAutomation> CreateWeChatUia(const std::atomic<bool>& stop, HANDLE wake, winrt::com_ptr<IUIAutomationCondition>& cells,
+                                              winrt::com_ptr<IUIAutomationCacheRequest>& cache)
 {
-    states.clear();
-    if (unread.exchange(0) != 0 && badgeMsg)
-        PostMessageW(notify, badgeMsg, 0, 0);
-}
-
-} // namespace
-
-void WeChatSource::Run()
-{
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    winrt::com_ptr<IUIAutomationCondition> cells;
-    winrt::com_ptr<IUIAutomationCacheRequest> cache;
-    winrt::com_ptr<IUIAutomation> uia = CreateUia(stop_, wake_, L"wechat", [&](IUIAutomation* u) {
+    return CreateUia(stop, wake, L"wechat", [&](IUIAutomation* u) {
         cells = nullptr;
         VARIANT v{};
         v.vt = VT_BSTR;
@@ -638,104 +685,107 @@ void WeChatSource::Run()
         return CreateRawCache(u, {UIA_AutomationIdPropertyId, UIA_NamePropertyId, UIA_ValueValuePropertyId, UIA_HelpTextPropertyId, UIA_ItemStatusPropertyId},
                               cache, true);
     });
-    std::map<std::wstring, WeChatChatState> states;
-    bool baseline = false;
-    int state = -1; // 0 no WeChat, 1 no list, 2 reading, 3 reading the held rows (logged on change)
-    auto report = [&](int now, const wchar_t* text) {
-        if (now != state)
-            Log(L"wechat: %s", text);
-        state = now;
-        reading_ = false;
-    };
+}
+
+} // namespace
+
+struct WeChatSource::LoopState {
+    std::map<DWORD, WeChatInstance> instances;
     std::vector<std::pair<DWORD, std::wstring>> procs;
+    std::map<DWORD, HWND> lastMainByPid;
     ULONGLONG listed = 0;
-    ULONGLONG busyUntilTick = 0;
-    ULONGLONG lastRead = 0;
-    ULONGLONG followUpTick = 0;
-    bool sampledWhileBusy = false;
-    WeChatBusyState prevBusy = WeChatBusyState::None;
     uint32_t openLoggedMask = 0;
-    HWND lastMainHwnd = nullptr;
-    // The chat rows last found in a shown window. Closed to the tray, WeChat's window leaves its
-    // rows out of the tree (Qt skips hidden controls), but rows already held still read via
-    // BuildUpdatedCache so messages are seen there too.
-    std::vector<HeldRow> held;
-    std::wstring heldProgram;
+    bool wasRunning = false;
+
+    void RefreshProcesses(UiaWindowWake& windows, ULONGLONG tick)
     {
-        UiaWindowWake windows(wake_, L"QWindowIcon", false);
+        const bool hasReadable = std::ranges::any_of(instances, [](const auto& kv) { return kv.second.state >= 2; });
+        if (!listed || tick - listed >= 10000 || (!hasReadable && tick - listed >= 2000)) {
+            detail::DiscoverWeChatProcesses(procs);
+            listed = tick;
+            windows.SetProcesses(procs);
+        }
+        lastMainByPid.clear();
+        for (const auto& [pid, inst] : instances)
+            if (inst.lastMainHwnd)
+                lastMainByPid[pid] = inst.lastMainHwnd;
+    }
+};
+
+void WeChatSource::PublishStatus(std::set<DWORD> activeReading, int totalUnread)
+{
+    reading_ = !activeReading.empty();
+    {
+        std::lock_guard lock(readingMu_);
+        readingPids_ = std::move(activeReading);
+    }
+    if (unread_.exchange(totalUnread) != totalUnread && badgeMsg_)
+        PostMessageW(notify_, badgeMsg_, WPARAM(totalUnread), 0);
+}
+
+DWORD WeChatSource::StepInstances(IUIAutomation* uia, IUIAutomationCondition* cells, IUIAutomationCacheRequest* cache, LoopState& loop, ULONGLONG tick)
+{
+    loop.wasRunning = true;
+    std::erase_if(loop.instances, [&](const auto& kv) { return std::ranges::none_of(loop.procs, [&](const auto& p) { return p.first == kv.first; }); });
+    const bool flashWake = wakePending_.exchange(false);
+    bool requeueWake = false;
+    int totalUnread = 0;
+    int maxState = 0;
+    ULONGLONG soonestFollowUp = 0;
+    DWORD minThrottleWait = INFINITE;
+    std::set<DWORD> activeReading;
+    for (const auto& [pid, program] : loop.procs) {
+        WeChatInstance& inst = loop.instances[pid];
+        inst.exe = program;
+        PollWeChatInstance(uia, cells, cache, pid, inst, blockOfficial_, postCards_, notify_, msg_, tick, flashWake, requeueWake, minThrottleWait);
+        maxState = std::max(maxState, inst.state);
+        if (inst.followUpTick)
+            soonestFollowUp = soonestFollowUp ? std::min(soonestFollowUp, inst.followUpTick) : inst.followUpTick;
+        if (inst.reading)
+            activeReading.insert(pid);
+        totalUnread += inst.unread;
+    }
+    if (requeueWake)
+        wakePending_ = true;
+    PublishStatus(std::move(activeReading), totalUnread);
+    DWORD pollWait = maxState >= 2 ? 2000 : (maxState == 1 ? 10000 : 6000);
+    if (soonestFollowUp) {
+        const ULONGLONG now = GetTickCount64();
+        pollWait = std::min(pollWait, now < soonestFollowUp ? DWORD(soonestFollowUp - now) : 0);
+    }
+    return minThrottleWait == INFINITE ? pollWait : std::min(pollWait, minThrottleWait);
+}
+
+void WeChatSource::Run()
+{
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    {
+        winrt::com_ptr<IUIAutomationCondition> cells;
+        winrt::com_ptr<IUIAutomationCacheRequest> cache;
+        winrt::com_ptr<IUIAutomation> uia = CreateWeChatUia(stop_, wake_, cells, cache);
+        LoopState loop;
+        UiaWindowWake windows(wake_, L"QWindowIcon", false, true);
         while (!stop_ && uia && cells) {
-            try {
-                const ULONGLONG tick = GetTickCount64();
-                if (!listed || tick - listed >= 10000 || (state < 2 && tick - listed >= 2000)) {
-                    detail::DiscoverWeChatProcesses(procs);
-                    listed = tick;
-                    windows.SetProcesses(procs);
-                }
-                detail::HandlePendingWeChatOpen(uia.get(), cells.get(), wake_, stop_, openMu_, pendingOpenChat_, procs, lastMainHwnd, openLoggedMask);
-                if (procs.empty()) {
-                    busyUntilTick = 0;
-                    lastRead = 0;
-                    followUpTick = 0;
-                    sampledWhileBusy = wakePending_ = false;
-                    prevBusy = WeChatBusyState::None;
-                    lastMainHwnd = nullptr;
-                    report(0, L"WeChat is not running");
-                    held.clear();
-                    baseline = false; // after a restart its list is a new baseline
-                    ResetUnreadState(states, unread_, notify_, badgeMsg_);
-                    WaitForUiaWake(wake_, 6000);
-                    continue;
-                }
-                if (const DWORD skipMs = WeChatBusyOrThrottleWait(procs, !held.empty(), unread_.load(), tick, busyUntilTick, lastRead, followUpTick,
-                                                                  sampledWhileBusy, reading_, wakePending_, baseline, prevBusy)) {
-                    WaitForUiaWake(wake_, skipMs);
-                    continue;
-                }
-                lastRead = tick;
-                std::wstring exe;
-                std::vector<std::pair<std::wstring, WeChatRow>> rows;
-                bool anyHung = false;
-                bool found = ReadLiveWindows(uia.get(), cells.get(), cache.get(), procs, rows, held, heldProgram, exe, lastMainHwnd, anyHung);
-                bool fromHeld = false;
-                if (!found && !anyHung && !held.empty()) {
-                    found = fromHeld = ReadHeldRows(cache.get(), held, rows);
-                    if (found) {
-                        exe = heldProgram;
-                        if (state != 3)
-                            Log(L"wechat: window hidden, reading the %zu chats held from it", held.size());
-                    }
-                }
-                if (!found && !anyHung) {
-                    report(1, L"WeChat's chat list is not readable (open its window once)");
-                    baseline = false;
-                    if (held.empty())
-                        ResetUnreadState(states, unread_, notify_, badgeMsg_);
-                } else if (found) {
-                    if (state < 2 || (state == 3 && !fromHeld))
-                        Log(L"wechat: reading WeChat's chat list (%zu chats in view)", rows.size());
-                    state = fromHeld ? 3 : 2;
-                    reading_ = true;
-                    UpdateUnread(rows, baseline, blockOfficial_, postCards_, exe, notify_, msg_, states);
-                    const int total = SumWeChatUnread(rows);
-                    if (unread_.exchange(total) != total && badgeMsg_)
-                        PostMessageW(notify_, badgeMsg_, WPARAM(total), 0);
-                    baseline = true;
-                } else {
-                    reading_ = false;
-                }
-            } catch (...) {
-                reading_ = false;
-                Log(L"wechat: reading failed");
+            const ULONGLONG tick = GetTickCount64();
+            loop.RefreshProcesses(windows, tick);
+            detail::HandlePendingWeChatOpen(uia.get(), cells.get(), wake_, stop_, openMu_, pendingOpenChat_, pendingOpenPid_, loop.procs, loop.lastMainByPid,
+                                            loop.openLoggedMask);
+            if (loop.procs.empty()) {
+                if (loop.wasRunning)
+                    Log(L"wechat: WeChat is not running");
+                loop.wasRunning = false;
+                wakePending_ = false;
+                loop.instances.clear();
+                PublishStatus({}, 0);
+                WaitForUiaWake(wake_, 6000);
+                continue;
             }
+            const DWORD waitMs = StepInstances(uia.get(), cells.get(), cache.get(), loop, tick);
             if (!stop_)
-                WaitForUiaWake(wake_, WeChatPollWait(state, followUpTick));
+                WaitForUiaWake(wake_, waitMs);
         }
     }
     reading_ = false;
-    held.clear();
-    cells = nullptr;
-    cache = nullptr;
-    uia = nullptr;
     winrt::uninit_apartment();
 }
 

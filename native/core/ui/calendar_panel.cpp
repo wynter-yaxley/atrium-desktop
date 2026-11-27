@@ -130,96 +130,114 @@ void CalendarPanel::Paint(Canvas& c)
     PaintCapsule(c, t, cap);
 }
 
-void CalendarPanel::PaintMonth(Canvas& c, const Theme& t, D2D1_RECT_F card)
+void CalendarPanel::PaintNavButton(Canvas& c, const Theme& t, const std::wstring& id, D2D1_RECT_F b, const std::wstring& glyph, const std::wstring& label)
+{
+    const float hv = Hover(c, id, hover_ == id);
+    if (hv > 0.001f || pressed_ == id)
+        c.Fill(b, (b.bottom - b.top) / 2, pressed_ == id ? t.press : Alpha(t.hover, hv));
+    if (!glyph.empty())
+        c.Glyph(glyph, b, 11, t.text);
+    else
+        c.Text(label, b, 12.5f, t.text, DWRITE_FONT_WEIGHT_NORMAL, 1);
+    hits_.push_back({b, id});
+}
+
+void CalendarPanel::PaintMonthHeader(Canvas& c, const Theme& t, D2D1_RECT_F card, const SYSTEMTIME& now)
 {
     const float w = card.right - card.left;
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-
-    // The month and its buttons.
-    std::wstring title = LanguageIsEnglish() ? std::wstring(kCalendarMonthsEn[std::clamp(month_, 1, 12) - 1]) + L" " + std::to_wstring(year_) :
-                                               std::to_wstring(year_) + L"年" + std::to_wstring(month_) + L"月";
+    const std::wstring title = LanguageIsEnglish() ? std::wstring(kCalendarMonthsEn[std::clamp(month_, 1, 12) - 1]) + L" " + std::to_wstring(year_) :
+                                                     std::to_wstring(year_) + L"年" + std::to_wstring(month_) + L"月";
     c.Text(title, D2D1::RectF(kPad + 6, card.top, w / 2 + 20, card.top + kMonthH), 16, t.text, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    auto button = [&](const std::wstring& id, D2D1_RECT_F b, const std::wstring& glyph, const std::wstring& label) {
-        float hv = Hover(c, id, hover_ == id);
-        if (hv > 0.001f || pressed_ == id)
-            c.Fill(b, (b.bottom - b.top) / 2, pressed_ == id ? t.press : Alpha(t.hover, hv));
-        if (!glyph.empty())
-            c.Glyph(glyph, b, 11, t.text);
-        else
-            c.Text(label, b, 12.5f, t.text, DWRITE_FONT_WEIGHT_NORMAL, 1);
-        hits_.push_back({b, id});
-    };
-    float by = card.top + kMonthH / 2;
-    D2D1_RECT_F next = D2D1::RectF(w - kPad - 34, by - 17, w - kPad, by + 17);
-    D2D1_RECT_F prev = D2D1::RectF(next.left - 38, by - 17, next.left - 4, by + 17);
-    button(L"prev", prev, L"\uE76B", L"");
-    button(L"next", next, L"\uE76C", L"");
-    bool away = year_ != now.wYear || month_ != now.wMonth || selected_.wYear != now.wYear || selected_.wMonth != now.wMonth || selected_.wDay != now.wDay;
+    const float by = card.top + kMonthH / 2;
+    const D2D1_RECT_F next = D2D1::RectF(w - kPad - 34, by - 17, w - kPad, by + 17);
+    const D2D1_RECT_F prev = D2D1::RectF(next.left - 38, by - 17, next.left - 4, by + 17);
+    PaintNavButton(c, t, L"prev", prev, L"\uE76B", L"");
+    PaintNavButton(c, t, L"next", next, L"\uE76C", L"");
+    const bool away =
+        year_ != now.wYear || month_ != now.wMonth || selected_.wYear != now.wYear || selected_.wMonth != now.wMonth || selected_.wDay != now.wDay;
     if (away) {
-        std::wstring label = Tr(L"Today");
-        float bw = c.TextWidth(label, 12.5f) + 26;
-        button(L"today", D2D1::RectF(prev.left - 8 - bw, by - 15, prev.left - 8, by + 15), L"", label);
+        const std::wstring label = Tr(L"Today");
+        const float bw = c.TextWidth(label, 12.5f) + 26;
+        PaintNavButton(c, t, L"today", D2D1::RectF(prev.left - 8 - bw, by - 15, prev.left - 8, by + 15), L"", label);
     }
+}
 
+void CalendarPanel::PaintDayCell(Canvas& c, const Theme& t, const SYSTEMTIME& now, size_t index, D2D1_RECT_F cell)
+{
+    const Day& d = days_[index];
+    const std::wstring id = L"day:" + std::to_wstring(index);
+    const bool inMonth = d.m == month_, today = d.y == now.wYear && d.m == now.wMonth && d.d == now.wDay;
+    const bool sel = d.y == selected_.wYear && d.m == selected_.wMonth && d.d == selected_.wDay;
+    const float hv = Hover(c, id, hover_ == id);
+    constexpr float kRadius = 12;
+    if (today)
+        c.Fill(cell, kRadius, pressed_ == id ? Alpha(t.accent, 0.8f) : t.accent);
+    else if (pressed_ == id)
+        c.Fill(cell, kRadius, t.press);
+    else if (hv > 0.001f)
+        c.Fill(cell, kRadius, Alpha(t.hover, hv));
+    if (sel && !today)
+        c.Stroke(cell, kRadius, Alpha(t.accent, 0.95f), 1.5f);
+    const float fade = inMonth ? 1.f : 0.38f;
+    const D2D1_COLOR_F ink = today ? t.accentText : Alpha(t.text, fade);
+    const D2D1_COLOR_F under = today ? t.accentText : d.festival ? Alpha(t.accent, fade) : Alpha(t.subtext, fade);
+    const bool halo = c.halo;
+    if (today)
+        c.halo = false;
+    const bool lunar = !d.lunar.empty();
+    c.Text(std::to_wstring(d.d), D2D1::RectF(cell.left, cell.top + (lunar ? 3 : 0), cell.right, lunar ? cell.top + 24 : cell.bottom), 14.5f, ink,
+           today ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, 1);
+    if (lunar)
+        c.Text(d.lunar, D2D1::RectF(cell.left - 2, cell.top + 23, cell.right + 2, cell.bottom - 2), 9.5f, under, DWRITE_FONT_WEIGHT_NORMAL, 1);
+    c.halo = halo;
+    hits_.push_back({cell, id});
+}
+
+void CalendarPanel::PaintMonthGrid(Canvas& c, const Theme& t, D2D1_RECT_F card, const SYSTEMTIME& now)
+{
     // Weekday names, then six weeks; the month slides in from the side it came from.
-    const float cellW = (w - 2 * kPad) / 7, top = card.top + kMonthH;
+    const float w = card.right - card.left, cellW = (w - 2 * kPad) / 7, top = card.top + kMonthH;
     for (int i = 0; i < 7; ++i) {
-        int wd = (firstWeekday_ + i) % 7;
+        const int wd = (firstWeekday_ + i) % 7;
         c.Text(WeekHeader(wd), D2D1::RectF(kPad + float(i) * cellW, top, kPad + float(i + 1) * cellW, top + kWeekH), 12, wd >= 5 ? t.subtext : t.faint,
                DWRITE_FONT_WEIGHT_NORMAL, 1);
     }
-    float e = motion::EaseOut(float((c.now - monthMs_) / kMonthMs));
+    const float e = motion::EaseOut(float((c.now - monthMs_) / kMonthMs));
     if (e < 1)
         c.Continue();
     const float gridTop = top + kWeekH;
     c.Clip(D2D1::RectF(0, gridTop - 2, w, gridTop + 6 * kCellH + 4));
     c.BeginGroup(monthDir_ ? e : 1, 1, w / 2, gridTop + 3 * kCellH, float(monthDir_) * 28 * (1 - e), 0);
     for (size_t i = 0; i < days_.size(); ++i) {
-        const Day& d = days_[i];
         const size_t col = i % 7, row = i / 7;
-        float x = kPad + float(col) * cellW, y = gridTop + float(row) * kCellH;
-        D2D1_RECT_F cell = D2D1::RectF(x + 2, y + 2, x + cellW - 2, y + kCellH - 2);
-        std::wstring id = L"day:" + std::to_wstring(i);
-        bool inMonth = d.m == month_, today = d.y == now.wYear && d.m == now.wMonth && d.d == now.wDay;
-        bool sel = d.y == selected_.wYear && d.m == selected_.wMonth && d.d == selected_.wDay;
-        float hv = Hover(c, id, hover_ == id);
-        const float r = 12;
-        if (today)
-            c.Fill(cell, r, pressed_ == id ? Alpha(t.accent, 0.8f) : t.accent);
-        else if (pressed_ == id)
-            c.Fill(cell, r, t.press);
-        else if (hv > 0.001f)
-            c.Fill(cell, r, Alpha(t.hover, hv));
-        if (sel && !today)
-            c.Stroke(cell, r, Alpha(t.accent, 0.95f), 1.5f);
-        float fade = inMonth ? 1.f : 0.38f;
-        D2D1_COLOR_F ink = today ? t.accentText : Alpha(t.text, fade);
-        D2D1_COLOR_F under = today ? t.accentText : d.festival ? Alpha(t.accent, fade) : Alpha(t.subtext, fade);
-        bool halo = c.halo;
-        if (today)
-            c.halo = false;
-        bool lunar = !d.lunar.empty();
-        c.Text(std::to_wstring(d.d), D2D1::RectF(cell.left, cell.top + (lunar ? 3 : 0), cell.right, lunar ? cell.top + 24 : cell.bottom), 14.5f, ink,
-               today ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, 1);
-        if (lunar)
-            c.Text(d.lunar, D2D1::RectF(cell.left - 2, cell.top + 23, cell.right + 2, cell.bottom - 2), 9.5f, under, DWRITE_FONT_WEIGHT_NORMAL, 1);
-        c.halo = halo;
-        hits_.push_back({cell, id});
+        const float x = kPad + float(col) * cellW, y = gridTop + float(row) * kCellH;
+        PaintDayCell(c, t, now, i, D2D1::RectF(x + 2, y + 2, x + cellW - 2, y + kCellH - 2));
     }
     c.EndGroup();
     c.Unclip();
+}
 
+void CalendarPanel::PaintMonthFooter(Canvas& c, const Theme& t, D2D1_RECT_F card)
+{
     // The system's settings.
-    float fy = gridTop + 6 * kCellH + 8;
+    const float w = card.right - card.left, fy = card.top + kMonthH + kWeekH + 6 * kCellH + 8;
     c.Line(kPad + 8, fy, w - kPad - 8, fy, t.divider);
     const std::wstring settingsLabel = Tr(L"Date & time settings");
-    D2D1_RECT_F link = D2D1::RectF(kPad, fy + 5, kPad + c.TextWidth(settingsLabel, 12.5f) + 28, fy + kFooter - 5);
-    float lh = Hover(c, L"settings", hover_ == L"settings");
+    const D2D1_RECT_F link = D2D1::RectF(kPad, fy + 5, kPad + c.TextWidth(settingsLabel, 12.5f) + 28, fy + kFooter - 5);
+    const float lh = Hover(c, L"settings", hover_ == L"settings");
     if (lh > 0.001f)
         c.Fill(link, (link.bottom - link.top) / 2, Alpha(t.hover, lh));
     c.Text(settingsLabel, link, 12.5f, t.subtext, DWRITE_FONT_WEIGHT_NORMAL, 1);
     hits_.push_back({link, L"settings"});
+}
+
+void CalendarPanel::PaintMonth(Canvas& c, const Theme& t, D2D1_RECT_F card)
+{
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    PaintMonthHeader(c, t, card, now);
+    PaintMonthGrid(c, t, card, now);
+    PaintMonthFooter(c, t, card);
 }
 
 void CalendarPanel::PaintCapsule(Canvas& c, const Theme& t, D2D1_RECT_F cap)

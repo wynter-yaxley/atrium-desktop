@@ -21,12 +21,14 @@ std::wstring SettingsPipeName();
 
 class SettingsServer {
 public:
-    SettingsServer(HWND host, const Settings& saved, std::wstring pipeName = {}, std::wstring settingsPath = {});
+    SettingsServer(HWND host, const Settings& saved, std::wstring pipeName = {}, std::wstring settingsPath = {},
+                   std::function<void(bool)> onAutoUpdateCommitted = {});
     ~SettingsServer();
     SettingsServer(const SettingsServer&) = delete;
     SettingsServer& operator=(const SettingsServer&) = delete;
 
     Settings Current();
+    Settings Saved();
     bool Ready() const { return ready_.load(); }
     // A change made by the core itself (e.g. pinning from the bar's menu):
     // applied to the saved settings and to the current preview, then written.
@@ -48,6 +50,7 @@ private:
     // file (the pipe's thread and the UI thread's Modify); lock_ guards the fields.
     std::mutex txn_, lock_;
     Settings saved_, current_;
+    std::function<void(bool)> onAutoUpdateCommitted_;
     uint64_t revision_ = 1;
     HANDLE quit_;
     std::atomic_bool ready_ = false;

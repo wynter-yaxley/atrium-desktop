@@ -1,6 +1,7 @@
 #include "render/ui_font.h"
 
 #include "log.h"
+#include "win32_path.h"
 
 #include <windows.h>
 
@@ -104,9 +105,12 @@ HRESULT UiTextFormat(IDWriteFactory* dw, float px, DWRITE_FONT_WEIGHT weight, ID
 
 HRESULT UiTextLayout(IDWriteFactory* dw, const std::wstring& s, IDWriteTextFormat* f, float width, float height, IDWriteTextLayout** out)
 {
-    HRESULT hr = dw->CreateTextLayout(s.c_str(), UINT32(s.size()), f, width, height, out);
+    const bool hasIsolate = TheFace().collection && std::ranges::any_of(s, [](wchar_t ch) { return ch >= 0x2060 && ch <= 0x2069; });
+    const std::wstring stripped = hasIsolate ? StripInvisibleUiChars(s) : std::wstring{};
+    const std::wstring& rendered = hasIsolate ? stripped : s;
+    HRESULT hr = dw->CreateTextLayout(rendered.c_str(), UINT32(rendered.size()), f, width, height, out);
     if (SUCCEEDED(hr) && TheFace().tabular)
-        (*out)->SetTypography(TheFace().tabular.get(), {0, UINT32(s.size())});
+        (*out)->SetTypography(TheFace().tabular.get(), {0, UINT32(rendered.size())});
     return hr;
 }
 
@@ -124,13 +128,21 @@ float MeasureUiText(IDWriteFactory* dw, const std::wstring& s, float px, DWRITE_
 void DrawUiText(ID2D1RenderTarget* rt, IDWriteFactory* dw, const std::wstring& s, IDWriteTextFormat* f, D2D1_RECT_F r, ID2D1Brush* b,
                 D2D1_DRAW_TEXT_OPTIONS options)
 {
-    bool digits = std::ranges::any_of(s, [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+    const bool hasIsolate = TheFace().collection && std::ranges::any_of(s, [](wchar_t ch) { return ch >= 0x2060 && ch <= 0x2069; });
+    const std::wstring stripped = hasIsolate ? StripInvisibleUiChars(s) : std::wstring{};
+    const std::wstring& rendered = hasIsolate ? stripped : s;
+    bool digits = std::ranges::any_of(rendered, [](wchar_t c) { return c >= L'0' && c <= L'9'; });
     winrt::com_ptr<IDWriteTextLayout> layout;
-    if (!digits || !TheFace().tabular || FAILED(UiTextLayout(dw, s, f, r.right - r.left, r.bottom - r.top, layout.put()))) {
-        rt->DrawText(s.c_str(), UINT32(s.size()), f, r, b, options);
+    if (!digits || !TheFace().tabular || FAILED(UiTextLayout(dw, rendered, f, r.right - r.left, r.bottom - r.top, layout.put()))) {
+        rt->DrawText(rendered.c_str(), UINT32(rendered.size()), f, r, b, options);
         return;
     }
+    const bool clip = (options & D2D1_DRAW_TEXT_OPTIONS_CLIP) != 0;
+    if (clip)
+        rt->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     rt->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout.get(), b, options);
+    if (clip)
+        rt->PopAxisAlignedClip();
 }
 
 } // namespace atrium

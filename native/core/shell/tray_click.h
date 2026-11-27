@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
+#include <string_view>
 #include <vector>
 
 namespace atrium::tray {
@@ -86,6 +87,18 @@ template<class Invoke, class Observe> DispatchResult Dispatch(Action action, boo
     return result;
 }
 
+// Permit XAML ShowContextMenu returning S_OK without observable menu evidence (#28),
+// while blocking provider timeouts, classic toolbars/S_FALSE, and already-observed outcomes.
+inline bool ShouldAttemptPointerRightFallback(const DispatchResult& result, bool classic)
+{
+    if (classic || result.outcome == Outcome::Observed)
+        return false;
+    if (result.outcome == Outcome::Unavailable)
+        return true;
+    return !result.attempts.empty() && result.attempts.back().route == Route::ContextMenu && result.attempts.back().status == 0 &&
+           !result.attempts.back().observed;
+}
+
 // Next to the click: above and to the right of it, else below or to the left; in `work`.
 inline POINT PlaceMenu(POINT at, int w, int h, const RECT& work)
 {
@@ -109,5 +122,44 @@ inline bool ShouldMoveFollowedMenu(const RECT& r, POINT at, const RECT& monitor,
     if (at.x >= r.left - 48 && at.x <= r.right + 48 && at.y >= r.top - 48 && at.y <= r.bottom + 48)
         return nativeMenu ? ExtendsBeyond(r, monitor, 8) : (ExtendsBeyond(r, monitor, 0) || ExtendsBeyond(r, work, 8));
     return true;
+}
+
+inline DWORD RecordPid(std::wstring_view recordId)
+{
+    if (!recordId.starts_with(L"uid:"))
+        return 0;
+    const std::wstring_view rest = recordId.substr(4);
+    const size_t colon = rest.find(L':');
+    if (colon == 0 || colon == std::wstring_view::npos)
+        return 0;
+    uint64_t pid = 0;
+    for (wchar_t ch : rest.substr(0, colon)) {
+        if (ch < L'0' || ch > L'9')
+            return 0;
+        pid = pid * 10 + static_cast<uint64_t>(ch - L'0');
+        if (pid > UINT32_MAX)
+            return 0;
+    }
+    return pid > 0 ? static_cast<DWORD>(pid) : 0;
+}
+
+inline bool ShouldObserveUnattributedMenu(bool nativeMenu, bool accessDenied, bool rightAction, bool popupStyle)
+{
+    return nativeMenu || (rightAction && accessDenied && popupStyle);
+}
+
+inline bool IsHoverPopupStyle(LONG_PTR style, LONG_PTR exStyle, bool nativeMenu, const RECT& rect, const RECT& monitorWork)
+{
+    if ((exStyle & WS_EX_APPWINDOW) != 0 || (style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) != 0)
+        return false;
+    const LONG w = rect.right - rect.left;
+    const LONG h = rect.bottom - rect.top;
+    if (w <= 0 || h <= 0)
+        return false;
+    const LONG workW = monitorWork.right - monitorWork.left;
+    const LONG workH = monitorWork.bottom - monitorWork.top;
+    if (workW > 0 && workH > 0 && (w > workW * 3 / 5 || h > workH * 3 / 4))
+        return false;
+    return nativeMenu || (style & WS_POPUP) != 0 || (exStyle & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) != 0 || (style & WS_CAPTION) != WS_CAPTION;
 }
 } // namespace atrium::tray

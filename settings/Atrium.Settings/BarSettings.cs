@@ -66,15 +66,16 @@ internal sealed class BarSettings
     public List<string> FolderStackFiles { get; set; } = [];
     public string TextColor { get; set; } = "auto"; // auto | light | dark
     public string Language { get; set; } = "auto"; // auto (follow Windows) | a locale tag: en, zh-Hans, ...
-    public string AutoHide { get; set; } = "fullscreen"; // never | fullscreen (a maximized or full-screen app in front) | always
+    public string AutoHide { get; set; } = "fullscreen"; // never | fullscreen | always
+    public bool BarDodge { get; set; }                  // Visible / Full screen: also hide whenever a window overlaps the bar
     public bool BarReserve { get; set; } = true;        // always shown: the bar keeps its strip, maximized windows end before it
     public bool BarFullscreenHide { get; set; } = true; // always shown: a full-screen app in front (a video, F11) has the screen
     public string BarEdge { get; set; } = "bottom"; // bottom | top | left | right
     public string StatusStyle { get; set; } = "ring"; // ring | icons (network, volume, battery as on the Windows taskbar)
     // The control centre's optional modules, in order; kControlModules in native/core/settings.h.
-    public static readonly string[] ControlModuleIds = ["stage", "energysaver", "darkmode", "hotspot"];
+    public static readonly string[] ControlModuleIds = ["stage", "energysaver", "darkmode", "hotspot", "dnd", "airplane"];
     public List<string> ControlModules { get; set; } = ["stage"];
-    public string DockDisplayMode { get; set; } = "primary"; // primary | follow | fixed | all
+    public string DockDisplayMode { get; set; } = "follow"; // primary | follow | fixed | all
     public double DockDisplayDelay { get; set; } = 450; // milliseconds at another display's bottom edge
     public string DockDisplay { get; set; } = "";
     public string DesktopDisplay { get; set; } = ""; // empty follows the system primary
@@ -116,10 +117,7 @@ internal sealed class BarSettings
     // Apps Stage Manager leaves alone; the default is the Windows Snipping Tool, whose overlay
     // and control bar must stay on screen while recording. Other tools can be added.
     // Keep in step with DefaultStageExcluded() in native/core/stage_excluded.h.
-    public static readonly string[] StageExcludedDefaults =
-    [
-        "snippingtool.exe", "screenclippinghost.exe", "microsoft.screensketch_",
-    ];
+    public static readonly string[] StageExcludedDefaults = ["snippingtool.exe", "screenclippinghost.exe", "microsoft.screensketch_"];
     public List<string> StageExcluded { get; set; } = [.. StageExcludedDefaults];
     public string WidgetMaterial { get; set; } = "glass"; // glass (the bar's) | dusk (dimmed glass, white ink) | color (their own faces)
     public bool HideTaskbar { get; set; } = true;      // the system taskbar is hidden while Atrium runs
@@ -130,6 +128,8 @@ internal sealed class BarSettings
     public bool WinKeyStart { get; set; }              // the Windows key alone opens Atrium's start menu
     public bool WinNumbers { get; set; }               // Win + 1..9, 0 open the bar's apps
     public bool StartOnLogin { get; set; } = true;
+    public string StartupMode { get; set; } = "run";   // run | task
+    public bool AutoUpdate { get; set; } = true;
     // Null = the key was absent (never saved); the core then imports the Windows pins.
     public List<PinnedApp>? Pins { get; set; }
 
@@ -230,6 +230,7 @@ internal sealed class BarSettings
             ["textColor"] = TextColor,
             ["language"] = Language,
             ["autoHide"] = AutoHide,
+            ["barDodge"] = BarDodge,
             ["barReserve"] = BarReserve,
             ["barFullscreenHide"] = BarFullscreenHide,
             ["barEdge"] = BarEdge,
@@ -279,6 +280,8 @@ internal sealed class BarSettings
             ["winKeyStart"] = WinKeyStart,
             ["winNumbers"] = WinNumbers,
             ["startOnLogin"] = StartOnLogin,
+            ["startupMode"] = StartupMode,
+            ["autoUpdate"] = AutoUpdate,
         };
         static JsonArray ToStringArray(List<string> list)
         {
@@ -408,8 +411,10 @@ internal sealed class BarSettings
         s.WinKeyStart = Flag("winKeyStart", f.WinKeyStart);
         s.WinNumbers = Flag("winNumbers", f.WinNumbers);
         s.StartOnLogin = Flag("startOnLogin", f.StartOnLogin);
+        s.StartupMode = Str("startupMode", f.StartupMode) == "task" ? "task" : "run";
+        s.AutoUpdate = Flag("autoUpdate", f.AutoUpdate);
         string mode = Str("dockDisplayMode", f.DockDisplayMode);
-        s.DockDisplayMode = mode is "follow" or "fixed" or "all" ? mode : "primary";
+        s.DockDisplayMode = mode is "primary" or "fixed" or "all" ? mode : "follow";
         s.DockDisplayDelay = Math.Clamp(Num("dockDisplayDelay", f.DockDisplayDelay), 100, 2000);
         s.DockDisplay = Str("dockDisplay", f.DockDisplay);
         s.DesktopDisplay = Str("desktopDisplay", f.DesktopDisplay);
@@ -423,6 +428,7 @@ internal sealed class BarSettings
         s.TextColor = textColor is "light" or "dark" ? textColor : "auto";
         string autoHide = Str("autoHide", f.AutoHide);
         s.AutoHide = autoHide is "never" or "always" ? autoHide : "fullscreen";
+        s.BarDodge = Flag("barDodge", autoHide == "dodge" && o?["barDodge"] == null || f.BarDodge);
         s.BarReserve = Flag("barReserve", f.BarReserve);
         s.BarFullscreenHide = Flag("barFullscreenHide", f.BarFullscreenHide);
         string barEdge = Str("barEdge", f.BarEdge);
@@ -558,7 +564,7 @@ internal sealed class BarSettings
         FolderStacks.SequenceEqual(o.FolderStacks, StringComparer.OrdinalIgnoreCase) &&
         FolderStackFiles.SequenceEqual(o.FolderStackFiles, StringComparer.OrdinalIgnoreCase) &&
         TextColor == o.TextColor && Language == o.Language && AutoHide == o.AutoHide &&
-        BarReserve == o.BarReserve && BarFullscreenHide == o.BarFullscreenHide &&
+        BarDodge == o.BarDodge && BarReserve == o.BarReserve && BarFullscreenHide == o.BarFullscreenHide &&
         BarEdge == o.BarEdge && StatusStyle == o.StatusStyle && ControlModules.SequenceEqual(o.ControlModules) && NotifyTimeout == o.NotifyTimeout &&
         NotifyAlways == o.NotifyAlways &&
         NotifyHideBody == o.NotifyHideBody && NotifyFullscreen == o.NotifyFullscreen &&
@@ -577,7 +583,7 @@ internal sealed class BarSettings
         WindowPeek == o.WindowPeek && HideBanners == o.HideBanners &&
         RemoteVisible == o.RemoteVisible &&
         WinKeyStart == o.WinKeyStart && WinNumbers == o.WinNumbers &&
-        StartOnLogin == o.StartOnLogin &&
+        StartOnLogin == o.StartOnLogin && StartupMode == o.StartupMode && AutoUpdate == o.AutoUpdate &&
         DockDisplayMode == o.DockDisplayMode && DockDisplayDelay == o.DockDisplayDelay && DockDisplay == o.DockDisplay && DesktopDisplay == o.DesktopDisplay &&
         TaskbarApps == o.TaskbarApps && TaskbarRightPrimaryOnly == o.TaskbarRightPrimaryOnly &&
         WindowsContextMenu == o.WindowsContextMenu &&
@@ -637,14 +643,8 @@ internal static class SettingsPersistence
                 PruneCorruptBackups(dir, stem, ext, maxBackups);
                 return true;
             }
-            catch (IOException) when (File.Exists(candidate))
-            {
-                continue;
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                return false;
-            }
+            catch (IOException) when (File.Exists(candidate)) { continue; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
         }
         return false;
     }
@@ -659,16 +659,14 @@ internal static class SettingsPersistence
             if (JsonNode.Parse(text) is JsonObject obj)
                 return BarSettings.FromJson(obj, new());
         }
-        catch (JsonException)
-        {
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            return new BarSettings();
-        }
+        catch (JsonException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return new BarSettings(); }
         TryBackupCorrupt(path);
         return new BarSettings();
     }
+
+    private static bool StartupDiffers(BarSettings prev, BarSettings next) =>
+        prev.StartOnLogin != next.StartOnLogin || (next.StartOnLogin && prev.StartupMode != next.StartupMode);
 
     public static bool WriteSettings(
         string path, BarSettings s, Func<string, object?[], string>? formatError = null, Func<string, bool>? backupCorrupt = null)
@@ -676,7 +674,7 @@ internal static class SettingsPersistence
         WriteGate.Wait();
         try
         {
-            bool startupChanged = new BarSettings().StartOnLogin != s.StartOnLogin;
+            bool startupChanged = StartupDiffers(new BarSettings(), s);
             if (File.Exists(path))
             {
                 string text = File.ReadAllText(path, Encoding.UTF8);
@@ -706,7 +704,7 @@ internal static class SettingsPersistence
                                 "Could not save {0}: settings file uses a newer format version (v{1} > v{2}). Update Atrium before saving.",
                                 path, ver, BarSettings.CurrentVersion));
                         }
-                        startupChanged = BarSettings.FromJson(obj, new()).StartOnLogin != s.StartOnLogin;
+                        startupChanged = StartupDiffers(BarSettings.FromJson(obj, new()), s);
                     }
                 }
             }

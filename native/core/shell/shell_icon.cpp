@@ -166,6 +166,55 @@ bool HIconToImage(HICON icon, IconImage& out)
 
 namespace {
 
+struct SquircleProfile {
+    float reach = 0.0f;
+    float a = 0.02f;
+};
+
+SquircleProfile SquircleFor(float width, float height, float radius)
+{
+    const float half = std::max(0.0f, std::min(width, height) * 0.5f);
+    radius = std::clamp(radius, 0.0f, half);
+    const float reach = std::min(radius * 1.6f, half);
+    if (reach <= 0.0f)
+        return {};
+    const float v = 1.0f - 0.2928932188134525f * radius / reach;
+    const float v2 = v * v;
+    if (width == height && radius == half)
+        return {reach, 0.0f};
+    return {reach, std::max(0.02f, (2.0f * v2 * v2 - v2) / (1.0f - v2))};
+}
+
+float SquircleF(float t, float a)
+{
+    const float t2 = t * t;
+    return t2 * t2 / (a + (1.0f - a) * t2);
+}
+
+float SquircleDF(float t, float a)
+{
+    const float t2 = t * t;
+    const float den = a + (1.0f - a) * t2;
+    return 2.0f * t * t2 * (2.0f * a + (1.0f - a) * t2) / (den * den);
+}
+
+float SquircleEdge(float qx, float qy, SquircleProfile p)
+{
+    if (p.reach <= 0.0f || std::min(qx, qy) <= 0.0f)
+        return std::max(qx, qy) - p.reach;
+    const float x = qx / p.reach;
+    const float y = qy / p.reach;
+    const float f = SquircleF(x, p.a) + SquircleF(y, p.a) - 1.0f;
+    return f * p.reach / std::max(std::hypot(SquircleDF(x, p.a), SquircleDF(y, p.a)), 1e-12f);
+}
+
+float SquircleCoverage(float x, float y, float width, float height, SquircleProfile p)
+{
+    const float qx = std::abs(x - width * 0.5f) - width * 0.5f + p.reach;
+    const float qy = std::abs(y - height * 0.5f) - height * 0.5f + p.reach;
+    return std::clamp(0.5f - SquircleEdge(qx, qy, p), 0.0f, 1.0f);
+}
+
 void ResampleRect(const IconImage& src, int sx0, int sy0, int sw, int sh, std::vector<uint8_t>& outBgra, int outWidth, int ox, int oy, int dw, int dh)
 {
     const uint8_t* srcData = src.Data();
@@ -325,6 +374,66 @@ bool LoadAtriumIcon(const std::wstring& exePath, int sizePx, IconImage& out)
     return ok;
 }
 
+bool HasEmbeddedExeIcon(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+    std::wstring expanded = path;
+    if (path.find(L'%') != std::wstring::npos) {
+        wchar_t buf[MAX_PATH * 2]{};
+        const DWORD n = ExpandEnvironmentStringsW(path.c_str(), buf, ARRAYSIZE(buf));
+        if (n > 0 && n <= ARRAYSIZE(buf))
+            expanded = buf;
+    }
+    return ExtractIconExW(expanded.c_str(), -1, nullptr, nullptr, 0) > 0;
+}
+
+bool IsFullBleedSquareIcon(const IconImage& img)
+{
+    if (img.Empty() || img.width != img.height || img.width < 8 || img.ByteSize() < static_cast<size_t>(img.width) * static_cast<size_t>(img.height) * 4)
+        return false;
+    const int side = img.width;
+    const uint8_t* data = img.Data();
+    auto alphaAt = [&](int x, int y) -> uint8_t { return data[(static_cast<size_t>(y) * static_cast<size_t>(side) + static_cast<size_t>(x)) * 4 + 3]; };
+    constexpr uint8_t kMinOpaqueAlpha = 240;
+    if (alphaAt(0, 0) < kMinOpaqueAlpha || alphaAt(side - 1, 0) < kMinOpaqueAlpha || alphaAt(0, side - 1) < kMinOpaqueAlpha ||
+        alphaAt(side - 1, side - 1) < kMinOpaqueAlpha)
+        return false;
+    for (int x = 0; x < side; ++x) {
+        if (alphaAt(x, 0) < kMinOpaqueAlpha || alphaAt(x, side - 1) < kMinOpaqueAlpha)
+            return false;
+    }
+    for (int y = 0; y < side; ++y) {
+        if (alphaAt(0, y) < kMinOpaqueAlpha || alphaAt(side - 1, y) < kMinOpaqueAlpha)
+            return false;
+    }
+    return true;
+}
+
+IconImage ApplySquircleMaskIfFullBleed(const IconImage& img)
+{
+    if (!IsFullBleedSquareIcon(img))
+        return img;
+    const int side = img.width;
+    const float fSide = static_cast<float>(side);
+    // Match bar_item_painter / launchpad icon plate proportion (22% of side).
+    const SquircleProfile profile = SquircleFor(fSide, fSide, fSide * 0.22f);
+    std::vector<uint8_t> px = img.Bytes();
+    for (int y = 0; y < side; ++y) {
+        for (int x = 0; x < side; ++x) {
+            const float cover = SquircleCoverage(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, fSide, fSide, profile);
+            if (cover >= 1.0f)
+                continue;
+            uint8_t* p = &px[(static_cast<size_t>(y) * static_cast<size_t>(side) + static_cast<size_t>(x)) * 4];
+            for (int c = 0; c < 4; ++c)
+                p[c] = static_cast<uint8_t>(std::lround(static_cast<float>(p[c]) * cover));
+            for (int c = 0; c < 3; ++c)
+                p[c] = std::min(p[c], p[3]);
+        }
+    }
+    return IconImage::FromBgra(side, side, std::move(px));
+}
+
 bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail)
 {
     if (!thumbnail) {
@@ -347,12 +456,16 @@ bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out,
             bool ok = HIconToImage(icon, raw);
             DestroyIcon(icon);
             if (ok) {
-                out = FitToSquare(raw, sizePx);
+                out = ApplySquircleMaskIfFullBleed(FitToSquare(raw, sizePx));
                 return true;
             }
         }
     }
-    return ShellImage(parsingName, sizePx, out, thumbnail);
+    if (!ShellImage(parsingName, sizePx, out, thumbnail))
+        return false;
+    if (!thumbnail)
+        out = ApplySquircleMaskIfFullBleed(out);
+    return true;
 }
 
 } // namespace atrium

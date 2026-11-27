@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="Atrium.Settings.DisplaysPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Atrium.Settings">
+
+    <StackPanel Spacing="24">
+        <Grid>
+            <TextBlock x:Name="DisplaySummary" Style="{StaticResource SectionStyle}" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+                <Button Content="Refresh" Click="OnRefresh" />
+                <Button Content="Windows display settings" Click="OnSystemDisplays" />
+            </StackPanel>
+        </Grid>
+        <ItemsControl x:Name="ConnectedDisplayList">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                    <Border Style="{StaticResource TileStyle}" Margin="0,0,0,10">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="{Binding Name}" Style="{StaticResource RowTitleStyle}" />
+                            <TextBlock Text="{Binding Details}" Style="{StaticResource RowNoteStyle}" />
+                        </StackPanel>
+                    </Border>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <Border Style="{StaticResource TileStyle}">
+            <StackPanel Spacing="16">
+                <TextBlock Text="Taskbar display mode" Style="{StaticResource SectionStyle}" />
+                <RadioButton x:Name="DockDisplayFollow" Content="Summon at the pointer's display" Tag="follow" GroupName="dockdisplay"
+                             Checked="OnDisplayMode" />
+                <RadioButton x:Name="DockDisplayPrimary" Content="Only on the primary display" Tag="primary" GroupName="dockdisplay"
+                             Checked="OnDisplayMode" />
+                <RadioButton x:Name="DockDisplayFixed" Content="Fix to a display" Tag="fixed" GroupName="dockdisplay"
+                             Checked="OnDisplayMode" />
+                <ComboBox x:Name="DockDisplayPicker" DisplayMemberPath="Name" HorizontalAlignment="Stretch"
+                          AutomationProperties.Name="Taskbar display" SelectionChanged="OnDockDisplay" />
+                <RadioButton x:Name="DockDisplayAll" Content="Show the taskbar on all displays" Tag="all" GroupName="dockdisplay"
+                             Checked="OnDisplayMode" />
+                <local:SliderTile x:Name="DisplayDelay" />
+            </StackPanel>
+        </Border>
+        <Border Style="{StaticResource TileStyle}">
+            <StackPanel Spacing="12">
+                <TextBlock Text="When using multiple displays, show my taskbar apps on" Style="{StaticResource RowTitleStyle}" />
+                <ComboBox x:Name="TaskbarAppsPicker" HorizontalAlignment="Stretch" AutomationProperties.Name="Taskbar apps on multiple displays"
+                          SelectionChanged="OnTaskbarApps">
+                    <ComboBoxItem Content="All taskbars" />
+                    <ComboBoxItem Content="Main taskbar and taskbars with open windows" />
+                    <ComboBoxItem Content="Taskbars with open windows" />
+                </ComboBox>
+            </StackPanel>
+        </Border>
+        <local:ToggleTile x:Name="TaskbarRightPrimaryOnlySwitch" Title="Right side on primary only"
+                          SwitchName="Right side on primary only" Toggled="OnTaskbarRightPrimaryOnly" />
+        <Border Style="{StaticResource TileStyle}">
+            <StackPanel Spacing="12">
+                <TextBlock Text="Desktop display" Style="{StaticResource SectionStyle}" />
+                <ComboBox x:Name="DesktopDisplayPicker" DisplayMemberPath="Name" HorizontalAlignment="Stretch"
+                          AutomationProperties.Name="Widgets and Stage Manager display" SelectionChanged="OnDesktopDisplay" />
+            </StackPanel>
+        </Border>
+        <TextBlock x:Name="DisplayFallback" Style="{StaticResource FootnoteStyle}" TextWrapping="Wrap" />
+    </StackPanel>
+</UserControl>

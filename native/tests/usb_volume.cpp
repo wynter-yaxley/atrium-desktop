@@ -1,6 +1,7 @@
 // Reconciliation and worker regressions. No real disks or system settings change.
 
 #include "shell/usb_volume.h"
+#include "win32_path.h"
 
 #include <cstdio>
 #include <chrono>
@@ -22,6 +23,41 @@ void Check(bool ok, const char* what)
 constexpr unsigned kC = 1u << 2, kE = 1u << 4;
 
 atrium::UsbVolumeSnapshot Attached(const wchar_t* identity = L"volume-A") { return {kC | kE, {{L'E', {L"BACKUP", identity}}}}; }
+
+void CheckSanitization()
+{
+    using namespace atrium;
+    // Build a deterministic CP936 mojibake string from UTF-8 bytes of "资料" (6 bytes) and 11-byte truncated UTF-8.
+    auto makeMojibake = [](const std::string& utf8, UINT cp) -> std::wstring {
+        const int n = MultiByteToWideChar(cp, 0, utf8.data(), int(utf8.size()), nullptr, 0);
+        if (n <= 0)
+            return {};
+        std::wstring out(size_t(n), L'\0');
+        MultiByteToWideChar(cp, 0, utf8.data(), int(utf8.size()), out.data(), n);
+        return out;
+    };
+    const std::string utf8Data = "\xE8\xB5\x84\xE6\x96\x99"; // "资料"
+    const std::wstring mojibake936 = makeMojibake(utf8Data, 936);
+    if (!mojibake936.empty()) {
+        Check(SanitizeUsbVolumeLabel(mojibake936 + L"   ", 936, 936) == L"\x8D44\x6599", "repairs UTF-8 decoded as CP936 volume label");
+        Check(SanitizeAutoPlayText(mojibake936 + L" (\x2068"
+                                                 L"E:\x2069)",
+                                   936, 936) == L"\x8D44\x6599 (E:)",
+              "repairs mojibake AutoPlay toast title and strips BiDi isolates");
+    }
+    // Clean Chinese volume label is never garbled further.
+    Check(SanitizeUsbVolumeLabel(L"我的U盘  ", 936, 936) == L"我的U盘", "preserves valid CJK USB label and trims spaces");
+    Check(StripInvisibleUiChars(L"工作盘 (\x2068"
+                                L"F:\x2069)") == L"工作盘 (F:)",
+          "strips U+2068/U+2069 BiDi isolates");
+    // 11-byte FAT32 label truncated mid-UTF8 character ("资料ABCD"+truncated lead+cont):
+    const std::string fat11 = "AB\xE8\xB5\x84\xE6\x96\x99\xE7\x9B\xAE"; // 2 + 3 + 3 + 3 = 11 bytes valid, test cut 11 bytes:
+    const std::string fat11Cut = "ABC\xE8\xB5\x84\xE6\x96\x99\xE7\x9B"; // 3 + 3 + 3 + 2 incomplete = 11 bytes
+    const std::wstring fat11Cut936 = makeMojibake(fat11Cut, 936);
+    if (!fat11Cut936.empty())
+        Check(SanitizeUsbVolumeLabel(fat11Cut936, 936, 936) == L"ABC\x8D44\x6599", "repairs 11-byte FAT32 label cut mid-UTF8");
+    (void)fat11;
+}
 
 void CheckReconciliation()
 {
@@ -161,6 +197,7 @@ int main(int argc, char** argv)
     Check(JoinNames({L"E:", L"F:"}) == std::wstring(L"E:") + Tr(L", ") + L"F:", "the names are joined");
 
     CheckReconciliation();
+    CheckSanitization();
     CheckWorker();
 
     if (g_failures) {

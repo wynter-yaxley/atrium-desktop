@@ -11,16 +11,20 @@
 #include <winrt/Windows.Foundation.h>
 #include <algorithm>
 #include <iostream>
-#include <stdexcept>
 #include <string_view>
 
 using namespace atrium;
 
 namespace {
-void Require(bool condition, const char* message)
+bool g_failed = false;
+
+bool Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (condition)
+        return true;
+    std::cerr << message << '\n';
+    g_failed = true;
+    return false;
 }
 
 void CheckClockAndBadgeSettings(Settings& settings, Settings& parsed)
@@ -111,7 +115,7 @@ void CheckSettings()
         settings.taskbarApps = mode;
         Require(Settings::FromJson(settings.ToJson(), Settings{}, parsed) && parsed.taskbarApps == mode, "every task distribution mode survives saving");
     }
-    Require(Settings::FromJson(LR"({"height":64})", Settings{}, parsed) && parsed.dockDisplayMode == L"primary" && parsed.taskbarApps == L"all" &&
+    Require(Settings::FromJson(LR"({"height":64})", Settings{}, parsed) && parsed.dockDisplayMode == L"follow" && parsed.taskbarApps == L"all" &&
                 parsed.dockDisplayDelay == 450 && !parsed.taskbarRightPrimaryOnly && parsed.notifyPlacement == L"dock",
             "old settings retain right-side elements and default dock notifications");
     Require(Settings::FromJson(LR"({"notifyPlacement":"bad"})", Settings{}, parsed) && parsed.notifyPlacement == L"dock",
@@ -127,7 +131,7 @@ void CheckSettings()
     }
     settings.notifyPlacement = L"topRight";
     Require(Settings::FromJson(LR"({"dockDisplayMode":"bad","taskbarApps":"bad","dockDisplayDelay":99999})", Settings{}, parsed) &&
-                parsed.dockDisplayMode == L"primary" && parsed.taskbarApps == L"all" && parsed.dockDisplayDelay == 2000,
+                parsed.dockDisplayMode == L"follow" && parsed.taskbarApps == L"all" && parsed.dockDisplayDelay == 2000,
             "invalid values are normalized");
     Require(Settings::FromJson(LR"({"dockDisplayDelay":-1})", Settings{}, parsed) && parsed.dockDisplayDelay == 100, "delay has a lower bound");
     Require(Settings::FromJson(LR"({"dockDisplayDelay":"bad","dockDisplay":false})", settings, parsed) && parsed.dockDisplayDelay == 750 &&
@@ -195,6 +199,19 @@ void CheckSettingsNormalization()
     Require(Settings::FromJson(LR"({"tint":"# 12345"})", tinted, parsed) && parsed.tint == 0x112233, "whitespace-padded tint is rejected and retains fallback");
     Require(Settings::FromJson(LR"({"tint":"#GGGGGG"})", tinted, parsed) && parsed.tint == 0x112233, "non-hex tint is rejected and retains fallback");
     Require(Settings::FromJson(LR"({"tint":"#1a2B3c"})", tinted, parsed) && parsed.tint == 0x1A2B3C, "strict ASCII hex tint parses");
+
+    Settings updateOff;
+    updateOff.autoUpdate = false;
+    Require(Settings{}.autoUpdate && Settings::FromJson(LR"({})", Settings{}, parsed) && parsed.autoUpdate, "autoUpdate defaults to true");
+    Require(Settings::FromJson(updateOff.ToJson(), Settings{}, parsed) && !parsed.autoUpdate, "autoUpdate false persists across round trip");
+    Require(Settings::FromJson(LR"({"autoUpdate":"bad"})", updateOff, parsed) && !parsed.autoUpdate, "malformed autoUpdate retains current value");
+
+    Settings taskStartup;
+    taskStartup.startupMode = L"task";
+    Require(Settings{}.startupMode == L"run" && Settings::FromJson(LR"({})", Settings{}, parsed) && parsed.startupMode == L"run",
+            "startupMode defaults to run");
+    Require(Settings::FromJson(taskStartup.ToJson(), Settings{}, parsed) && parsed.startupMode == L"task", "startupMode task persists across round trip");
+    Require(Settings::FromJson(LR"({"startupMode":"bogus"})", taskStartup, parsed) && parsed.startupMode == L"run", "invalid startupMode normalizes to run");
 }
 
 void CheckExtrasSettings()
@@ -266,9 +283,10 @@ void CheckExtrasSettings()
 
     Settings modules;
     Require(modules.controlModules == std::vector<std::wstring>{L"stage"}, "controlModules defaults to Stage Manager");
-    modules.controlModules = {L" darkmode ", L"wifi", L"stage", L"darkmode", L"", L"hotspot"};
+    modules.controlModules = {L" darkmode ", L"wifi", L"stage", L"dnd", L"darkmode", L"", L"airplane", L"hotspot"};
     modules.Clamp();
-    Require(modules.controlModules == std::vector<std::wstring>{L"darkmode", L"stage", L"hotspot"}, "controlModules keeps known modules once, in order");
+    Require(modules.controlModules == std::vector<std::wstring>{L"darkmode", L"stage", L"dnd", L"airplane", L"hotspot"},
+            "controlModules keeps known modules once, in order");
     modules.controlModules = {L"nightlight", L"stage", L"darkmode"};
     modules.Clamp();
     Require(modules.controlModules == std::vector<std::wstring>{L"darkmode", L"stage"}, "controlModules: night light is dark mode now");
@@ -327,7 +345,7 @@ void CheckTaskDistribution()
     auto local = TaskItemsForDisplay(items, L"primaryAndWindow", false, external, first, monitorOf);
     Require(local.size() == 3 && local[0].windows.empty() && !local[0].active && !local[0].attention && local[0].badge == 5,
             "remote pins stay without running or active indicators, keeping their badge");
-    Require(local[1].windows == std::vector<HWND>{second} && !local[1].active, "window previews only include local windows");
+    Require(local.size() >= 2 && local[1].windows == std::vector<HWND>{second} && !local[1].active, "window previews only include local windows");
     local = TaskItemsForDisplay(items, L"window", true, primary, first, monitorOf);
     Require(local.size() == 2 && local[1].windows == std::vector<HWND>{first} && local[1].active, "window-only mode also filters the primary taskbar");
     auto moved = TaskItemsForDisplay(items, L"window", false, external, second, [&](HWND) { return external; });
@@ -589,7 +607,7 @@ void CheckNotificationWithdrawAndMerge()
     Require(notification::WithdrawNotice(wechat, wechatWithdraw), "title-based withdraw still removes matching card");
 }
 
-void RunNormalizer()
+bool RunNormalizer()
 {
     namespace json = winrt::Windows::Data::Json;
     std::string line;
@@ -599,15 +617,19 @@ void RunNormalizer()
         if (line.empty())
             continue;
         json::JsonObject obj{nullptr};
-        Require(json::JsonObject::TryParse(Utf8ToWide(line), obj), "valid ndjson line");
+        if (!Require(json::JsonObject::TryParse(Utf8ToWide(line), obj), "valid ndjson line"))
+            return false;
         Settings base;
-        if (obj.HasKey(L"base") && obj.GetNamedValue(L"base").ValueType() == json::JsonValueType::Object)
-            Require(Settings::FromJson(std::wstring(obj.GetNamedObject(L"base").Stringify()), Settings{}, base), "valid base");
+        if (obj.HasKey(L"base") && obj.GetNamedValue(L"base").ValueType() == json::JsonValueType::Object) {
+            if (!Require(Settings::FromJson(std::wstring(obj.GetNamedObject(L"base").Stringify()), Settings{}, base), "valid base"))
+                return false;
+        }
         std::wstring patchText;
         if (obj.HasKey(L"patchText") && obj.GetNamedValue(L"patchText").ValueType() == json::JsonValueType::String) {
             patchText = std::wstring(obj.GetNamedString(L"patchText"));
         } else {
-            Require(obj.HasKey(L"patch") && obj.GetNamedValue(L"patch").ValueType() == json::JsonValueType::Object, "patch object required");
+            if (!Require(obj.HasKey(L"patch") && obj.GetNamedValue(L"patch").ValueType() == json::JsonValueType::Object, "patch object required"))
+                return false;
             patchText = std::wstring(obj.GetNamedObject(L"patch").Stringify());
         }
         Settings out;
@@ -617,6 +639,7 @@ void RunNormalizer()
             std::cout << R"({"ok":false})" << '\n';
         std::cout.flush();
     }
+    return true;
 }
 
 StackWindow MakeStackWin(uintptr_t id, const wchar_t* cls, RECT r, bool caption = true, bool topmost = false)
@@ -662,28 +685,24 @@ void CheckWidgetStacking()
 
 int main(int argc, char** argv)
 {
-    try {
-        winrt::init_apartment();
-        if (std::any_of(argv + 1, argv + argc, [](const char* arg) { return std::string_view(arg) == "--normalize"; })) {
-            RunNormalizer();
-            return 0;
-        }
-        CheckSettings();
-        CheckStageDragMerge();
-        CheckSettingsNormalization();
-        CheckExtrasSettings();
-        CheckDataDirArgument();
-        CheckDisplays();
-        CheckTaskDistribution();
-        CheckFullscreenCoverage();
-        CheckTaskbarReshowGuard();
-        CheckNotificationLayout();
-        CheckNotificationQuietState();
-        CheckWidgetStacking();
-        CheckNotificationWithdrawAndMerge();
-        std::cout << "Display, fullscreen auto-hide, notification placement and animated reflow checks passed.\n";
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+    winrt::init_apartment();
+    if (std::any_of(argv + 1, argv + argc, [](const char* arg) { return std::string_view(arg) == "--normalize"; }))
+        return RunNormalizer() ? 0 : 1;
+    CheckSettings();
+    CheckStageDragMerge();
+    CheckSettingsNormalization();
+    CheckExtrasSettings();
+    CheckDataDirArgument();
+    CheckDisplays();
+    CheckTaskDistribution();
+    CheckFullscreenCoverage();
+    CheckTaskbarReshowGuard();
+    CheckNotificationLayout();
+    CheckNotificationQuietState();
+    CheckWidgetStacking();
+    CheckNotificationWithdrawAndMerge();
+    if (g_failed)
         return 1;
-    }
+    std::cout << "Display, fullscreen auto-hide, notification placement and animated reflow checks passed.\n";
+    return 0;
 }

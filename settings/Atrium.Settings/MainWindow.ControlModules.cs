@@ -17,6 +17,9 @@ public sealed partial class MainWindow
         "stage" => "\uE7C4",
         "energysaver" => "\uEC0A",
         "darkmode" => "\uE708",
+        "hotspot" => "\uE88A",
+        "dnd" => "\uE7ED",
+        "airplane" => "\uE709",
         _ => "\uE88A",
     };
 
@@ -25,6 +28,9 @@ public sealed partial class MainWindow
         "stage" => "Stage Manager",
         "energysaver" => "Energy saver",
         "darkmode" => "Dark mode",
+        "hotspot" => "Mobile hotspot",
+        "dnd" => "Do Not Disturb",
+        "airplane" => "Airplane mode",
         _ => "Mobile hotspot",
     };
 
@@ -33,6 +39,9 @@ public sealed partial class MainWindow
         "stage" => "Turn Stage Manager on or off",
         "energysaver" => "Save battery",
         "darkmode" => "Windows and apps in dark colours",
+        "hotspot" => "Share this PC's internet",
+        "dnd" => "Silence notification popups",
+        "airplane" => "Turn off all wireless radios",
         _ => "Share this PC's internet",
     };
 

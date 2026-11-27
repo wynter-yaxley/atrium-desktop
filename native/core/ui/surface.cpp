@@ -365,22 +365,29 @@ LRESULT CALLBACK Surface::Proc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 }
 
-void Surface::Place(RECT rect)
+void Surface::Place(RECT rect, bool keepZOrder)
 {
     rect_ = rect;
     scale_ = PopupScale(rect);
     int inset = InsetPx();
     window_ = RECT{rect.left - inset, rect.top - inset, rect.right + inset, rect.bottom + inset};
-    ApplyPlacement();
+    ApplyPlacement(keepZOrder);
 }
 
-void Surface::ApplyPlacement()
+void Surface::ApplyPlacement(bool keepZOrder)
 {
     if (desktopLayer_) {
+        HMONITOR mon = MonitorFromRect(&rect_, MONITOR_DEFAULTTONEAREST);
         MONITORINFO monitor{sizeof(monitor)};
-        GetMonitorInfoW(MonitorFromRect(&rect_, MONITOR_DEFAULTTONEAREST), &monitor);
-        if (!EqualRect(&nativeWindow_, &monitor.rcMonitor)) {
-            nativeWindow_ = monitor.rcMonitor;
+        RECT targetMonitor{};
+        if (!mon || GetMonitorInfoW(mon, &monitor) == FALSE)
+            targetMonitor = !IsRectEmpty(&window_) ? window_ : rect_;
+        else
+            targetMonitor = monitor.rcMonitor;
+        if (IsRectEmpty(&targetMonitor))
+            return;
+        if (!EqualRect(&nativeWindow_, &targetMonitor)) {
+            nativeWindow_ = targetMonitor;
             SetWindowPos(hwnd_, nullptr, nativeWindow_.left, nativeWindow_.top, nativeWindow_.right - nativeWindow_.left,
                          nativeWindow_.bottom - nativeWindow_.top, SWP_NOACTIVATE | SWP_NOZORDER);
             inputRegion_ = {};
@@ -400,7 +407,9 @@ void Surface::ApplyPlacement()
         }
         return;
     }
-    SetWindowPos(hwnd_, HWND_TOPMOST, window_.left, window_.top, window_.right - window_.left, window_.bottom - window_.top, SWP_NOACTIVATE);
+    const bool noZOrder = keepZOrder && visible_;
+    const UINT flags = SWP_NOACTIVATE | (noZOrder ? SWP_NOZORDER : 0u);
+    SetWindowPos(hwnd_, noZOrder ? nullptr : HWND_TOPMOST, window_.left, window_.top, window_.right - window_.left, window_.bottom - window_.top, flags);
     ApplyRegion();
 }
 
@@ -448,6 +457,7 @@ void Surface::Show(RECT rect, bool activate, POINT anchor, bool pop)
     hiding_ = false;
     if (!visible_) {
         visible_ = true;
+        failedFrames_ = 0;
         firstPaint_ = !wasHiding;
         if (!wasHiding)
             StartGlassWait();
@@ -470,7 +480,7 @@ void Surface::Show(RECT rect, bool activate, POINT anchor, bool pop)
         onReady();
 }
 
-void Surface::Move(RECT rect)
+void Surface::Move(RECT rect, bool keepZOrder)
 {
     // Keep each desktop content frame paired with its glass geometry.
     // Input can replace the next request
@@ -483,7 +493,7 @@ void Surface::Move(RECT rect)
     if (EqualRect(&rect, &rect_))
         return;
     bool resized = rect.right - rect.left != rect_.right - rect_.left || rect.bottom - rect.top != rect_.bottom - rect_.top;
-    Place(rect);
+    Place(rect, keepZOrder);
     if (visible_) {
         PublishPanel();
         if (resized || desktopLayer_) // desktop translation travels with the pixel buffer
@@ -602,8 +612,10 @@ bool Surface::EnsureDevice()
     if (d2d_)
         return true;
     shared_ = SharedDevice();
-    if (!shared_)
+    if (!shared_) {
+        RetryFrame();
         return false;
+    }
     const auto size = BufferSize();
     int w = int(size.width), h = int(size.height);
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -621,8 +633,7 @@ bool Surface::EnsureDevice()
         FAILED(visual_->SetContent(swap_.get())) || FAILED(target_->SetRoot(visual_.get())) || FAILED(s.dcomp->Commit()) ||
         FAILED(s.d2d->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, d2d_.put()))) {
         Log(L"surface: swap chain setup failed");
-        s.lost = true; // a fresh shared device next time
-        ResetDevice();
+        RecoverDevice(); // marks shared_->lost, resets, and retries boundedly
         return false;
     }
     bufW_ = w;
@@ -630,169 +641,39 @@ bool Surface::EnsureDevice()
     return true;
 }
 
-void Surface::Paint()
+void Surface::RecoverDevice()
 {
-    if (painting_) {
-        frameWanted_ = true;
-        return;
-    }
-    painting_ = true;
-    PaintFrame();
-    painting_ = false;
+    if (shared_)
+        shared_->lost = true;
+    ResetDevice();
+    RetryFrame();
 }
 
-void Surface::PaintFrame()
+void Surface::SetupCanvasInk(Canvas& c)
 {
-    if (presentPending_) {
-        // Keep this buffer paired with its glass. Input and time continue to
-        // advance; the next frame uses their latest state once it is presented.
+    c.panel = !g_host || (!glassReady_ && c.now - shownMs_ > kGlassWaitMs);
+    if (c.panel) {
+        c.theme = Theme::Panel();
+        c.inkDark = c.theme.light ? 1.f : 0.f;
+        return;
+    }
+    // The inks fade to what the glass needs now (InkFade).
+    bool fading = inkAll_.Moving(c.now);
+    c.inkDark = inkAll_.set ? inkAll_.Value(c.now) : (darkInk_ ? 1.f : 0.f);
+    c.theme = Theme::Mix(c.inkDark);
+    if (!inkCells_.empty()) {
+        c.ink.w = inkGrid_.w;
+        c.ink.h = inkGrid_.h;
+        c.ink.cellX = inkGrid_.cellX;
+        c.ink.cellY = inkGrid_.cellY;
+        c.ink.dark.resize(inkCells_.size());
+        for (size_t i = 0; i < inkCells_.size(); ++i) {
+            c.ink.dark[i] = inkCells_[i].Value(c.now);
+            fading |= inkCells_[i].Moving(c.now);
+        }
+    }
+    if (fading)
         frameWanted_ = true;
-        return;
-    }
-    if (!visible_ || !EnsureDevice())
-        return;
-    const auto size = BufferSize();
-    int w = int(size.width), h = int(size.height);
-    if (w != bufW_ || h != bufH_) {
-        d2d_->SetTarget(nullptr);
-        backTarget_ = nullptr;
-        if (FAILED(swap_->ResizeBuffers(2, UINT(w), UINT(h), DXGI_FORMAT_B8G8R8A8_UNORM, 0))) {
-            ResetDevice();
-            return;
-        }
-        bufW_ = w;
-        bufH_ = h;
-    }
-    if (!backTarget_) {
-        winrt::com_ptr<IDXGISurface> back;
-        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                                                             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-        if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(back.put()))) || FAILED(d2d_->CreateBitmapFromDxgiSurface(back.get(), &bp, backTarget_.put()))) {
-            ResetDevice();
-            return;
-        }
-    }
-    LARGE_INTEGER t0, t1, f;
-    QueryPerformanceCounter(&t0);
-    d2d_->SetTarget(backTarget_.get());
-    d2d_->BeginDraw();
-    d2d_->Clear(D2D1::ColorF(0, 0, 0, 0));
-    d2d_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    frameWanted_ = false;
-    if (paint) {
-        float inset = float(InsetPx());
-        d2d_->SetTransform(D2D1::Matrix3x2F::Translation(inset, inset));
-        Canvas c(*this, d2d_.get(), scale_);
-        c.now = ClockMs();
-        c.panel = !g_host || (!glassReady_ && c.now - shownMs_ > kGlassWaitMs);
-        if (c.panel) {
-            c.theme = Theme::Panel();
-            c.inkDark = c.theme.light ? 1.f : 0.f;
-        } else {
-            // The inks fade to what the glass needs now (InkFade).
-            bool fading = inkAll_.Moving(c.now);
-            c.inkDark = inkAll_.set ? inkAll_.Value(c.now) : (darkInk_ ? 1.f : 0.f);
-            c.theme = Theme::Mix(c.inkDark);
-            if (!inkCells_.empty()) {
-                c.ink.w = inkGrid_.w;
-                c.ink.h = inkGrid_.h;
-                c.ink.cellX = inkGrid_.cellX;
-                c.ink.cellY = inkGrid_.cellY;
-                c.ink.dark.resize(inkCells_.size());
-                for (size_t i = 0; i < inkCells_.size(); ++i) {
-                    c.ink.dark[i] = inkCells_[i].Value(c.now);
-                    fading |= inkCells_[i].Moving(c.now);
-                }
-            }
-            if (fading)
-                frameWanted_ = true;
-        }
-        paint(c);
-        d2d_->SetTransform(D2D1::Matrix3x2F::Identity());
-    }
-    HRESULT hr = d2d_->EndDraw();
-    d2d_->SetTarget(nullptr);
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&f);
-    double ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
-    if (firstPaint_ || ms > 16) {
-        wchar_t title[64] = {};
-        GetWindowTextW(hwnd_, title, 64);
-        Log(L"surface: %s painted %dx%d in %.1f ms%s", title, w, h, ms, firstPaint_ ? L" (first after show)" : L"");
-        firstPaint_ = false;
-    }
-    if (FAILED(hr)) {
-        Log(L"surface: paint failed 0x%08X, recreating", unsigned(hr));
-        if (shared_)
-            shared_->lost = true;
-        ResetDevice();
-        RetryFrame();
-        return;
-    }
-    failedFrames_ = 0;
-    paintMs_ = ms;
-    presentGen_ = glassGen_;
-    presentPending_ = true;
-    bool waitForGlass = glassPending_ && glassReady_ && !IsGlassPresented(hwnd_, presentGen_);
-    glassPending_ = false;
-    if (!waitForGlass)
-        Present();
-}
-
-void Surface::Present()
-{
-    if (!visible_ || !presentPending_ || !swap_)
-        return;
-    if (desktopLayer_) {
-        ApplyPlacement();
-        const DXGI_MATRIX_3X2_F matrix{1, 0, 0, 1, float(window_.left - nativeWindow_.left), float(window_.top - nativeWindow_.top)};
-        if (FAILED(swap_.as<IDXGISwapChain2>()->SetMatrixTransform(&matrix))) {
-            ResetDevice();
-            return;
-        }
-        // One composed frame later the region can forget the previous bounds.
-        frameWanted_ |= !EqualRect(&presentedWindow_, &window_);
-        presentedWindow_ = window_;
-    }
-    presentPending_ = false;
-    HRESULT hr = swap_->Present(0, 0);
-    if (FAILED(hr)) {
-        Log(L"surface: present failed 0x%08X, recreating", unsigned(hr));
-        if (shared_)
-            shared_->lost = true;
-        ResetDevice();
-        RetryFrame();
-        return;
-    }
-    const double ms = paintMs_;
-    // Frame statistics of an animation (a run of frames that asked for more).
-    double end = ClockMs();
-    if (frameWanted_) {
-        if (!burst_.frames)
-            burst_ = Burst{end, end, 0, 0, 0};
-        burst_.maxGap = std::max(burst_.maxGap, end - burst_.last);
-        burst_.maxPaint = std::max(burst_.maxPaint, ms);
-        burst_.last = end;
-        ++burst_.frames;
-    } else if (burst_.frames) {
-        if (burst_.frames >= 4) {
-            wchar_t title[64] = {};
-            GetWindowTextW(hwnd_, title, 64);
-            double span = end - burst_.start;
-            Log(L"surface: %s animated %d frames in %.0f ms (%.0f fps), longest gap %.1f ms, slowest paint %.1f ms", title, burst_.frames + 1, span,
-                span > 0 ? 1000.0 * burst_.frames / span : 0.0, std::max(burst_.maxGap, end - burst_.last), std::max(burst_.maxPaint, ms));
-        }
-        burst_ = Burst{};
-    }
-    if (nextResize_) {
-        RECT next = *nextResize_;
-        nextResize_.reset();
-        Move(next);
-    }
-    if (releaseResize_ && !presentPending_ && !nextResize_)
-        ReserveResize(D2D1::SizeF());
-    if (frameWanted_ && visible_)
-        FramePump::Get().Want(hwnd_);
 }
 
 } // namespace atrium

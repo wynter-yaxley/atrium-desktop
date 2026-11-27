@@ -128,7 +128,19 @@ try {
         @('native/core/ui/foo.cpp', 'void F(HANDLE h) { WaitForSingleObject(h, INFINITE); }', ': ui-infinite-wait:'),
         @('native/core/ui/foo.cpp', 'void F() { FooAsync(1).get(); }', ': ui-winrt-blocking-get:'),
         @('native/core/ui/foo.cpp', 'void F() { std::thread([=] {}); }', ': thread-default-capture:'),
-        @('native/core/a.cpp', 'void F(std::thread& t) { t.detach(); }', ': detach:')
+        @('native/core/a.cpp', 'void F(std::thread& t) { t.detach(); }', ': detach:'),
+        @('native/core/a.cpp', "void F()`n{`n    try {`n        Foo();`n    } catch (const std::exception&) {`n    }`n}", ': try:'),
+        @('native/core/a.cpp', "void F()`n{`n    try {`n        Foo();`n    } catch (...) {`n    }`n}", ': try:'),
+        @('native/core/a.cpp', ("void F()`n{`n    try {`n        Foo();`n    } catch (const winrt::hresult_error&) {`n" +
+            "    } catch (const std::exception&) {`n    }`n}"), ': try:'),
+        @('native/core/a.cpp', ("void F()`n{`n    try {`n        Foo();`n    } catch (const std::exception&) {`n" +
+            "    } catch (const winrt::hresult_error&) {`n    }`n}"), ': try:'),
+        @('native/core/a.cpp', ("void F()`n{`n    try {`n        Foo();`n    } catch (const winrt::hresult_error&) {`n" +
+            "    } catch (...) {`n    }`n}"), ': try:'),
+        @('native/core/a.cpp', "void F()`n{`n    try {`n        Foo();`n    } catch (const winrt::hresult_error_code&) {`n    }`n}", ': try:'),
+        @('native/core/a.cpp', "void F()`n{`n    try {`n        Foo();`n    }`n}", ': try:'),
+        @('native/core/a.cpp', ("void F()`n{`n    try {`n        try {`n            Foo();`n        } catch (const std::exception&) {`n" +
+            "        }`n    } catch (const winrt::hresult_error&) {`n    }`n}"), ': try:')
     )
     $r = New-FixtureRepo 'native-bans'
     foreach ($tc in $nativeCases) {
@@ -140,10 +152,26 @@ try {
     $r = New-FixtureRepo 'safety-pass'
     Write-RepoFile $r 'native/core/a.cpp' ("void F(HWND tip, HWND other, DWORD me, DWORD them)`n{`n" +
         "    SendMessageW(tip, TTM_GETDELAYTIME, 0, 0);`n    if (!IsHungAppWindow(other)) {`n" +
-        "        AttachThreadInput(me, them, TRUE);`n    }`n}")
+        "        AttachThreadInput(me, them, TRUE);`n    }`n}`n" +
+        "void WinRtTries(bool flag)`n{`n" +
+        "    try {`n        if (flag) {`n            Foo();`n        }`n" +
+        "    } catch (const winrt::hresult_error& e) {`n        Log(e);`n    }`n" +
+        "    try {`n        Foo();`n    } catch (winrt::hresult_error) {`n    }`n" +
+        "    try {`n        Foo();`n    } catch (const hresult_error& e) {`n        Log(e);`n    }`n" +
+        "    try {`n        Foo();`n    } catch (const winrt::hresult_error* p) {`n        Log(p);`n" +
+        "    } catch (const winrt::hresult_error& e) {`n        Log(e);`n    }`n" +
+        "    try {`n        try {`n            Foo();`n        } catch (const winrt::hresult_error&) {`n        }`n" +
+        "    } catch (const winrt::hresult_error&) {`n    }`n}")
     Write-RepoFile $r 'native/core/shell/shell_taskbar.h' ("// Taskbar.`n#pragma once`ninline void Tb()`n{`n" +
         "    SHAppBarMessage(0, nullptr);`n    Shell_NotifyIconGetRect(nullptr, nullptr);`n}")
     Write-RepoFile $r 'native/core/settings.cpp' "#include <winrt/base.h>`nint kSettingsOk = 1;"
+    Invoke-LintCase $r @() 0 @('lint: clean')
+
+    $r = New-FixtureRepo 'try-mixed-count'
+    Write-RepoFile $r 'native/core/a.cpp' ("void F()`n{`n" +
+        "    try {`n        Foo();`n    } catch (const winrt::hresult_error&) {`n    }`n" +
+        "    try {`n        Bar();`n    } catch (const std::exception&) {`n    }`n}")
+    Write-RepoFile $r 'tools/lint-baseline.json' '{"core/a.cpp|try":1}'
     Invoke-LintCase $r @() 0 @('lint: clean')
 
     # 5. Layers, header-cycle, csharp-layer

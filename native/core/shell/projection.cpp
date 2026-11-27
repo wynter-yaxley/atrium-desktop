@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -55,7 +56,8 @@ struct DisplaySubscription {
         auto step = [](auto&& f) {
             try {
                 f();
-            } catch (const hresult_error&) {
+            } catch (const winrt::hresult_error& error) {
+                Log(L"cast: display watcher cleanup failed (0x%08X)", unsigned(error.code()));
             }
         };
         if (added.value)
@@ -113,22 +115,25 @@ void DisplayFinder::Start(HWND hwnd, UINT msg)
     }
     std::weak_ptr<State> weak = state_;
     worker_ = std::thread([weak, gen] {
+        auto changed = [weak, gen](auto&& apply) {
+            if (auto s = weak.lock()) {
+                {
+                    std::lock_guard g(s->lock);
+                    if (s->gen != gen || s->stop)
+                        return;
+                    apply(*s);
+                }
+                s->Notify(gen);
+            }
+        };
+        std::optional<ApartmentGuard> apartment;
+        DisplaySubscription subscription;
+        bool started = false;
+        bool failed = false;
         try {
-            ApartmentGuard apartment;
-            DisplaySubscription subscription;
+            apartment.emplace();
             auto w = DeviceInformation::CreateWatcher(ProjectionManager::GetDeviceSelector());
             subscription.watcher = w;
-            auto changed = [weak, gen](auto&& apply) {
-                if (auto s = weak.lock()) {
-                    {
-                        std::lock_guard g(s->lock);
-                        if (s->gen != gen || s->stop)
-                            return;
-                        apply(*s);
-                    }
-                    s->Notify(gen);
-                }
-            };
             subscription.added = w.Added([changed](const DeviceWatcher&, const DeviceInformation& d) {
                 std::wstring id(d.Id()), name(d.Name());
                 changed([&](State& s) { s.found[id] = name; });
@@ -150,12 +155,14 @@ void DisplayFinder::Start(HWND hwnd, UINT msg)
                 }
                 if (!stopped) {
                     w.Start();
-                    std::unique_lock lk(s->lock);
-                    s->cv.wait(lk, [&] { return s->stop || s->gen != gen; });
+                    started = true;
                 }
             }
-        } catch (...) {
-            Log(L"cast: watching for wireless displays failed");
+        } catch (const winrt::hresult_error& error) {
+            Log(L"cast: watching for wireless displays failed (0x%08X)", unsigned(error.code()));
+            failed = true;
+        }
+        if (failed) {
             if (auto s = weak.lock()) {
                 {
                     std::lock_guard g(s->lock);
@@ -164,6 +171,11 @@ void DisplayFinder::Start(HWND hwnd, UINT msg)
                     s->searching = false;
                 }
                 s->Notify(gen);
+            }
+        } else if (started) {
+            if (auto s = weak.lock()) {
+                std::unique_lock lk(s->lock);
+                s->cv.wait(lk, [&] { return s->stop || s->gen != gen; });
             }
         }
     });
@@ -201,6 +213,7 @@ bool DisplayFinder::Searching() const
 
 bool ProjectTo(const std::wstring& id)
 {
+    bool ok = false;
     try {
         auto createOp = DeviceInformation::CreateFromIdAsync(id);
         if (!AwaitAsync(createOp, L"create"))
@@ -211,29 +224,32 @@ bool ProjectTo(const std::wstring& id)
         if (!AwaitAsync(projOp, L"projecting"))
             return false;
         projOp.GetResults();
-        Log(L"cast: projecting");
-        return true;
-    } catch (const hresult_error& e) {
-        Log(L"cast: projecting failed (0x%08X)", unsigned(e.code()));
-    } catch (...) {
-        Log(L"cast: projecting failed");
+        ok = true;
+    } catch (const winrt::hresult_error& error) {
+        Log(L"cast: projecting failed (0x%08X)", unsigned(error.code()));
+        return false;
     }
-    return false;
+    if (ok)
+        Log(L"cast: projecting");
+    return ok;
 }
 
 bool StopProjecting()
 {
+    bool ok = false;
     try {
         auto stopOp = ProjectionManager::StopProjectingAsync(0, 0);
         if (!AwaitAsync(stopOp, L"stopping"))
             return false;
         stopOp.GetResults();
-        Log(L"cast: stopped");
-        return true;
-    } catch (...) {
-        Log(L"cast: stopping failed");
+        ok = true;
+    } catch (const winrt::hresult_error& error) {
+        Log(L"cast: stopping failed (0x%08X)", unsigned(error.code()));
+        return false;
     }
-    return false;
+    if (ok)
+        Log(L"cast: stopped");
+    return ok;
 }
 
 ProjectionMode CurrentProjectionMode(int* displays)

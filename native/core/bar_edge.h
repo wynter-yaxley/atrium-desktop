@@ -5,6 +5,8 @@
 #include <d2d1.h>
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
 #include <string_view>
 
 namespace atrium {
@@ -19,15 +21,19 @@ constexpr BarEdge ParseBarEdge(std::wstring_view name)
 
 constexpr bool Vertical(BarEdge edge) { return edge == BarEdge::Left || edge == BarEdge::Right; }
 
+constexpr BarEdge EdgeInMonitor(const RECT& bar, const RECT& m)
+{
+    if (bar.bottom - bar.top > bar.right - bar.left)
+        return bar.left + bar.right < m.left + m.right ? BarEdge::Left : BarEdge::Right;
+    return bar.top + bar.bottom < m.top + m.bottom ? BarEdge::Top : BarEdge::Bottom;
+}
+
 // The edge a bar's glass (screen px) sits on, from the rect alone: popups need no other word of it.
 inline BarEdge EdgeOf(const RECT& bar)
 {
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(MonitorFromRect(&bar, MONITOR_DEFAULTTONEAREST), &mi);
-    const RECT& m = mi.rcMonitor;
-    if (bar.bottom - bar.top > bar.right - bar.left)
-        return bar.left + bar.right < m.left + m.right ? BarEdge::Left : BarEdge::Right;
-    return bar.top + bar.bottom < m.top + m.bottom ? BarEdge::Top : BarEdge::Bottom;
+    return EdgeInMonitor(bar, mi.rcMonitor);
 }
 
 // The bar is laid out as at the bottom of a landscape area: u along the bar, v across it, growing
@@ -112,6 +118,120 @@ inline RECT PlaceBarWindow(const BarPlacement& p)
     const int x = (int(frame.Along()) - p.winW) / 2;
     const int y = int(frame.Across()) - p.margin - p.barH - p.insetTop;
     return frame.ToArea(RECT{x, y, x + p.winW, y + p.winH});
+}
+
+// Always-shown taskbar with "keep room for windows" reserves `margin + barH + margin`
+// so the inner gap between maximized windows and the bar equals the outer screen margin.
+constexpr int BarReservePx(int barH, int margin) { return barH + 2 * std::max(0, margin); }
+
+// Full-length edge strip (screen px) used to summon an auto-hidden bar anywhere along `edge` of `monitor`.
+inline RECT MonitorEdgeStrip(BarEdge edge, const RECT& monitor, LONG thickness = 2)
+{
+    if (thickness <= 0 || monitor.right <= monitor.left || monitor.bottom <= monitor.top)
+        return RECT{};
+    const LONG spanX = std::min(thickness, monitor.right - monitor.left);
+    const LONG spanY = std::min(thickness, monitor.bottom - monitor.top);
+    switch (edge) {
+    case BarEdge::Top: return RECT{monitor.left, monitor.top, monitor.right, monitor.top + spanY};
+    case BarEdge::Left: return RECT{monitor.left, monitor.top, monitor.left + spanX, monitor.bottom};
+    case BarEdge::Right: return RECT{monitor.right - spanX, monitor.top, monitor.right, monitor.bottom};
+    default: return RECT{monitor.left, monitor.bottom - spanY, monitor.right, monitor.bottom};
+    }
+}
+
+// Interactive bar region extended outward to `monitor`'s edge so hovering icons or the margin keeps a revealed bar up.
+inline RECT BarEdgeZone(BarEdge edge, const RECT& window, const RECT& monitor, const D2D1_RECT_F& bar)
+{
+    if (bar.right <= bar.left || window.right <= window.left || window.bottom <= window.top || monitor.right <= monitor.left || monitor.bottom <= monitor.top)
+        return RECT{};
+    const EdgeFrame f{edge, window};
+    return f.ToArea(RECT{LONG(bar.left), 0, LONG(bar.right), std::max<LONG>(0, f.FromArea(monitor).bottom)});
+}
+
+inline bool InEdgeSummonZone(BarEdge edge, POINT pointer, const RECT& monitor, LONG thickness = 2)
+{
+    const RECT strip = MonitorEdgeStrip(edge, monitor, thickness);
+    return PtInRect(&strip, pointer) != FALSE;
+}
+
+inline bool InEdgeRevealZone(BarEdge edge, POINT pointer, const RECT& window, const RECT& monitor, const D2D1_RECT_F& bar, LONG thickness = 2)
+{
+    if (InEdgeSummonZone(edge, pointer, monitor, thickness))
+        return true;
+    const RECT zone = BarEdgeZone(edge, window, monitor, bar);
+    return PtInRect(&zone, pointer) != FALSE;
+}
+
+// Edge a docked system taskbar occupies on `mon`, or nullopt if auto-hidden/unrecognized.
+inline std::optional<BarEdge> TaskbarEdgeOnMonitor(const RECT& tb, const RECT& mon)
+{
+    const LONG w = tb.right - tb.left, h = tb.bottom - tb.top, mw = mon.right - mon.left, mh = mon.bottom - mon.top;
+    if (w <= 0 || h <= 0 || mw <= 0 || mh <= 0)
+        return std::nullopt;
+    if (w >= h && w >= mw / 2 && h >= 16 && h < mh / 2) {
+        if (std::abs(tb.bottom - mon.bottom) <= 4 && tb.top > mon.top)
+            return BarEdge::Bottom;
+        if (std::abs(tb.top - mon.top) <= 4 && tb.bottom < mon.bottom)
+            return BarEdge::Top;
+    }
+    if (h > w && h >= mh / 2 && w >= 16 && w < mw / 2) {
+        if (std::abs(tb.left - mon.left) <= 4 && tb.right < mon.right)
+            return BarEdge::Left;
+        if (std::abs(tb.right - mon.right) <= 4 && tb.left > mon.left)
+            return BarEdge::Right;
+    }
+    return std::nullopt;
+}
+
+constexpr LONG RectEdge(const RECT& r, BarEdge edge)
+{
+    return edge == BarEdge::Top ? r.top : edge == BarEdge::Left ? r.left : edge == BarEdge::Right ? r.right : r.bottom;
+}
+
+constexpr bool WorkAreaEdgeExpanded(const RECT& before, const RECT& after, const RECT& mon, BarEdge edge)
+{
+    const LONG a = RectEdge(after, edge), m = RectEdge(mon, edge), b = RectEdge(before, edge);
+    return (edge == BarEdge::Top || edge == BarEdge::Left) ? (a <= m || a < b) : (a >= m || a > b);
+}
+
+constexpr bool WorkAreaEdgeShrunk(const RECT& before, const RECT& after, BarEdge edge)
+{
+    const LONG a = RectEdge(after, edge), b = RectEdge(before, edge);
+    return (edge == BarEdge::Top || edge == BarEdge::Left) ? (a > b) : (a < b);
+}
+
+struct TaskbarWorkSnapshot {
+    HMONITOR monitor = nullptr;
+    BarEdge edge = BarEdge::Bottom;
+    RECT work{};
+    RECT monitorRect{};
+};
+
+constexpr bool WorkAreaSnapshotSynced(const TaskbarWorkSnapshot& s, const RECT& currentWork, bool release)
+{
+    return release ? WorkAreaEdgeExpanded(s.work, currentWork, s.monitorRect, s.edge) : WorkAreaEdgeShrunk(s.work, currentWork, s.edge);
+}
+
+inline std::optional<TaskbarWorkSnapshot> MakeTaskbarSnapshot(HMONITOR mon, const RECT& tb, const RECT& monitor, const RECT& work, bool requireDockedEdge)
+{
+    auto edge = TaskbarEdgeOnMonitor(tb, monitor);
+    if (!edge && !requireDockedEdge)
+        edge = EdgeInMonitor(tb, monitor);
+    if (!edge || (requireDockedEdge && WorkAreaEdgeExpanded(work, work, monitor, *edge)))
+        return std::nullopt;
+    return TaskbarWorkSnapshot{mon, *edge, work, monitor};
+}
+
+inline bool WorkHoldsTaskbarEdge(const RECT& tb, const RECT& mon, const RECT& work)
+{
+    const auto edge = TaskbarEdgeOnMonitor(tb, mon);
+    if (!edge)
+        return false;
+    const BarEdge inner = *edge == BarEdge::Bottom ? BarEdge::Top :
+                          *edge == BarEdge::Top    ? BarEdge::Bottom :
+                          *edge == BarEdge::Left   ? BarEdge::Right :
+                                                     BarEdge::Left;
+    return std::abs(RectEdge(work, *edge) - RectEdge(tb, inner)) <= 1;
 }
 
 } // namespace atrium

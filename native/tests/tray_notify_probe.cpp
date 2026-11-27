@@ -31,6 +31,40 @@ public:
         return S_OK;
     }
 };
+namespace {
+
+void PumpFor(DWORD ms)
+{
+    HANDLE timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    if (timer) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(ms) * 10000LL;
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+    }
+    const ULONGLONG until = GetTickCount64() + ms;
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= until)
+            break;
+        const DWORD remaining = static_cast<DWORD>(until - now);
+        if (timer) {
+            if (MsgWaitForMultipleObjects(1, &timer, FALSE, remaining, QS_ALLINPUT) == WAIT_OBJECT_0)
+                break;
+        } else {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, remaining, QS_ALLINPUT);
+        }
+    }
+    if (timer)
+        CloseHandle(timer);
+}
+
+} // namespace
+
 int wmain()
 {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -46,17 +80,8 @@ int wmain()
             auto callback = Microsoft::WRL::Make<Callback>();
             ULONG cookie = 0;
             hr = tray->RegisterCallback(callback.Get(), &cookie);
-            if (SUCCEEDED(hr)) {
-                const auto until = GetTickCount64() + 500;
-                while (GetTickCount64() < until) {
-                    MSG msg;
-                    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                        TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                    Sleep(10);
-                }
-            }
+            if (SUCCEEDED(hr))
+                PumpFor(500);
             std::wcout << L"register=0x" << std::hex << unsigned(hr) << std::dec << L" count=" << callback->count << L'\n';
             if (SUCCEEDED(hr))
                 std::wcout << L"unregister=0x" << std::hex << unsigned(tray->UnregisterCallback(&cookie)) << L'\n';

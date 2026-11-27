@@ -1,6 +1,7 @@
 #include "ui/window_snapshot.h"
 
 #include "log.h"
+#include "shell/process_integrity.h"
 #include "render/window_capture.h"
 #include "win32_path.h"
 
@@ -257,6 +258,12 @@ WindowPicture TryPrintWindow(HWND window, const RECT& win, const RECT& frame, in
 WindowPicture Capture(HWND window, int maxWidth, int maxHeight, float radius, int largeMax, WindowPicture* large, std::unordered_set<HWND>& logged,
                       WindowFrameCapturer& capturer, HANDLE stopEvent)
 {
+    if (WindowHasHigherIntegrity(window)) {
+        RECT win{};
+        GetWindowRect(window, &win);
+        LogCaptureFailure(logged, window, L"skipped (higher integrity / UIPI)", win.right - win.left, win.bottom - win.top, ERROR_ACCESS_DENIED);
+        return {};
+    }
     if (!CanPrintWindow(window)) {
         RECT win{};
         GetWindowRect(window, &win);

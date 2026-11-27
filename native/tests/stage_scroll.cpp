@@ -5,17 +5,19 @@
 
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
 #include <vector>
 
 using namespace atrium;
 
 namespace {
+bool g_failed = false;
 
 void Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        g_failed = true;
+    }
 }
 
 void CheckMerge()
@@ -59,8 +61,6 @@ void CheckMerge()
     Require(!StageMergeGroups(stage, recent, {}, L"front.exe|9", {L"front.exe|9"}), "self-only group cannot merge into itself");
     Require(stage == keepStage && recent == keepRecent, "rejected merges leave stage and strip groups untouched");
 }
-
-} // namespace
 
 void CheckFade()
 {
@@ -159,66 +159,62 @@ void CheckStageScrollAndMerge()
     CheckMerge();
 }
 
+} // namespace
+
 int main()
 {
-    try {
-        CheckFade();
-        auto require = Require;
-        StageOpenIntent intent;
-        intent.Arm(L"editor", 100);
-        require(!intent.Matches(L"browser", 101), "a launch intent never targets another app");
-        require(intent.Matches(L"editor", 10099), "the requested app joins when its window arrives");
-        require(!intent.Matches(L"editor", 10100), "a stale launch intent expires");
-        intent.Arm(L"editor", 20000);
-        intent.Cancel();
-        require(!intent.Matches(L"editor", 20001), "disable or stage switching cancels a launch intent");
-        CheckStageScrollAndMerge();
+    CheckFade();
+    auto require = Require;
+    StageOpenIntent intent;
+    intent.Arm(L"editor", 100);
+    require(!intent.Matches(L"browser", 101), "a launch intent never targets another app");
+    require(intent.Matches(L"editor", 10099), "the requested app joins when its window arrives");
+    require(!intent.Matches(L"editor", 10100), "a stale launch intent expires");
+    intent.Arm(L"editor", 20000);
+    intent.Cancel();
+    require(!intent.Matches(L"editor", 20001), "disable or stage switching cancels a launch intent");
+    CheckStageScrollAndMerge();
 
-        // Park predicate: disabled windows (e.g. blocked by a modal dialog) stay where they are.
-        require(ShouldParkStageWindow(false, true, false, true, false, false, true), "enabled non-transient window on monitor parks");
-        require(!ShouldParkStageWindow(false, true, false, true, false, false, false), "disabled window is never parked");
-        require(!ShouldParkStageWindow(true, true, false, true, false, false, true) && !ShouldParkStageWindow(false, false, false, true, false, false, true) &&
-                    !ShouldParkStageWindow(false, true, true, true, false, false, true) &&
-                    !ShouldParkStageWindow(false, true, false, false, false, false, true) &&
-                    !ShouldParkStageWindow(false, true, false, true, true, false, true) && !ShouldParkStageWindow(false, true, false, true, false, true, true),
-                "parked, hidden, iconic, off-monitor, transient, and fullscreen windows do not park");
+    // Park predicate: disabled windows (e.g. blocked by a modal dialog) stay where they are.
+    require(ShouldParkStageWindow(false, true, false, true, false, false, true), "enabled non-transient window on monitor parks");
+    require(!ShouldParkStageWindow(false, true, false, true, false, false, false), "disabled window is never parked");
+    require(!ShouldParkStageWindow(true, true, false, true, false, false, true) && !ShouldParkStageWindow(false, false, false, true, false, false, true) &&
+                !ShouldParkStageWindow(false, true, true, true, false, false, true) && !ShouldParkStageWindow(false, true, false, false, false, false, true) &&
+                !ShouldParkStageWindow(false, true, false, true, true, false, true) && !ShouldParkStageWindow(false, true, false, true, false, true, true),
+            "parked, hidden, iconic, off-monitor, transient, and fullscreen windows do not park");
 
-        // Adopt / wait / drop decisions for stage windows.
-        require(DecideStageAdopt(false, true, false, true, false, false) == StageAdoptAction::Up, "visible non-iconic on monitor stays up");
-        require(DecideStageAdopt(false, true, false, false, true, false) == StageAdoptAction::Drop, "non-iconic moved off monitor is dropped");
-        require(DecideStageAdopt(false, true, true, false, true, false) == StageAdoptAction::Adopt, "minimized in up_ at -32000 off-monitor is adopted");
-        require(DecideStageAdopt(false, true, true, false, false, false) == StageAdoptAction::Adopt, "minimized stage window that missed up_ is adopted");
-        require(DecideStageAdopt(false, true, true, false, false, true) == StageAdoptAction::Wait, "minimized window still restoring waits");
-        require(ShouldWaitStageRestore(true, 5000, 2000, true), "outbound strip flight keeps waiting beyond settle timeout");
-        require(ShouldWaitStageRestore(false, 0, 2000, true), "outbound strip flight waits even without prior restoring entry");
-        require(DecideStageAdopt(false, true, true, false, false, ShouldWaitStageRestore(true, 100, 2000, false)) == StageAdoptAction::Wait,
-                "post-flight restoring window within settle window waits");
-        require(DecideStageAdopt(false, true, true, false, false, ShouldWaitStageRestore(true, 2001, 2000, false)) == StageAdoptAction::Adopt,
-                "restoring window exceeding settle window after flight ends is adopted");
-        require(!ShouldWaitStageRestore(false, 0, 2000, false), "inbound flight does not suppress adoption when not restoring");
-        require(DecideStageAdopt(true, true, true, true, true, false) == StageAdoptAction::Drop, "already parked window is skipped");
-        require(DecideStageAdopt(false, false, true, true, true, false) == StageAdoptAction::Drop, "hidden window is skipped");
+    // Adopt / wait / drop decisions for stage windows.
+    require(DecideStageAdopt(false, true, false, true, false, false) == StageAdoptAction::Up, "visible non-iconic on monitor stays up");
+    require(DecideStageAdopt(false, true, false, false, true, false) == StageAdoptAction::Drop, "non-iconic moved off monitor is dropped");
+    require(DecideStageAdopt(false, true, true, false, true, false) == StageAdoptAction::Adopt, "minimized in up_ at -32000 off-monitor is adopted");
+    require(DecideStageAdopt(false, true, true, false, false, false) == StageAdoptAction::Adopt, "minimized stage window that missed up_ is adopted");
+    require(DecideStageAdopt(false, true, true, false, false, true) == StageAdoptAction::Wait, "minimized window still restoring waits");
+    require(ShouldWaitStageRestore(true, 5000, 2000, true), "outbound strip flight keeps waiting beyond settle timeout");
+    require(ShouldWaitStageRestore(false, 0, 2000, true), "outbound strip flight waits even without prior restoring entry");
+    require(DecideStageAdopt(false, true, true, false, false, ShouldWaitStageRestore(true, 100, 2000, false)) == StageAdoptAction::Wait,
+            "post-flight restoring window within settle window waits");
+    require(DecideStageAdopt(false, true, true, false, false, ShouldWaitStageRestore(true, 2001, 2000, false)) == StageAdoptAction::Adopt,
+            "restoring window exceeding settle window after flight ends is adopted");
+    require(!ShouldWaitStageRestore(false, 0, 2000, false), "inbound flight does not suppress adoption when not restoring");
+    require(DecideStageAdopt(true, true, true, true, true, false) == StageAdoptAction::Drop, "already parked window is skipped");
+    require(DecideStageAdopt(false, false, true, true, true, false) == StageAdoptAction::Drop, "hidden window is skipped");
 
-        // First-picture short delay and failed/blank retry backoff.
-        require(!ShouldTakeStagePicture(false, false, 0, 299, ULLONG_MAX), "first picture waits 300 ms away from caption buttons");
-        require(ShouldTakeStagePicture(false, false, 0, 300, ULLONG_MAX), "first picture fires at 300 ms");
-        require(!ShouldTakeStagePicture(false, true, 0, 199, ULLONG_MAX), "first picture waits 200 ms on caption buttons");
-        require(ShouldTakeStagePicture(false, true, 0, 200, ULLONG_MAX), "first picture fires at 200 ms on caption buttons");
-        require(!ShouldTakeStagePicture(false, true, 0, 400, 100), "in-flight first picture does not re-request immediately");
-        require(!ShouldTakeStagePicture(false, false, 1, 1000, 699) && ShouldTakeStagePicture(false, false, 1, 1000, 700), "first blank retries after 700 ms");
-        require(!ShouldTakeStagePicture(false, false, 2, 3000, 1499) && ShouldTakeStagePicture(false, false, 2, 3000, 1500),
-                "second blank retries after 1500 ms");
-        require(!ShouldTakeStagePicture(false, false, 3, 9000, 4999) && ShouldTakeStagePicture(false, false, 3, 9000, 5000), "further blanks cap at 5000 ms");
-        require(!ShouldTakeStagePicture(true, true, 0, 1499, 5000), "refresh with picture still waits 1500 ms settle");
-        require(!ShouldTakeStagePicture(true, false, 0, 2000, 19999) && ShouldTakeStagePicture(true, false, 0, 2000, 20000),
-                "steady refresh away from buttons is 20 s");
-        require(!ShouldTakeStagePicture(true, true, 0, 2000, 1499) && ShouldTakeStagePicture(true, true, 0, 2000, 1500),
-                "steady refresh on buttons is 1500 ms");
+    // First-picture short delay and failed/blank retry backoff.
+    require(!ShouldTakeStagePicture(false, false, 0, 299, ULLONG_MAX), "first picture waits 300 ms away from caption buttons");
+    require(ShouldTakeStagePicture(false, false, 0, 300, ULLONG_MAX), "first picture fires at 300 ms");
+    require(!ShouldTakeStagePicture(false, true, 0, 199, ULLONG_MAX), "first picture waits 200 ms on caption buttons");
+    require(ShouldTakeStagePicture(false, true, 0, 200, ULLONG_MAX), "first picture fires at 200 ms on caption buttons");
+    require(!ShouldTakeStagePicture(false, true, 0, 400, 100), "in-flight first picture does not re-request immediately");
+    require(!ShouldTakeStagePicture(false, false, 1, 1000, 699) && ShouldTakeStagePicture(false, false, 1, 1000, 700), "first blank retries after 700 ms");
+    require(!ShouldTakeStagePicture(false, false, 2, 3000, 1499) && ShouldTakeStagePicture(false, false, 2, 3000, 1500), "second blank retries after 1500 ms");
+    require(!ShouldTakeStagePicture(false, false, 3, 9000, 4999) && ShouldTakeStagePicture(false, false, 3, 9000, 5000), "further blanks cap at 5000 ms");
+    require(!ShouldTakeStagePicture(true, true, 0, 1499, 5000), "refresh with picture still waits 1500 ms settle");
+    require(!ShouldTakeStagePicture(true, false, 0, 2000, 19999) && ShouldTakeStagePicture(true, false, 0, 2000, 20000),
+            "steady refresh away from buttons is 20 s");
+    require(!ShouldTakeStagePicture(true, true, 0, 2000, 1499) && ShouldTakeStagePicture(true, true, 0, 2000, 1500), "steady refresh on buttons is 1500 ms");
 
-        std::cout << "PASS: cyclic Stage scrolling, strip hit-testing and group merges\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "FAIL: " << error.what() << '\n';
+    if (g_failed)
         return 1;
-    }
+    std::cout << "PASS: cyclic Stage scrolling, strip hit-testing and group merges\n";
+    return 0;
 }

@@ -13,7 +13,9 @@
 
 #include <array>
 #include <cwctype>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace atrium {
@@ -31,7 +33,7 @@ inline const MessengerInfo& InfoOf(Messenger m)
 {
     static const MessengerInfo kInfo[] = {
         {L"wechat", L"WeChat", {L"weixin.exe", L"wechat.exe", nullptr, nullptr}, {L"weixin", L"wechat", L"微信", nullptr}},
-        {L"qq", L"QQ", {L"qq.exe", nullptr, nullptr, nullptr}, {L"qq", nullptr, nullptr, nullptr}},
+        {L"qq", L"QQ", {L"qq.exe", L"tim.exe", nullptr, nullptr}, {L"qq", L"tim", nullptr, nullptr}},
         {L"feishu", L"Feishu", {L"feishu.exe", L"lark.exe", nullptr, nullptr}, {L"feishu", L"lark", L"飞书", nullptr}},
         {L"wecom", L"WeCom", {L"wxwork.exe", L"wecom.exe", L"wxworklocal.exe", L"wxworklocalpro.exe"}, {L"wxwork", L"wecom", L"企业微信", nullptr}},
         {L"dingtalk", L"DingTalk", {L"dingtalk.exe", nullptr, nullptr, nullptr}, {L"dingtalk", L"钉钉", nullptr, nullptr}},
@@ -78,19 +80,25 @@ inline Messenger MessengerOfNotice(const std::wstring& source, const std::wstrin
     return Messenger::None;
 }
 
-// Flashes and cards per app. A flash after a quiet spell begins a burst; once the wait is over,
-// a burst no card came for (from a little before it) is due its plain card. Within a burst, more
-// flashes (each message flashes again) add nothing: the card says there is something new.
+// Flashes and cards per app instance (`pid`; 0 when the instance is unknown, e.g. a Windows toast).
+// A flash after a quiet spell begins a burst; once the wait is over, a burst no card came for
+// (from a little before it) is due its plain card. Within a burst, more flashes add nothing.
 class MessengerAlerts {
 public:
     static constexpr ULONGLONG kQuietMs = 8000, kWaitMs = 3000, kBeforeMs = 5000;
 
-    // True when this flash begins a burst (check Due after kWaitMs).
-    bool Flash(Messenger m, ULONGLONG now)
+    struct DueAlert {
+        Messenger messenger = Messenger::None;
+        DWORD pid = 0;
+        bool operator==(const DueAlert&) const = default;
+    };
+
+    // True when this flash begins a burst (check Due/DueInstances after kWaitMs).
+    bool Flash(Messenger m, ULONGLONG now, DWORD pid = 0)
     {
         if (m == Messenger::None)
             return false;
-        State& s = state_[size_t(m)];
+        State& s = state_[{m, pid}];
         const bool begins = !s.pending && (s.last == 0 || now - s.last >= kQuietMs);
         s.last = now;
         if (begins) {
@@ -99,25 +107,43 @@ public:
         }
         return begins;
     }
-    void Noticed(Messenger m, ULONGLONG now)
+    void Noticed(Messenger m, ULONGLONG now, DWORD pid = 0)
     {
-        if (m != Messenger::None)
-            state_[size_t(m)].noticed = now;
+        if (m == Messenger::None)
+            return;
+        if (pid != 0) {
+            state_[{m, pid}].noticed = now;
+            return;
+        }
+        state_[{m, 0}].noticed = now;
+        for (auto& [key, s] : state_)
+            if (key.first == m)
+                s.noticed = now;
     }
-    void Cancel(Messenger m)
+    void Cancel(Messenger m, DWORD pid = 0)
     {
-        if (m != Messenger::None) {
-            state_[size_t(m)].pending = false;
-            state_[size_t(m)].last = 0;
+        if (m == Messenger::None)
+            return;
+        if (pid != 0) {
+            if (auto it = state_.find({m, pid}); it != state_.end()) {
+                it->second.pending = false;
+                it->second.last = 0;
+            }
+            return;
+        }
+        for (auto& [key, s] : state_) {
+            if (key.first == m) {
+                s.pending = false;
+                s.last = 0;
+            }
         }
     }
-    // The apps whose burst is over without a card; `waiting` tells whether one is still pending.
-    std::vector<Messenger> Due(ULONGLONG now, bool* waiting = nullptr)
+    std::vector<DueAlert> DueInstances(ULONGLONG now, bool* waiting = nullptr)
     {
-        std::vector<Messenger> out;
+        std::vector<DueAlert> out;
         bool more = false;
-        for (size_t i = 0; i < state_.size(); ++i) {
-            State& s = state_[i];
+        const ULONGLONG globalNoticedWeChat = state_.contains({Messenger::WeChat, 0}) ? state_[{Messenger::WeChat, 0}].noticed : 0;
+        for (auto& [key, s] : state_) {
             if (!s.pending)
                 continue;
             if (now - s.burst < kWaitMs) {
@@ -125,11 +151,21 @@ public:
                 continue;
             }
             s.pending = false;
-            if (!s.noticed || s.noticed + kBeforeMs < s.burst)
-                out.push_back(Messenger(i));
+            const ULONGLONG noticed = key.first == Messenger::WeChat ? std::max(s.noticed, globalNoticedWeChat) : s.noticed;
+            if (!noticed || noticed + kBeforeMs < s.burst)
+                out.push_back({key.first, key.second});
         }
         if (waiting)
             *waiting = more;
+        return out;
+    }
+    // Backwards-compatible app-level projection for callers/tests without PID.
+    std::vector<Messenger> Due(ULONGLONG now, bool* waiting = nullptr)
+    {
+        std::vector<Messenger> out;
+        for (const DueAlert& alert : DueInstances(now, waiting))
+            if (std::ranges::find(out, alert.messenger) == out.end())
+                out.push_back(alert.messenger);
         return out;
     }
 
@@ -138,7 +174,11 @@ private:
         ULONGLONG burst = 0, last = 0, noticed = 0;
         bool pending = false;
     };
-    std::array<State, size_t(Messenger::Count)> state_{};
+    std::map<std::pair<Messenger, DWORD>, State> state_;
 };
 
+struct MessengerSourceMeta {
+    std::wstring program;
+    std::wstring hostKey;
+};
 } // namespace atrium

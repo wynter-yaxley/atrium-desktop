@@ -14,6 +14,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace atrium {
@@ -82,9 +84,9 @@ public:
     // The path a pinned item was pinned from (a shortcut when that is what was
     // pinned): the shell's menus and AppUserModelID live there, not on the exe.
     std::wstring PinTarget(const std::wstring& key) const;
-    // Brings the group's most recent window to the front (never minimizes or
-    // launches); used while files are dragged over the item.
-    void Show(const std::wstring& key);
+    // Brings a window of the group to the front (never minimizes or launches);
+    // when `pid` is non-zero, targets that specific instance. Returns true if one was shown.
+    bool Show(const std::wstring& key, DWORD pid = 0);
     // Moves a running unpinned group to `toIndex` among the unpinned groups.
     void MoveRunning(const std::wstring& key, int toIndex);
     // Files dropped on an item: open them with that app.
@@ -96,6 +98,9 @@ public:
     // The user's current Windows taskbar pins (desktop apps, from
     // %APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar).
     static std::vector<PinnedApp> ImportWindowsPins();
+
+    // Reloads failed icons immediately once AppCatalog finishes its initial refresh.
+    void OnCatalogLoaded();
 
     // Forwarded from the UI window procedure; returns true if handled.
     bool HandleMessage(UINT msg, WPARAM wp, LPARAM lp);
@@ -130,6 +135,59 @@ std::optional<LaunchPlan> BuildLaunchPlan(const PinnedApp* pin, const std::wstri
 bool OpenFilesWithTaskApp(const std::wstring& desktopExe, const std::wstring& aumid, const std::vector<std::wstring>& files);
 bool SendTaskSysCommand(HWND h, WPARAM command);
 void RaiseTaskWindow(HWND h, HWND ui, UINT restoreMsg, const std::function<void(HWND)>& deferActivate, const std::function<bool(HWND)>& isPending);
+
+// Window identity, scanning, and pin resolution helpers (task_model_windows.cpp).
+struct TaskWinInfo {
+    DWORD pid = 0;
+    std::wstring exePath;
+    std::wstring aumid;
+    std::wstring key;
+    ULONGLONG created = 0;
+    bool webApp = false;
+    std::wstring launcher;
+};
+
+struct TaskPin {
+    PinnedApp app;
+    std::wstring key, target, exe, aumid;
+    bool multipleWindows = false;
+    bool specific = false;
+};
+
+std::wstring TaskHwndKey(HWND h);
+TaskWinInfo ComputeTaskWinInfo(HWND h, DWORD pid, const wchar_t* cls);
+bool IsTaskAppWindow(HWND h, DWORD& pid, wchar_t* cls, int clsCap, std::wstring& title);
+bool ReadTaskLink(const std::wstring& path, std::wstring& target, std::wstring& aumid, std::wstring* args = nullptr);
+std::wstring TaskFileDescription(const std::wstring& path);
+std::wstring TaskShellDisplayName(const std::wstring& parsingName);
+bool TaskWindowDirectIcon(HWND h, int size, IconImage& out);
+bool TaskWindowIcon(HWND h, int size, IconImage& out);
+TaskPin ResolveTaskPin(const PinnedApp& app);
+
+// Background icon and display-name worker (task_model_icons.cpp).
+struct TaskIconSource {
+    std::wstring aumid, pinPath, exePath;
+    std::vector<HWND> hwnds;
+    std::wstring Signature() const;
+};
+
+class TaskIconWorker {
+public:
+    TaskIconWorker(HWND ui, UINT readyMsg);
+    ~TaskIconWorker();
+    TaskIconWorker(const TaskIconWorker&) = delete;
+    TaskIconWorker& operator=(const TaskIconWorker&) = delete;
+
+    IconImage GetOrRequest(const std::wstring& key, int sizePx, const TaskIconSource& source);
+    void RequestName(const std::wstring& key, const TaskIconSource& source);
+    void SyncLiveKeys(const std::unordered_set<std::wstring>& liveKeys);
+    void RetryFailedIcons();
+    void TakeReady(std::vector<std::wstring>& doneIcons, std::vector<std::pair<std::wstring, std::wstring>>& doneNames);
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace detail
 

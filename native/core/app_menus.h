@@ -54,9 +54,10 @@ bool UnpinMatchingPin(std::vector<PinnedApp>& pins, int pinIndex, const std::opt
 
 void ShowBarContextMenu(const AppMenuEnv& env, POINT pt);
 void ShowStartContextMenu(const AppMenuEnv& env, POINT pt);
-void ShowAppMenu(const AppMenuEnv& env, const AppMenuTarget& target, POINT pt, MenuPlace place, std::function<void(bool)> done = nullptr);
+void ShowAppMenu(const AppMenuEnv& env, const AppMenuTarget& target, POINT pt, MenuPlace place, std::function<void(bool)> done = nullptr,
+                 std::vector<AppMenuExtra> extras = {});
 void ShowTaskItemMenu(const AppMenuEnv& env, const std::wstring& key, POINT pt);
-void ShowCatalogAppMenu(const AppMenuEnv& env, const CatalogApp& app, POINT pt, std::function<void(bool)> done);
+void ShowCatalogAppMenu(const AppMenuEnv& env, const CatalogApp& app, POINT pt, std::function<void(bool)> done, std::vector<AppMenuExtra> extras = {});
 void ShowOverflowAppsMenu(const AppMenuEnv& env, const std::vector<std::wstring>& keys, RECT anchor);
 void ReorderBarTask(const AppMenuEnv& env, const std::wstring& key, int to);
 

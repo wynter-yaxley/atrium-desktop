@@ -58,12 +58,15 @@ public:
     void BrightnessChanged(int percent);
     // Stage Manager's state, for its switch.
     void SetStage(bool on, bool onRight);
+    void SetDoNotDisturb(bool on);
     // The optional modules under the connections (controlModules): Stage Manager's switch and the
-    // system's (energy saver, dark mode, mobile hotspot), two to a row.
+    // system's (energy saver, dark mode, mobile hotspot, Do Not Disturb, airplane mode), two to a row.
     void SetModules(std::vector<std::wstring> ids);
 
     std::function<void()> onChanged; // volume, mute or the network changed: the bar's icon updates
     std::function<void(bool)> onStage; // Stage Manager's switch was pressed: on or off
+    std::function<void(bool)> onDnd;   // Do Not Disturb switch was pressed: on or off
+    std::function<bool()> quietIsOurs; // True when Windows DND is held by Atrium's hideBanners setting
 
 private:
     enum class Page { Main, Wifi, Bluetooth, Sound, Cast };
@@ -304,6 +307,7 @@ private:
     RECT anchor_{}, bar_{};
     float radius_ = 30, barH_ = 60;
     bool stageOn_ = false, stageRight_ = false;
+    bool dndOn_ = false;
     std::vector<std::wstring> modules_{L"stage"};
     std::map<std::wstring, std::optional<bool>> moduleOn_; // the system's switches as last read (none: unavailable)
     std::unordered_set<std::wstring> moduleBusy_;          // switches on their way

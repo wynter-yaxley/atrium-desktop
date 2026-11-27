@@ -30,6 +30,26 @@ internal sealed partial class CoreClient : IDisposable
 {
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint processId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, char[] exeName, ref uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static string? TryGetProcessPath(uint pid)
+    {
+        const uint ProcessQueryLimitedInformation = 0x1000;
+        IntPtr proc = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+        if (proc == IntPtr.Zero) return null;
+        try
+        {
+            char[] buf = new char[32768];
+            uint len = (uint)buf.Length;
+            return QueryFullProcessImageNameW(proc, 0, buf, ref len) && len > 0 ? new string(buf, 0, (int)len) : null;
+        }
+        finally { CloseHandle(proc); }
+    }
 
     private readonly string _pipeName;
     private readonly string _settingsPath;
@@ -128,6 +148,7 @@ internal sealed partial class CoreClient : IDisposable
 
     public bool Connected => _pipe is { IsConnected: true };
     public int ProcessId { get; private set; }
+    public bool CoreElevated { get; private set; }
     public bool StateConfirmed { get; private set; }
     public string? InstanceId { get; private set; }
     public ulong Revision { get; private set; }
@@ -139,18 +160,51 @@ internal sealed partial class CoreClient : IDisposable
         return null;
     }
 
-    internal static ProcessStartInfo CoreStartInfo(string exe, string[]? args = null, bool? development = null)
+    internal static ProcessStartInfo CoreStartInfo(
+        string exe, string[]? args = null, bool? development = null, bool runAsAdmin = false, bool replace = false)
     {
         bool dev = development ?? Development;
-        if (dev && TryParseDataDirArgument(args ?? Environment.GetCommandLineArgs(), out string? custom, out bool specified) && specified && custom != null)
+        var list = new List<string>();
+        if (replace) list.Add("--replace");
+        if (dev && TryParseDataDirArgument(args ?? Environment.GetCommandLineArgs(), out string? custom, out bool specified) &&
+            specified && custom != null)
+        {
+            list.Add("--development");
+            list.Add("--data-dir");
+            list.Add(custom);
+        }
+        if (runAsAdmin)
+        {
+            return new ProcessStartInfo(exe)
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                Arguments = string.Join(" ", list.Select(QuoteArg)),
+            };
+        }
+        if (list.Count > 0)
         {
             var info = new ProcessStartInfo(exe) { UseShellExecute = false };
-            info.ArgumentList.Add("--development");
-            info.ArgumentList.Add("--data-dir");
-            info.ArgumentList.Add(custom);
+            foreach (string a in list) info.ArgumentList.Add(a);
             return info;
         }
         return new ProcessStartInfo(exe) { UseShellExecute = true };
+    }
+
+    private static string QuoteArg(string a)
+    {
+        if (a.Length > 0 && !a.Any(c => char.IsWhiteSpace(c) || c == '"')) return a;
+        var sb = new System.Text.StringBuilder("\"");
+        int bs = 0;
+        foreach (char c in a)
+        {
+            if (c == '\\') { bs++; continue; }
+            if (c == '"') { sb.Append('\\', bs * 2 + 1); sb.Append('"'); bs = 0; continue; }
+            if (bs > 0) { sb.Append('\\', bs); bs = 0; }
+            sb.Append(c);
+        }
+        if (bs > 0) sb.Append('\\', bs * 2);
+        return sb.Append('"').ToString();
     }
 
     public async Task<bool> ConnectAsync(int timeoutMs)
@@ -167,9 +221,14 @@ internal sealed partial class CoreClient : IDisposable
                 pipe.Dispose();
                 return false;
             }
-            using var process = Process.GetProcessById((int)pid);
+            string? actual = TryGetProcessPath(pid);
+            if (actual == null)
+            {
+                using var process = Process.GetProcessById((int)pid);
+                actual = process.MainModule?.FileName;
+            }
             string? expected = _expectedServerExe ?? CoreExe();
-            if (expected == null || !string.Equals(process.MainModule?.FileName, expected, StringComparison.OrdinalIgnoreCase))
+            if (expected == null || !string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
             {
                 _connectionLost = true;
                 ConnectionError = Loc.T("Atrium is running from another location; the core in this folder was not connected.");
@@ -205,6 +264,7 @@ internal sealed partial class CoreClient : IDisposable
         _pipe?.Dispose();
         _pipe = null;
         ProcessId = 0;
+        CoreElevated = false;
         StateConfirmed = false;
         InstanceId = null;
         Revision = 0;
@@ -262,6 +322,7 @@ internal sealed partial class CoreClient : IDisposable
         if (r?["op"]?.GetValue<string>() == "state")
         {
             StateConfirmed = true;
+            CoreElevated = r["elevated"] is JsonValue ev && ev.TryGetValue(out bool elev) && elev;
             InstanceId = ParseNonEmptyString(r["instanceId"]);
             Revision = ParseRevision(r["revision"]);
             return new CoreState(
@@ -328,6 +389,9 @@ internal sealed partial class CoreClient : IDisposable
     }
 
     public Task<string?> CancelAsync() => Send("cancel", null);
+
+    public async Task<bool> QuitCoreAsync() =>
+        (await RequestAsync(new JsonObject { ["op"] = "quit" }))?["op"]?.GetValue<string>() == "ok";
 
     // Puts a desktop widget in the first free place ("clock", "medium"); null on success.
     public async Task<string?> AddWidgetAsync(string kind, string size)
@@ -465,8 +529,16 @@ internal sealed partial class CoreClient : IDisposable
             string command = $"\"{exe}\"";
             if (s.StartOnLogin)
             {
-                RemoveLogonTask(exe, strictOwner: false);
-                run.SetValue("Atrium", command);
+                if (s.StartupMode == "task")
+                {
+                    CreateLogonTask(exe);
+                    run.DeleteValue("Atrium", throwOnMissingValue: false);
+                }
+                else
+                {
+                    run.SetValue("Atrium", command);
+                    RemoveLogonTask(exe, strictOwner: false);
+                }
             }
             else
             {
@@ -483,7 +555,64 @@ internal sealed partial class CoreClient : IDisposable
         return null;
     }
 
-    // Atrium starts from the HKCU Run key; remove any leftover Task Scheduler logon task for this install.
+    // Create or update the standard-user Task Scheduler logon task for this install.
+    private static void CreateLogonTask(string exe)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string? sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
+        if (string.IsNullOrEmpty(sid))
+            throw new IOException("Could not determine the current user SID.");
+        string name = "Atrium Startup-" + sid;
+        dynamic? service = null, folder = null, definition = null, registrationInfo = null,
+            principal = null, settings = null, idleSettings = null, triggers = null, trigger = null, actions = null, action = null;
+        try
+        {
+            service = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service")!)!;
+            service.Connect();
+            folder = service.GetFolder("\\");
+            definition = service.NewTask(0);
+            registrationInfo = definition.RegistrationInfo;
+            registrationInfo.Author = "Atrium";
+            registrationInfo.Description = "Start Atrium when you sign in to Windows.";
+            principal = definition.Principal;
+            principal.UserId = sid;
+            principal.LogonType = 3; // TASK_LOGON_INTERACTIVE_TOKEN
+            principal.RunLevel = 0;  // TASK_RUNLEVEL_LUA
+            settings = definition.Settings;
+            settings.DisallowStartIfOnBatteries = false;
+            settings.StopIfGoingOnBatteries = false;
+            settings.ExecutionTimeLimit = "PT0S";
+            settings.AllowDemandStart = true;
+            settings.Enabled = true;
+            settings.MultipleInstances = 2; // TASK_INSTANCES_IGNORE_NEW
+            settings.Priority = 4;          // match normal interactive UI priority
+            idleSettings = settings.IdleSettings;
+            idleSettings.StopOnIdleEnd = false;
+            idleSettings.RestartOnIdle = false;
+            triggers = definition.Triggers;
+            trigger = triggers.Create(9); // TASK_TRIGGER_LOGON
+            trigger.UserId = sid;
+            trigger.Enabled = true;
+            actions = definition.Actions;
+            action = actions.Create(0); // TASK_ACTION_EXEC
+            action.Path = exe;
+            action.WorkingDirectory = Path.GetDirectoryName(exe) ?? "";
+            folder.RegisterTaskDefinition(name, definition, 6, null, null, 3);
+        }
+        catch (Exception e) when (e is RuntimeBinderException or COMException or ArgumentException)
+        {
+            throw new IOException(e.Message, e);
+        }
+        finally
+        {
+            static void Release(object? com) { if (com != null && Marshal.IsComObject(com)) Marshal.FinalReleaseComObject(com); }
+            Release(action); Release(actions); Release(trigger); Release(triggers);
+            Release(idleSettings); Release(settings); Release(principal); Release(registrationInfo);
+            Release(definition); Release(folder); Release(service);
+        }
+    }
+
+    // Remove any leftover Task Scheduler logon task for this install.
     private static void RemoveLogonTask(string exe, bool strictOwner)
     {
         if (!OperatingSystem.IsWindows()) return;
@@ -496,16 +625,15 @@ internal sealed partial class CoreClient : IDisposable
             folder = service.GetFolder("\\");
             try { task = folder.GetTask(name); }
             catch (COMException e) when (e.HResult == unchecked((int)0x80070002)) { return; } // no task
-            definition = task.Definition;
-            actions = definition.Actions;
-            if ((int)actions.Count < 1) return;
-            action = actions.Item(1);
-            string? command = (action.Path as string)?.Trim('"');
-            if (!string.Equals(command, exe, StringComparison.OrdinalIgnoreCase))
+            if (strictOwner)
             {
-                if (strictOwner)
+                definition = task.Definition;
+                actions = definition.Actions;
+                if ((int)actions.Count < 1) return;
+                action = actions.Item(1);
+                string? command = (action.Path as string)?.Trim('"');
+                if (!string.Equals(command, exe, StringComparison.OrdinalIgnoreCase))
                     throw new IOException(Loc.T("That startup entry belongs to Atrium in another location"));
-                return;
             }
             folder.DeleteTask(name, 0);
         }

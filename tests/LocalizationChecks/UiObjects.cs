@@ -13,6 +13,7 @@ namespace Microsoft.UI.Xaml.Controls
 {
     public class TextBlock : DependencyObject { public string Text { get; set; } = ""; public Documents.InlineCollection Inlines { get; } = []; }
     public class ContentControl : DependencyObject { public object? Content { get; set; } }
+    public class UserControl : DependencyObject { public object? Content { get; set; } }
     public class ComboBoxItem : ContentControl { }
     public class ToggleSwitch : DependencyObject
     {
@@ -32,7 +33,7 @@ namespace Microsoft.UI.Xaml.Controls
     public static class ToolTipService
     {
         public static object? GetToolTip(DependencyObject d) { _ = d; return null; }
-        public static void SetToolTip(DependencyObject d, object o) { _ = d; _ = o; }
+        public static void SetToolTip(DependencyObject d, object? o) { _ = d; _ = o; }
     }
 }
 namespace Microsoft.UI.Xaml.Media
@@ -54,7 +55,7 @@ namespace Microsoft.UI.Xaml.Automation
 namespace Atrium.Settings
 {
     public static class CoreClient { public static string SettingsPath => "unused-review-fixture.json"; }
-    public class ToggleTile : DependencyObject
+    public class ToggleTile : Microsoft.UI.Xaml.Controls.UserControl
     {
         public string Title { get; set; } = "";
         public string Note { get; set; } = "";

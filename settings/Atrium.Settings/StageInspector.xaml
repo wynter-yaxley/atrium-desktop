@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="Atrium.Settings.StageInspector"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Atrium.Settings">
+
+    <StackPanel Style="{StaticResource InspectorPageStyle}">
+        <StackPanel>
+            <TextBlock Text="Windows" Style="{StaticResource SectionStyle}" />
+            <local:ToggleTile x:Name="StageSwitch" Title="Stage Manager" SwitchName="Stage Manager" Toggled="OnStageToggled" Flat="True"
+                              Note="The app in front stays in the middle; other apps' windows stand at an angle at the side, each with its shadow and app icon." />
+            <StackPanel Style="{StaticResource FlatRowStyle}">
+                <TextBlock Text="Recent apps" Style="{StaticResource RowTitleStyle}" />
+                <local:SegmentTrack>
+                    <RadioButton x:Name="StageLeft" GroupName="stageside" Content="Left side" Tag="left"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnStageSideChecked" />
+                    <RadioButton x:Name="StageRight" GroupName="stageside" Content="Right side" Tag="right"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnStageSideChecked" />
+                </local:SegmentTrack>
+            </StackPanel>
+            <StackPanel Style="{StaticResource FlatRowStyle}">
+                <TextBlock Text="Visibility" Style="{StaticResource RowTitleStyle}" />
+                <local:SegmentTrack>
+                    <RadioButton x:Name="StageAlways" GroupName="stagemode" Content="Visible" Tag="always"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnStageModeChecked" />
+                    <RadioButton x:Name="StageAutoHide" GroupName="stagemode" Content="Show on hover" Tag="hover"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnStageModeChecked" />
+                </local:SegmentTrack>
+            </StackPanel>
+            <local:ToggleTile x:Name="StageMinimizeSwitch" Title="Minimize to Stage Manager" SwitchName="Minimize to Stage Manager"
+                              Toggled="OnStageMinimizeToggled" Flat="True" />
+            <local:ToggleTile x:Name="StageDragMergeSwitch" Title="Drag a window onto a card" SwitchName="Drag a window onto a card"
+                              Note="Release a window over a card in the strip: the card's windows come onto the stage with it."
+                              Toggled="OnStageDragMergeToggled" Flat="True" />
+            <local:ToggleTile x:Name="StageAvoidSwitch" Title="Windows avoid the strip" SwitchName="Windows avoid the strip"
+                              Note="A window coming to the front over the cards moves beside them. Off, it stays where it is and the cards step aside."
+                              Toggled="OnStageAvoidToggled" Flat="True" />
+            <local:ToggleTile x:Name="StageCloseButtonSwitch" Title="Close button on the cards"
+                              SwitchName="Close button on the cards"
+                              Note="A cross at the top right of a group in the strip closes its windows."
+                              Toggled="OnStageCloseButtonToggled" Flat="True" />
+            <local:ToggleTile x:Name="StageScrollWrapSwitch" Title="Loop card scrolling"
+                              SwitchName="Loop card scrolling"
+                              Note="Wrap past the last card back to the first when scrolling the strip."
+                              Toggled="OnStageScrollWrapToggled" Flat="True" />
+        </StackPanel>
+        <StackPanel>
+            <TextBlock Text="Actions" Style="{StaticResource SectionStyle}" />
+            <StackPanel Style="{StaticResource FlatRowStyle}" Spacing="2">
+                <TextBlock Text="Click a card" Style="{StaticResource RowTitleStyle}" />
+                <TextBlock Text="Bring to the front; the app that was in front moves to the side."
+                           Style="{StaticResource RowNoteStyle}" TextWrapping="Wrap" />
+            </StackPanel>
+            <StackPanel Style="{StaticResource FlatRowStyle}" Spacing="2">
+                <TextBlock Text="Shift + click" Style="{StaticResource RowTitleStyle}" />
+                <TextBlock Text="Brought onto the stage beside the window in front; put away, each goes back on a card of its own."
+                           Style="{StaticResource RowNoteStyle}" TextWrapping="Wrap" />
+            </StackPanel>
+            <StackPanel Style="{StaticResource FlatRowStyle}" Spacing="2">
+                <TextBlock Text="Pointer at the screen edge" Style="{StaticResource RowTitleStyle}" />
+                <TextBlock Text="Cards slide in from the edge above the windows and go back when the pointer leaves."
+                           Style="{StaticResource RowNoteStyle}" TextWrapping="Wrap" />
+            </StackPanel>
+            <StackPanel Style="{StaticResource FlatRowStyle}" Spacing="2">
+                <TextBlock Text="Close or quit" Style="{StaticResource RowTitleStyle}" />
+                <TextBlock Text="All put-away windows are restored." Style="{StaticResource RowNoteStyle}" TextWrapping="Wrap" />
+            </StackPanel>
+        </StackPanel>
+    </StackPanel>
+</UserControl>

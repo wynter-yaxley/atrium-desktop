@@ -65,7 +65,8 @@ struct ExplorerEntry {
     bool hasImage = false;
 };
 struct MergedTrayView {
-    std::vector<size_t> hostedFallback;
+    std::vector<size_t> hostedFallback; // display metadata (icon/tip/order); may be weak/shared
+    std::vector<size_t> hostedTarget;   // 1-to-1 strict identity-compatible Explorer action target
     std::vector<size_t> extraExplorer;
 };
 bool IsShellExplorerExe(const std::wstring& exe);

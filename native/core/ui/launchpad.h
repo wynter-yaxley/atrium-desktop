@@ -13,6 +13,8 @@
 
 #include "motion.h"
 #include "shell/app_catalog.h"
+#include "shell/launchpad_order.h"
+#include "ui/glass_menu.h"
 #include "ui/launchpad_model.h"
 #include "ui/surface.h"
 
@@ -20,6 +22,7 @@
 
 #include <functional>
 #include <map>
+#include <string_view>
 #include <unordered_map>
 #include <string>
 #include <utility>
@@ -44,28 +47,34 @@ public:
     // Reads every app's icon ahead, at the size a window on `work` would show them.
     void Prewarm(RECT work);
     HWND Hwnd() const { return surface_.Hwnd(); }
+    GlassMenu* menu = nullptr;
     // A right click on an app: its menu at `screen` (the bar's, main.cpp); done(picked) once it has closed.
-    std::function<void(const CatalogApp& app, POINT screen, std::function<void(bool picked)> done)> onAppMenu;
+    std::function<void(const CatalogApp& app, POINT screen, std::function<void(bool picked)> done, std::vector<AppMenuExtra> extras)> onAppMenu;
 
 private:
-    static constexpr UINT_PTR kCloseTimer = 0x4C50, kCaretTimer = 0x4C51, kEdgeTimer = 0x4C53;
-    static constexpr int kSearch = -1, kGlass = -1000; // what HitAt finds besides a tile (its index) and page dot n (-2 - n)
+    static constexpr UINT_PTR kCloseTimer = 0x4C50, kCaretTimer = 0x4C51, kDragTimer = 0x4C53;
+    static constexpr int kSearch = -1, kFolderTitle = -900, kGlass = -1000;
     struct Hit {
         D2D1_RECT_F rect;
-        int index; // into Shown(), kSearch, or -2 - n for page dot n
+        int index; // into Shown(), kSearch, kFolderTitle, or -2 - n for page dot n
     };
 
     // Painting (launchpad.cpp).
     void Paint(Canvas& c);
     void PaintSearch(Canvas& c, const Theme& t, float shown);
+    void PaintFolderHeader(Canvas& c, const Theme& t, float shown);
     void PaintPage(Canvas& c, const Theme& t, int page, float dx);
-    void PaintTile(Canvas& c, const Theme& t, int index, D2D1_RECT_F cell);
+    void PaintTile(Canvas& c, const Theme& t, const CatalogApp& app, int index, D2D1_RECT_F cell);
     void PaintDots(Canvas& c, const Theme& t);
     void PaintSpinner(Canvas& c, const Theme& t, float shown);
     void PaintIcon(Canvas& c, const Theme& t, const std::wstring& id, D2D1_RECT_F r); // an app's icon, a quiet square until read
-    void PaintFolder(Canvas& c, const Theme& t, D2D1_RECT_F r);                       // the system folder: its first nine apps
-    void Split();                                                                      // tiles_ and system_ from apps_
-    void ShowFolder(bool open);
+    void PaintFolder(Canvas& c, const Theme& t, const std::vector<CatalogApp>& apps, D2D1_RECT_F r);
+    const std::vector<CatalogApp>* FolderApps(std::wstring_view id) const;
+    std::wstring FolderTitle(std::wstring_view id) const;
+    static bool IsCustomFolder(std::wstring_view id) { return id.starts_with(L"folder:"); }
+    bool Hidden(const std::wstring& id) const;
+    void Split(); // tiles_, customFolders_, microsoft_ and system_ from apps_
+    void ShowFolder(const std::wstring& id);
     std::vector<std::wstring> PageIconIds(int page) const;
     void UpdatePageTargets(bool prioritize);
     int IconPx(RECT work) const;
@@ -87,20 +96,29 @@ private:
     void Drag(POINT pt);
     void Release(POINT pt);
     void AppMenu(POINT pt); // a right click
+    void OpenFolderMenu(const std::wstring& folderId, POINT screen);
+    void OpenBackgroundMenu(POINT screen);
     void Wheel(int delta);
     int HitAt(POINT pt) const;
     void SetPage(int page);
     void Launch(int index);
     bool ImeMessage(UINT m, WPARAM w, LPARAM l, LRESULT& result);
-    // Arranging (launchpad_drag.cpp): pressed and moved, an app lifts and follows the pointer (as a start menu
-    // tile does); the others
-    // make room, the page turns at the sheet's sides, and the order is kept (shell/launchpad_order.h).
-    bool Arranging() const { return query_.empty() && !folderOpen_; }
+    // Arranging & custom folders (launchpad_drag.cpp).
+    bool Arranging() const { return query_.empty() && (openFolder_.empty() || IsCustomFolder(openFolder_)); }
+    std::vector<int> DragOrder() const;
     void Lift();
     void MoveLifted(POINT pt);
-    void TurnAtEdge();
+    void UpdateDragTarget();
+    void DragTick();
     void DropLifted();
-    void ApplyOrder();                                       // tiles_ in the user's order
+    void HideApp(const CatalogApp& app);
+    void RestoreApp(const std::wstring& id);
+    void RestoreAllHidden();
+    void RemoveAppFromFolder(const std::wstring& folderId, const std::wstring& appId);
+    void UngroupFolder(const std::wstring& folderId);
+    void StartFolderNaming();
+    void FinishFolderNaming(bool commit);
+    void ApplyOrder(); // tiles_ in the user's order
     D2D1_RECT_F Glide(const std::wstring& id, D2D1_RECT_F cell, int page, float dx); // where a tile is drawn as it makes room
     void PaintLifted(Canvas& c, const Theme& t);
     void PlaceIme();
@@ -108,14 +126,27 @@ private:
     void Finish();          // the closing has played: the window goes, the focus goes back
     void Filter();          // shown_ from apps_ and query_
     int Pages() const;
-    const std::vector<CatalogApp>& Shown() const { return !query_.empty() ? shown_ : folderOpen_ ? system_ : tiles_; }
+    const std::vector<CatalogApp>& Shown() const
+    {
+        if (!query_.empty())
+            return shown_;
+        if (const auto* folder = FolderApps(openFolder_))
+            return *folder;
+        return tiles_;
+    }
 
     Surface surface_;
     AppCatalog& catalog_;
-    static constexpr const wchar_t* kFolderId = L"#system"; // the system folder's tile among tiles_
+    static constexpr const wchar_t* kFolderId = L"#system";          // the system folder's tile among tiles_
+    static constexpr const wchar_t* kMicrosoftFolderId = L"#microsoft"; // built-in Microsoft apps folder
     std::vector<CatalogApp> apps_, shown_;
-    std::vector<CatalogApp> tiles_, system_; // the pages, the system folder's apps
-    bool folderOpen_ = false;
+    std::vector<CatalogApp> tiles_, microsoft_, system_; // root tiles, Microsoft folder, system folder
+    std::map<std::wstring, std::vector<CatalogApp>> customFolders_;
+    std::map<std::wstring, std::wstring> customFolderNames_;
+    std::wstring openFolder_;
+    bool namingFolder_ = false;
+    std::wstring nameDraft_;
+    D2D1_RECT_F folderTitleRect_{};
     std::wstring query_;
     std::wstring composition_;
     bool searchFocused_ = false;
@@ -151,9 +182,14 @@ private:
     std::vector<Hit> hits_;
     std::vector<std::pair<std::wstring, int>> visibleIcons_, askedIcons_;
     std::map<int, motion::Follow> hoverAnim_;
-    int lifted_ = -1;                // the app being moved, its place in tiles_ as it goes
+    int lifted_ = -1; // index inside liftedFromFolder_ ? *FolderApps(dragFolderId_) : tiles_
+    bool liftedFromFolder_ = false, dragInFolder_ = false;
+    std::wstring dragFolderId_, liftedId_;
+    CatalogApp liftedApp_;
+    int dragInsert_ = 0, dragPendingSlot_ = -1, mergeTarget_ = -1, dragEdge_ = 0;
+    double dragPendingMs_ = 0, dragEdgeMs_ = 0;
     D2D1_POINT_2F liftAt_{};         // the pointer, DIP
-    std::vector<std::wstring> order_; // the user's order, as read when it opened
+    LaunchpadLayout layout_;         // the user's layout, as read when it opened
     std::unordered_map<std::wstring, D2D1_POINT_2F> tilePos_; // the tiles' places on the sheet as they glide
     float glideMs_ = 0;              // this frame's time step for the places
     bool gliding_ = false;

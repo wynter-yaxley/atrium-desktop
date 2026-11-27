@@ -1,5 +1,6 @@
 #include "launch_args.h"
 #include "log.h"
+#include "shell/process_integrity.h"
 #include "shell/wifi.h"
 #include "win32_path.h"
 
@@ -75,7 +76,21 @@ bool TestCoreLaunchOptions()
     }
     {
         const CoreLaunchOptions opt = ParseCoreLaunchOptions({L"Atrium.exe", L"--exit"});
-        if (!Require(opt.exitRequested, "exact --exit token must set exitRequested"))
+        if (!Require(opt.exitRequested && !opt.replace, "exact --exit token must set exitRequested"))
+            return false;
+    }
+    {
+        const CoreLaunchOptions opt = ParseCoreLaunchOptions({L"Atrium.exe", L"--replace"});
+        if (!Require(opt.replace && !opt.exitRequested, "exact --replace token must set replace"))
+            return false;
+    }
+    {
+        if (!Require(!IsHigherIntegrityRid(SECURITY_MANDATORY_MEDIUM_RID, SECURITY_MANDATORY_MEDIUM_RID), "same RID must not count as higher integrity") ||
+            !Require(!IsHigherIntegrityRid(SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_MEDIUM_RID), "lower RID must not count as higher integrity") ||
+            !Require(IsHigherIntegrityRid(SECURITY_MANDATORY_MEDIUM_RID, SECURITY_MANDATORY_HIGH_RID), "high RID > medium RID must count as higher") ||
+            !Require(!IsElevatedIntegrityRid(SECURITY_MANDATORY_MEDIUM_RID), "medium RID must not count as elevated") ||
+            !Require(IsElevatedIntegrityRid(SECURITY_MANDATORY_HIGH_RID), "high RID must count as elevated") ||
+            !Require(SelfIntegrityRid() != 0, "SelfIntegrityRid must be non-zero"))
             return false;
     }
     return true;

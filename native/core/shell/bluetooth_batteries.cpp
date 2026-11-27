@@ -45,8 +45,12 @@ std::wstring Text(HDEVINFO set, SP_DEVINFO_DATA& d, const DEVPROPKEY& key)
     if (!size || (type != DEVPROP_TYPE_STRING && type != DEVPROP_TYPE_STRING_LIST))
         return {};
     std::wstring s(size / sizeof(wchar_t), L'\0');
-    if (!SetupDiGetDevicePropertyW(set, &d, &key, &type, reinterpret_cast<BYTE*>(s.data()), size, nullptr, 0))
+    if (!SetupDiGetDevicePropertyW(set, &d, &key, &type, reinterpret_cast<BYTE*>(s.data()), size, nullptr, 0)) {
+        const DWORD err = GetLastError();
+        if (err != ERROR_NOT_FOUND)
+            Log(L"bluetooth: SetupDiGetDevicePropertyW failed (%lu)", err);
         return {};
+    }
     s.resize(wcslen(s.c_str())); // the first string of a list
     return s;
 }
@@ -79,8 +83,10 @@ std::vector<BluetoothBattery> ReadBluetoothBatteries()
     // battery, its keyboard or mouse (HID) parts what it is.
     std::map<GUID, Container, decltype([](const GUID& a, const GUID& b) { return memcmp(&a, &b, sizeof(GUID)) < 0; })> containers;
     HDEVINFO set = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
-    if (set == INVALID_HANDLE_VALUE)
+    if (set == INVALID_HANDLE_VALUE) {
+        Log(L"bluetooth: SetupDiGetClassDevsW failed (%lu)", GetLastError());
         return {};
+    }
     SP_DEVINFO_DATA d{sizeof(d)};
     wchar_t id[MAX_DEVICE_ID_LEN];
     for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &d); ++i) {
@@ -114,6 +120,8 @@ std::vector<BluetoothBattery> ReadBluetoothBatteries()
         c.keyboard |= cls == L"Keyboard";
         c.mouse |= cls == L"Mouse";
     }
+    if (const DWORD enumErr = GetLastError(); enumErr != ERROR_NO_MORE_ITEMS)
+        Log(L"bluetooth: SetupDiEnumDeviceInfo failed (%lu)", enumErr);
     SetupDiDestroyDeviceInfoList(set);
     std::vector<BluetoothBattery> out;
     for (auto& [guid, c] : containers)
@@ -171,12 +179,7 @@ void BluetoothBatteries::Run()
             if (quit_)
                 return;
         }
-        std::vector<BluetoothBattery> now;
-        try {
-            now = ReadBluetoothBatteries();
-        } catch (...) {
-            Log(L"bluetooth: reading the batteries failed");
-        }
+        std::vector<BluetoothBattery> now = ReadBluetoothBatteries();
         bool changed;
         {
             std::lock_guard g(lock_);

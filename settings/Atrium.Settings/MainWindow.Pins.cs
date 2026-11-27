@@ -106,7 +106,14 @@ public sealed partial class MainWindow
         ShowMessage(InfoBarSeverity.Warning, Loc.T("Too many pinned apps"), body);
     }
 
-    private void InitPins() => PinsList.ItemsSource = _pinVms;
+    private void InitPins()
+    {
+        MainDock.List.ItemsSource = _pinVms;
+        MainDock.ImportPinsClicked += OnImportPins;
+        MainDock.AddPinClicked += OnAddPin;
+        MainDock.PinsDragCompleted += OnPinsDragCompleted;
+        MainDock.WindowsContextMenuToggled += OnWindowsContextMenuToggled;
+    }
 
     private void RebuildPins()
     {
@@ -132,9 +139,9 @@ public sealed partial class MainWindow
         _previewPins = [.. _pinVms.Take(MaxPreviewApps - 1)];
         for (int i = 0; i < _pinVms.Count; i++) _pinVms[i].SetPosition(i, _pinVms.Count);
         bool empty = _pinVms.Count == 0;
-        PinsEmpty.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
-        PinsList.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
-        PinCount.Text = $"{_pinVms.Count} / {SettingsSession.MaxPins}";
+        MainDock.EmptyPanel.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+        MainDock.List.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+        MainDock.CountText.Text = $"{_pinVms.Count} / {SettingsSession.MaxPins}";
         if (_session.HasPinOverflow)
         {
             ShowPinOverflow();
@@ -210,7 +217,7 @@ public sealed partial class MainWindow
     {
         DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
         {
-            if (PinsList.ContainerFromItem(vm) is not DependencyObject container) return;
+            if (MainDock.List.ContainerFromItem(vm) is not DependencyObject container) return;
             var buttons = new List<Button>();
             Collect(container, buttons);
             var target = buttons.FirstOrDefault(b => b.IsEnabled && AutomationProperties.GetName(b).StartsWith(verb)) ??
@@ -232,7 +239,7 @@ public sealed partial class MainWindow
     private void OnWindowsContextMenuToggled(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
-        CurrentSettings.WindowsContextMenu = WindowsContextMenuSwitch.IsOn;
+        CurrentSettings.WindowsContextMenu = MainDock.ContextMenuSwitch.IsOn;
         Changed();
     }
 
@@ -263,7 +270,7 @@ public sealed partial class MainWindow
         _ = LoadIconAsync(vm);
         SyncPins();
         FocusPinButton(vm, Loc.T("Remove"));
-        PinsList.ScrollIntoView(vm);
+        MainDock.List.ScrollIntoView(vm);
         Changed();
     }
 

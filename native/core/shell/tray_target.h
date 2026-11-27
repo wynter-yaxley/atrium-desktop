@@ -16,6 +16,7 @@ struct TargetKey {
     ShellSession shell;
     std::vector<int> runtime;
     std::wstring identity, exe, tip; // adapter supplies normalized full exe paths
+    bool operator==(const TargetKey&) const = default;
 };
 enum class Resolution { Runtime, Record, Program, Missing, Ambiguous, Conflict, ShellChanged };
 inline const wchar_t* ResolutionName(Resolution value)
@@ -63,6 +64,7 @@ inline ResolvedTarget ResolveTarget(const TargetKey& request, const ShellSession
         return {static_cast<size_t>(-1), Resolution::Conflict};
     return result;
 }
+inline bool ShouldAllowExeForegroundFallback(bool allowProgramWake) { return allowProgramWake; }
 inline bool SameGestureTarget(const TargetKey& a, const TargetKey& b)
 {
     if (!a.shell.Valid() || a.shell != b.shell || a.exe != b.exe || a.identity != b.identity)

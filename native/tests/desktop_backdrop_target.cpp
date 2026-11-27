@@ -132,11 +132,38 @@ bool CheckSkipFailedWorkerAndMissingDesktop()
     return Require(empty.hwnd == nullptr && empty.isProgman, "empty candidate list returns null target");
 }
 
+bool CheckBoundedAsyncRetirementBudget()
+{
+    // Allocation failure prevents starting a session that would lack a guaranteed async retirement slot.
+    auto failSlot = atrium::AsyncWorkSlot::Create([](PTP_WORK_CALLBACK, PVOID) -> PTP_WORK { return nullptr; });
+    if (!Require(!failSlot, "failed preallocated work creation must abort cleanly without leaking"))
+        return false;
+
+    HANDLE releaseEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!Require(releaseEvent != nullptr, "create release event"))
+        return false;
+    auto slot = atrium::AsyncWorkSlot::Create();
+    if (!Require(slot != nullptr && slot->DoneEvent() != nullptr, "preallocate async retirement slot")) {
+        CloseHandle(releaseEvent);
+        return false;
+    }
+    slot->Retire([releaseEvent] { WaitForSingleObject(releaseEvent, 5000); });
+    const ULONGLONG t0 = GetTickCount64();
+    const bool completedInBudget = atrium::WaitBoundedHandles({slot->DoneEvent()}, 250);
+    const ULONGLONG elapsed = GetTickCount64() - t0;
+    SetEvent(releaseEvent);
+    const bool completedAfterRelease = atrium::WaitBoundedHandles({slot->DoneEvent()}, 2000);
+    CloseHandle(releaseEvent);
+    return Require(!completedInBudget && elapsed < 1000 && completedAfterRelease && slot->Finished(),
+                   "stalled async close must time out within 250ms budget without blocking caller");
+}
+
 } // namespace
 
 int main()
 {
-    if (!CheckRaisedAndUnsplitDesktop() || !CheckSplitDesktopWithLiveWallpaper() || !CheckSplitDesktopFallbacks() || !CheckSkipFailedWorkerAndMissingDesktop())
+    if (!CheckRaisedAndUnsplitDesktop() || !CheckSplitDesktopWithLiveWallpaper() || !CheckSplitDesktopFallbacks() ||
+        !CheckSkipFailedWorkerAndMissingDesktop() || !CheckBoundedAsyncRetirementBudget())
         return 1;
     std::cout << "Desktop backdrop target selection checks passed.\n";
     return 0;

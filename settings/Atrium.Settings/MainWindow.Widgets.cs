@@ -68,7 +68,7 @@ public sealed partial class MainWindow
 
     private void OnWidgetCategoryChecked(object sender, RoutedEventArgs e)
     {
-        if (sender is not RadioButton { Tag: string category }) return;
+        if (_updatesClosed || _session.Closed || sender is not RadioButton { Tag: string category }) return;
         foreach (var (name, section) in _widgetSections)
             section.Visibility = category == "All" || category == name ? Visibility.Visible : Visibility.Collapsed;
     }
@@ -76,11 +76,13 @@ public sealed partial class MainWindow
     // The gallery only adds while the widgets are on.
     private void UpdateGallery()
     {
-        WidgetGallery.Opacity = WidgetsSwitch.IsOn ? 1 : 0.45;
-        WidgetGallery.IsHitTestVisible = WidgetsSwitch.IsOn;
+        if (_updatesClosed || _session.Closed) return;
+        bool on = SideWidgets.WidgetsOn;
+        WidgetGallery.Opacity = on ? 1 : 0.45;
+        WidgetGallery.IsHitTestVisible = on;
         // Only why the gallery does not answer: the widgets are off.
         WidgetHint.Text = Loc.T("Turn on Desktop widgets first.");
-        WidgetHint.Visibility = WidgetsSwitch.IsOn ? Visibility.Collapsed : Visibility.Visible;
+        WidgetHint.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
     }
 
     // A gallery card: the widget on a piece of the bar's glass over the picture, rendered like the hero.
@@ -95,7 +97,7 @@ public sealed partial class MainWindow
 
     private readonly List<GalleryPreview> _galleryStages = [];
     private readonly Queue<Action> _galleryApplyQueue = [];
-    private bool _galleryApplyScheduled;
+    private bool _galleryApplyScheduled, _addingWidget;
 
     private Button GalleryCard(WidgetChoice c)
     {
@@ -134,19 +136,62 @@ public sealed partial class MainWindow
         AutomationProperties.SetName(button, c.Size == "small" ? Loc.F("Add {0} (small)", c.Name)
             : c.Size == "medium" ? Loc.F("Add {0} (medium)", c.Name) : Loc.F("Add {0} (large)", c.Name));
         ToolTipService.SetToolTip(button, c.Note);
-        button.Click += async (_, _) =>
-        {
-            string? error = await _client.AddWidgetAsync(c.Kind, c.Size);
-            WidgetHint.Text = error == null ? Loc.F("Added “{0}” to the desktop.", c.Name)
-                : error.Contains("room") ? Loc.T("No room on the desktop: remove or shrink a widget first.") : Loc.F("Not added: {0}", error);
-            WidgetHint.Visibility = Visibility.Visible;
-        };
+        button.Click += (_, _) => OnWidgetCardClick(button, c);
         return button;
+    }
+
+    private async void OnWidgetCardClick(Button button, WidgetChoice choice)
+    {
+        if (_addingWidget || _tilesStopped || _updatesClosed || _session.Closed) return;
+        if (string.IsNullOrEmpty(choice.Kind) || string.IsNullOrEmpty(choice.Size)) return;
+        _addingWidget = true;
+        button.IsEnabled = false;
+        try
+        {
+            string? error = await _client.AddWidgetAsync(choice.Kind, choice.Size);
+            if (_tilesStopped || _updatesClosed || _session.Closed) return;
+            WidgetHint.Text = error == null
+                ? Loc.F("Added “{0}” to the desktop.", choice.Name)
+                : error.Contains("room", StringComparison.OrdinalIgnoreCase)
+                    ? Loc.T("No room on the desktop: remove or shrink a widget first.")
+                    : Loc.F("Not added: {0}", error);
+            WidgetHint.Visibility = Visibility.Visible;
+        }
+        catch (Exception ex)
+        {
+            App.LogCrash(ex);
+            System.Diagnostics.Debug.WriteLine("widget add failed: " + ex);
+            if (!_tilesStopped && !_updatesClosed && !_session.Closed)
+            {
+                try
+                {
+                    WidgetHint.Text = Loc.F("Not added: {0}", ex.Message);
+                    WidgetHint.Visibility = Visibility.Visible;
+                }
+                catch (Exception uiEx)
+                {
+                    System.Diagnostics.Debug.WriteLine("widget hint update failed: " + uiEx);
+                }
+            }
+        }
+        finally
+        {
+            _addingWidget = false;
+            if (!_tilesStopped && !_updatesClosed && !_session.Closed)
+            {
+                try { button.IsEnabled = true; }
+                catch (Exception uiEx)
+                {
+                    System.Diagnostics.Debug.WriteLine("widget button restore failed: " + uiEx);
+                }
+            }
+        }
     }
 
     // The gallery again when the picture or the material changed since it was drawn.
     private void RefreshGallery()
     {
+        if (_tilesStopped || _updatesClosed || _session.Closed) return;
         foreach (var preview in _galleryStages)
         {
             if (preview.RenderedMaterial != null &&
@@ -162,19 +207,27 @@ public sealed partial class MainWindow
 
     private void RenderGalleryCard(GalleryPreview preview)
     {
+        if (_tilesStopped || _updatesClosed || _session.Closed) return;
         var (c, stage, face, viewport) = preview;
         double sw = stage.ActualWidth, sh = stage.ActualHeight;
-        if (sw < 8 || sh < 8) return;
-        preview.RenderedMaterial = CurrentSettings.Clone();
-        preview.RenderedGen = Photo.Generation;
+        if (!double.IsFinite(sw) || !double.IsFinite(sh) || sw <= 28 || sh <= 28) return;
         // The widget fitted into the card, 14 DIP of air around.
         var (w, h) = WidgetFaces.Size(c.Size);
+        if (w <= 0 || h <= 0) return;
         double k = Math.Min((sw - 28) / w, (sh - 28) / h);
+        if (!double.IsFinite(k) || k <= 0) return;
+        preview.RenderedMaterial = CurrentSettings.Clone();
+        preview.RenderedGen = Photo.Generation;
         var tile = new GlassTile((sw - w * k) / 2, (sh - h * k) / 2, w * k, h * k, 22 * k);
         int mine = 0;
         mine = PostTiles(stage, sw, sh, k, [tile], null, frame => EnqueueGalleryApply(() =>
         {
-            if (_tilesStopped || !_tileRequests.TryGetValue(stage, out int current) || current != mine) return;
+            if (_tilesStopped || _updatesClosed || _session.Closed ||
+                !_tileRequests.TryGetValue(stage, out int current) || current != mine)
+            {
+                return;
+            }
+            if (frame.Lumas.Length == 0 || tile.W <= 0 || tile.H <= 0) return;
             frame.Apply(stage);
             viewport.Width = sw;
             viewport.Height = sh;
@@ -198,29 +251,38 @@ public sealed partial class MainWindow
 
     private void EnqueueGalleryApply(Action apply)
     {
-        if (_tilesStopped) return;
+        if (_tilesStopped || _updatesClosed || _session.Closed) return;
         _galleryApplyQueue.Enqueue(apply);
         ScheduleGalleryDrain();
     }
 
     private void ScheduleGalleryDrain()
     {
-        if (_galleryApplyScheduled || _tilesStopped || _galleryApplyQueue.Count == 0) return;
+        if (_galleryApplyScheduled || _tilesStopped || _updatesClosed || _session.Closed || _galleryApplyQueue.Count == 0) return;
         _galleryApplyScheduled = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, DrainGalleryApplies);
     }
 
     private void DrainGalleryApplies()
     {
         _galleryApplyScheduled = false;
-        if (_tilesStopped)
+        if (_tilesStopped || _updatesClosed || _session.Closed)
         {
             _galleryApplyQueue.Clear();
             return;
         }
         int processed = 0;
-        while (processed < 4 && _galleryApplyQueue.Count > 0 && !_tilesStopped)
+        while (processed < 4 && _galleryApplyQueue.Count > 0 && !_tilesStopped && !_updatesClosed && !_session.Closed)
         {
-            _galleryApplyQueue.Dequeue()();
+            var apply = _galleryApplyQueue.Dequeue();
+            try
+            {
+                apply();
+            }
+            catch (Exception ex)
+            {
+                App.LogCrash(ex);
+                System.Diagnostics.Debug.WriteLine("gallery apply failed: " + ex);
+            }
             processed++;
         }
         ScheduleGalleryDrain();
@@ -244,7 +306,11 @@ public sealed partial class MainWindow
     {
         public WriteableBitmap Overlay(int index)
         {
-            var image = Overlays![index];
+            if (Overlays == null || (uint)index >= (uint)Overlays.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+            var image = Overlays[index];
+            if (image.Width <= 0 || image.Height <= 0)
+                throw new InvalidOperationException("Tile overlay has empty bounds.");
             var bmp = new WriteableBitmap(image.Width, image.Height);
             using (var stream = bmp.PixelBuffer.AsStream()) stream.Write(image.Pixels);
             bmp.Invalidate();
@@ -252,6 +318,7 @@ public sealed partial class MainWindow
         }
         public void Apply(Border stage)
         {
+            if (PW <= 0 || PH <= 0 || Px.Length == 0) return;
             var brush = ContinuousCorners.Original(stage) as ImageBrush;
             var bmp = brush?.ImageSource as WriteableBitmap;
             if (bmp == null || bmp.PixelWidth != PW || bmp.PixelHeight != PH)
@@ -267,16 +334,37 @@ public sealed partial class MainWindow
     private int PostTiles(object target, double w, double h, double k, IReadOnlyList<GlassTile> tiles, GlassTile? bar,
                           Action<TileFrame> done, bool overlays = false, bool scaled = false)
     {
-        double rs = Math.Clamp(Content.XamlRoot?.RasterizationScale ?? 1, 1, 2);
+        if (_tilesStopped || _updatesClosed || _session.Closed ||
+            !double.IsFinite(w) || !double.IsFinite(h) || !double.IsFinite(k) ||
+            w <= 0 || h <= 0 || k <= 0 || tiles.Count == 0)
+        {
+            return 0;
+        }
+        double rs = Math.Clamp(Content?.XamlRoot?.RasterizationScale ?? 1, 1, 2);
+        if (!double.IsFinite(rs) || rs <= 0) rs = 1;
         int mine = _tileRequests[target] = (_tileRequests.TryGetValue(target, out int n) ? n : 0) + 1;
+        bool startWorker = false;
         lock (_tileLock)
         {
             if (_tilesStopped) return mine;
             _pendingTiles[target] = new TileJob(target, mine, w, h, k, rs, tiles, bar, CurrentSettings.Clone(), Photo.Capture(), done, overlays, scaled);
-            if (_tilesBusy) return mine;
-            _tilesBusy = true;
+            if (!_tilesBusy)
+            {
+                _tilesBusy = true;
+                startWorker = true;
+            }
         }
-        Task.Run(RenderTiles);
+        if (startWorker)
+        {
+            _ = Task.Run(RenderTiles).ContinueWith(t =>
+            {
+                if (t.Exception != null)
+                {
+                    App.LogCrash(t.Exception);
+                    System.Diagnostics.Debug.WriteLine("tile render worker failed: " + t.Exception);
+                }
+            }, TaskScheduler.Default);
+        }
         return mine;
     }
 
@@ -302,53 +390,80 @@ public sealed partial class MainWindow
     {
         Backdrop? bg = null;
         (double W, double H, double Rs, Lazy<Photo> Photo)? backdrop = null;
-        while (true)
+        bool completed = false;
+        try
         {
-            TileJob[] jobs;
-            lock (_tileLock)
+            while (true)
             {
-                if (_pendingTiles.Count == 0) { _tilesBusy = false; return; }
-                jobs = [.. _pendingTiles.Values];
-                _pendingTiles.Clear();
-            }
-            foreach (var group in jobs.GroupBy(j => (j.W, j.H, j.Rs, j.Photo)))
-            {
-                var key = group.Key;
-                int pw = (int)Math.Round(key.W * key.Rs), ph = (int)Math.Round(key.H * key.Rs);
-                try
+                TileJob[] jobs;
+                lock (_tileLock)
                 {
-                    if (bg == null || backdrop != key)
+                    if (_tilesStopped || _pendingTiles.Count == 0)
                     {
-                        bg = Backdrop.Create(pw, ph, key.W, key.H, 0, 0, key.Rs, key.Photo.Value);
-                        backdrop = key;
+                        _tilesBusy = false;
+                        completed = true;
+                        return;
                     }
-                    Parallel.ForEach(group, new ParallelOptions { MaxDegreeOfParallelism = 2 }, job =>
-                    {
-                        lock (_tileLock)
-                            if (_tilesStopped || _pendingTiles.ContainsKey(job.Target)) return;
-                        TileFrame frame;
-                        if (job.Overlays)
-                        {
-                            // Scaled: the widget map, whose picture comes along (its cards move over it).
-                            var cards = GlassRenderer.CardOverlays(bg, job.Material, job.Rs, job.Tiles, job.Scaled ? job.K : 0);
-                            frame = new TileFrame(job.Scaled ? bg.Base : [], pw, ph, job.Rs, [.. cards.Select(c => c.Luma)], cards);
-                        }
-                        else
-                        {
-                            byte[] px = new byte[bg.Base.Length];
-                            float[] lumas = GlassRenderer.DrawTiles(bg, px, job.Material, job.K, job.Rs, job.Tiles, job.Bar);
-                            frame = new TileFrame(px, pw, ph, job.Rs, lumas);
-                        }
-                        DispatcherQueue.TryEnqueue(() =>
-                        {
-                            if (!_tilesStopped && _tileRequests[job.Target] == job.Id) job.Done(frame);
-                        });
-                    });
+                    jobs = [.. _pendingTiles.Values];
+                    _pendingTiles.Clear();
                 }
-                catch (Exception e)
+                foreach (var group in jobs.GroupBy(j => (j.W, j.H, j.Rs, j.Photo)))
                 {
-                    System.Diagnostics.Debug.WriteLine("tile preview render failed: " + e);
+                    var key = group.Key;
+                    int pw = (int)Math.Round(key.W * key.Rs), ph = (int)Math.Round(key.H * key.Rs);
+                    if (pw <= 0 || ph <= 0) continue;
+                    try
+                    {
+                        if (bg == null || backdrop != key)
+                        {
+                            bg = Backdrop.Create(pw, ph, key.W, key.H, 0, 0, key.Rs, key.Photo.Value);
+                            backdrop = key;
+                        }
+                        Parallel.ForEach(group, new ParallelOptions { MaxDegreeOfParallelism = 2 }, job =>
+                        {
+                            lock (_tileLock)
+                                if (_tilesStopped || _pendingTiles.ContainsKey(job.Target)) return;
+                            TileFrame frame;
+                            if (job.Overlays)
+                            {
+                                // Scaled: the widget map, whose picture comes along (its cards move over it).
+                                var cards = GlassRenderer.CardOverlays(bg, job.Material, job.Rs, job.Tiles, job.Scaled ? job.K : 0);
+                                frame = new TileFrame(job.Scaled ? bg.Base : [], pw, ph, job.Rs, [.. cards.Select(c => c.Luma)], cards);
+                            }
+                            else
+                            {
+                                byte[] px = new byte[bg.Base.Length];
+                                float[] lumas = GlassRenderer.DrawTiles(bg, px, job.Material, job.K, job.Rs, job.Tiles, job.Bar);
+                                frame = new TileFrame(px, pw, ph, job.Rs, lumas);
+                            }
+                            DispatcherQueue.TryEnqueue(() =>
+                            {
+                                if (_tilesStopped || _updatesClosed || _session.Closed) return;
+                                if (!_tileRequests.TryGetValue(job.Target, out int current) || current != job.Id) return;
+                                try
+                                {
+                                    job.Done(frame);
+                                }
+                                catch (Exception ex)
+                                {
+                                    App.LogCrash(ex);
+                                    System.Diagnostics.Debug.WriteLine("tile preview apply failed: " + ex);
+                                }
+                            });
+                        });
+                    }
+                    catch (Exception e)
+                    {
+                        System.Diagnostics.Debug.WriteLine("tile preview render failed: " + e);
+                    }
                 }
+            }
+        }
+        finally
+        {
+            if (!completed)
+            {
+                lock (_tileLock) { _tilesBusy = false; }
             }
         }
     }

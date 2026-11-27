@@ -10,9 +10,95 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace atrium {
+
+// Pre-allocated Win32 threadpool work slot so retiring blocking WGC objects at teardown cannot fail
+// on pool exhaustion or fall back to synchronous Close() on the calling thread.
+class AsyncWorkSlot : public std::enable_shared_from_this<AsyncWorkSlot> {
+public:
+    AsyncWorkSlot() = default;
+    ~AsyncWorkSlot()
+    {
+        if (work_ && !submitted_)
+            ::CloseThreadpoolWork(work_);
+        if (doneEvent_)
+            CloseHandle(doneEvent_);
+    }
+    AsyncWorkSlot(const AsyncWorkSlot&) = delete;
+    AsyncWorkSlot& operator=(const AsyncWorkSlot&) = delete;
+
+    static std::shared_ptr<AsyncWorkSlot> Create(PTP_WORK (*createWork)(PTP_WORK_CALLBACK, PVOID) = nullptr)
+    {
+        HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!done)
+            return {};
+        auto slot = std::make_shared<AsyncWorkSlot>();
+        slot->doneEvent_ = done;
+        PTP_WORK work = createWork ? createWork(&WorkCallback, slot.get()) : ::CreateThreadpoolWork(&WorkCallback, slot.get(), nullptr);
+        if (!work)
+            return {};
+        slot->work_ = work;
+        return slot;
+    }
+
+    // Submits `task` on the pre-allocated threadpool work item; non-failing once Create() succeeded.
+    void Retire(std::function<void()> task)
+    {
+        if (submitted_ || !work_) {
+            finished_.store(true, std::memory_order_release);
+            if (doneEvent_)
+                SetEvent(doneEvent_);
+            return;
+        }
+        submitted_ = true;
+        task_ = std::move(task);
+        self_ = shared_from_this();
+        ::SubmitThreadpoolWork(work_);
+        ::CloseThreadpoolWork(work_);
+        work_ = nullptr;
+    }
+
+    HANDLE DoneEvent() const { return doneEvent_; }
+    bool Finished() const { return finished_.load(std::memory_order_acquire); }
+
+private:
+    static void CALLBACK WorkCallback(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WORK)
+    {
+        auto* raw = static_cast<AsyncWorkSlot*>(context);
+        std::shared_ptr<AsyncWorkSlot> keepAlive = std::move(raw->self_);
+        if (keepAlive && keepAlive->task_)
+            keepAlive->task_();
+        if (keepAlive) {
+            keepAlive->task_ = {};
+            keepAlive->finished_.store(true, std::memory_order_release);
+            if (keepAlive->doneEvent_)
+                SetEvent(keepAlive->doneEvent_);
+        }
+    }
+
+    PTP_WORK work_ = nullptr;
+    HANDLE doneEvent_ = nullptr;
+    bool submitted_ = false;
+    std::atomic<bool> finished_{false};
+    std::function<void()> task_;
+    std::shared_ptr<AsyncWorkSlot> self_;
+};
+
+// Waits at most `budgetMs` for every handle in `handles`; returns true if all signaled or empty.
+inline bool WaitBoundedHandles(const std::vector<HANDLE>& handles, DWORD budgetMs)
+{
+    if (handles.empty())
+        return true;
+    const DWORD count = static_cast<DWORD>(std::min<size_t>(handles.size(), MAXIMUM_WAIT_OBJECTS));
+    return WaitForMultipleObjects(count, handles.data(), TRUE, budgetMs) == WAIT_OBJECT_0;
+}
 
 struct DesktopHostCandidate {
     HWND hwnd = nullptr;

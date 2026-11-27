@@ -44,6 +44,8 @@ public:
     bool CenterVisible() const { return center_.surface && center_.surface->Visible(); }
     void Clear();
     void SetOptions(double timeoutSeconds, bool hideBody, const std::wstring& placement, bool notifyFullscreen = false, bool notifyAlways = false);
+    void SetDoNotDisturb(bool on);
+    bool DoNotDisturb() const { return dnd_; }
     // Corner radius (DIP), the bar's; the cards are concentric with it.
     void SetRadius(float dip);
     int Unread() const;
@@ -107,9 +109,17 @@ private:
     void ShiftStack(Mode mode, size_t index, int by);
     void Sweep(); // drops the cards whose closing animation has finished
     bool Message(Mode mode, UINT m, WPARAM w, LPARAM l, LRESULT& result);
+    std::wstring HitAt(const View& v, POINT pt) const;
+    bool HandleTimerMessage(Mode mode, View& v, WPARAM w);
+    void HandleMouseMove(Mode mode, View& v, POINT pt);
+    void HandleMouseLeave(Mode mode, View& v);
+    void HandleLButtonDown(View& v, POINT pt);
+    void HandleLButtonUp(Mode mode, View& v, POINT pt);
+    void HandleMouseWheel(Mode mode, View& v, WPARAM w);
     void Click(Mode mode, const std::wstring& id);
     void Activate(uint64_t id);
     void Remove(uint64_t id);
+    bool MergeOrIgnoreDuplicate(Notice& n);
     void Changed();       // unread count, layout of visible windows
     void Layout(Mode mode);
     void LayoutCorner(Mode mode, View& v, size_t shownCount);
@@ -138,10 +148,12 @@ private:
     bool expanded_ = false;
     uint64_t nextId_ = 1;
     static constexpr UINT_PTR kPopupTimer = 1;
+    static constexpr double kLeaveMs = 340;
     double timeout_ = 6;
     bool always_ = false;
     bool hideBody_ = false;
     bool notifyFullscreen_ = false;
+    bool dnd_ = false;
     bool corner_ = false, left_ = false, bottom_ = false; // notifyPlacement: a corner of the main screen
     BarEdge barEdge_ = BarEdge::Bottom;
     ULONGLONG centerClosed_ = 0;

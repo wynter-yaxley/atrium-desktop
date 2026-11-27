@@ -12,6 +12,8 @@
 
 #include <windows.h>
 
+#include <atomic>
+
 namespace atrium {
 
 struct WinKeyAction {
@@ -83,12 +85,15 @@ public:
     ~WinKey();
     WinKey(const WinKey&) = delete;
     WinKey& operator=(const WinKey&) = delete;
+    // While Atrium's Start menu is open, the Windows key toggles it even if an elevated window still holds focus.
+    void SetStartMenuOpen(bool open);
 
 private:
     static bool OnKey(void* context, DWORD vk, DWORD scan, bool extended, bool down, bool injected, ULONG_PTR extraInfo);
     HWND notify_;
     UINT msg_;
     bool alone_, numbers_;
+    std::atomic<bool> startMenuOpen_{false};
     WinKeyState state_;
     int keyToken_ = 0; // the shared hook's registration
 };

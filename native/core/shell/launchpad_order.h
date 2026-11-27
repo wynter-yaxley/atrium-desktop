@@ -1,13 +1,30 @@
-// Launchpad's own order, %LOCALAPPDATA%\Atrium\launchpad.json: the tiles' ids (apps' catalog ids and the
-// system folder's) as the user dragged them. Until the first drag the apps keep the order they came in.
+// Launchpad's persisted layout, %LOCALAPPDATA%\Atrium\launchpad.json:
+// root order (apps, "#microsoft", "#system", "folder:<n>"), user folders, and hidden apps.
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace atrium {
 
-std::vector<std::wstring> LoadLaunchpadOrder();
-void SaveLaunchpadOrder(const std::vector<std::wstring>& ids);
+struct LaunchpadFolder {
+    std::wstring id;                // "folder:<n>"
+    std::wstring name;
+    std::vector<std::wstring> apps; // catalog app IDs in order
+};
+
+struct LaunchpadLayout {
+    std::vector<std::wstring> order;
+    std::vector<LaunchpadFolder> folders;
+    std::vector<std::wstring> hidden;
+    std::wstring NewFolderId() const;
+    void Clamp();
+};
+
+LaunchpadLayout LoadLaunchpadLayout();
+bool SaveLaunchpadLayout(const LaunchpadLayout& layout);
+bool ParseLaunchpadLayoutJson(std::wstring_view text, LaunchpadLayout& layout);
+std::wstring SerializeLaunchpadLayoutJson(const LaunchpadLayout& layout);
 
 } // namespace atrium

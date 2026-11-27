@@ -38,6 +38,9 @@ namespace atrium {
 class StartMenu {
 public:
     StartMenu(HINSTANCE instance, TaskModel& tasks, AppCatalog& catalog);
+    ~StartMenu();
+    StartMenu(const StartMenu&) = delete;
+    StartMenu& operator=(const StartMenu&) = delete;
 
     // barRect: the bar's glass shape on screen; the menu opens above its left
     // end, out of `logo` (the logo's rectangle).
@@ -77,6 +80,7 @@ public:
     std::function<void(const PinnedApp&)> onPin;            // pin to the bar (the dock)
     std::function<void(const std::wstring& what)> onSystem; // "network", "volume", "battery", "tray", "account"
     std::function<void()> onStatusRequest;
+    std::function<void(bool open)> onOpenChanged;           // notifies WinKey of Start menu open state
     void SetPowerNotify(HWND host, UINT message)
     {
         powerNotifyHost_ = host;
@@ -86,6 +90,7 @@ public:
 
 private:
     static constexpr UINT_PTR kStatusTimer = 1, kDragTimer = 2, kCaretTimer = 3;
+    static constexpr UINT WM_START_MOUSE_DOWN = WM_APP + 0x60;
     static constexpr float kPowerRowH = 44, kPowerPad = 12;
     static constexpr motion::Spring kFolderClose{0.30f, 1.f};
     struct Hit {
@@ -129,25 +134,37 @@ private:
     };
 
     void Paint(Canvas& c);
+    bool StepPanelSize(Canvas& c, D2D1_SIZE_F target);
+    void UpdateSurfaceRegion(D2D1_SIZE_F target, bool resizing);
     void PaintFolderCard(Canvas& c, std::vector<ShapeDip>& shapes, float dt, float& open, D2D1_RECT_F& card, bool& animating);
     void StepPowerCard(Canvas& c, float dt, bool& animating);
     void PaintPowerCard(Canvas& c, const Theme& t, std::vector<ShapeDip>& shapes);
     bool DismissPowerCard();
     void PaintSearch(Canvas& c, const Theme& t);
     void PaintTiles(Canvas& c, const Theme& t, float shown);
+    void PaintTileNaming(Canvas& c, const Theme& t, const Tile& tile, D2D1_RECT_F r, D2D1_RECT_F lr);
     // A tile in `r`: its icon (a folder: its first apps, small) and name. target: a carried app would go into it.
     void PaintTileFace(Canvas& c, const Theme& t, const Tile& tile, D2D1_RECT_F r, const std::wstring& id, bool selected, bool target);
     void DrawIcon(Canvas& c, const std::wstring& id, int px, D2D1_RECT_F r, float radius, const std::wstring& name = L"");
     void PaintHoverTip(Canvas& c, const Theme& t);
+    void PaintRowHeading(Canvas& c, const Theme& t, D2D1_RECT_F r, wchar_t letter);
+    void PaintRowItem(Canvas& c, const Theme& t, const Row& row, D2D1_RECT_F r, size_t index, bool firstIsDefault, int rowPx);
     void PaintRows(Canvas& c, const Theme& t, const std::vector<Row>& rows, float shown);
     void PaintIndex(Canvas& c, const Theme& t); // the A-Z list's letters, and the one being picked
+    void PaintFolderTitle(Canvas& c, const Theme& t, const Tile& f, D2D1_RECT_F full);
+    void PaintFolderApps(Canvas& c, const Theme& t, const Tile& f, D2D1_RECT_F full);
     void PaintFolder(Canvas& c, const Theme& t, D2D1_RECT_F card, float shown);
     void PaintDragged(Canvas& c, const Theme& t);
+    void PaintGrip(Canvas& c, const Theme& t);
+    void PaintShelfButton(Canvas& c, const Theme& t, float& x, float cy, float bh, const std::wstring& id, const std::wstring& glyph, const std::wstring& label,
+                          bool dim);
+    void PaintShelfAccount(Canvas& c, const Theme& t, float left, float maxRight, float cy, float bh, const D2D1_RECT_F& shelf);
     void PaintShelf(Canvas& c, const Theme& t);
     void PaintPower(Canvas& c, const Theme& t);
-    void PaintGrip(Canvas& c, const Theme& t);
     void PaintDots(Canvas& c, const Theme& t, int pages, float current, float y, const wchar_t* prefix);
     bool Message(UINT m, WPARAM w, LPARAM l, LRESULT& result);
+    void HandleExternalMouseDown(LPARAM l);
+    void RemoveMouseWatcher();
     bool HandleMouseMove(WPARAM w, POINT pt);
     bool HandleLeftDown(POINT pt, POINT content);
     bool HandleLeftUp(POINT pt);
@@ -233,6 +250,7 @@ private:
     std::vector<int> FolderOrder() const; // the folder's
     void BeginDrag();
     void UpdateDrag(POINT client);
+    void UpdateDragHover(int cols, int rows, float x0, float top, int page, double now);
     void EndDrag(bool commit);
     void CommitDrag(const Drag& d, const std::wstring& appId, const std::wstring& targetKey, const std::wstring& folderKey, bool targetIsFolder,
                     const std::vector<std::wstring>& keys);
@@ -294,6 +312,7 @@ private:
     SystemStatus status_;
     HWND previous_ = nullptr;
     RECT bar_{};
+    int mouseWatcherToken_ = 0;
     bool menuOpen_ = false;
     bool tracking_ = false;
     bool stale_ = false;    // the catalog changed while a tile was carried

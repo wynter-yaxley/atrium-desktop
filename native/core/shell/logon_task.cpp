@@ -58,20 +58,90 @@ std::wstring UserSid()
 // One task per user, as OneDrive names its own.
 std::wstring TaskName(const std::wstring& sid) { return L"Atrium Startup-" + sid; }
 
+bool ConnectTaskService(winrt::com_ptr<ITaskService>& service, winrt::com_ptr<ITaskFolder>& folder)
+{
+    if (FAILED(CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(service.put()))))
+        return false;
+    VARIANT none{};
+    VariantInit(&none);
+    if (FAILED(service->Connect(none, none, none, none)))
+        return false;
+    return SUCCEEDED(service->GetFolder(Bstr(L"\\").b, folder.put())) && folder;
+}
+
 winrt::com_ptr<ITaskFolder> RootFolder()
 {
     winrt::com_ptr<ITaskService> service;
-    if (FAILED(CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(service.put()))))
-        return nullptr;
-    VARIANT none{};
-    if (FAILED(service->Connect(none, none, none, none)))
-        return nullptr;
     winrt::com_ptr<ITaskFolder> folder;
-    service->GetFolder(Bstr(L"\\").b, folder.put());
-    return folder;
+    return ConnectTaskService(service, folder) ? folder : nullptr;
+}
+
+bool ConfigureLogonTask(ITaskDefinition* def, const std::wstring& sid, const std::wstring& exe)
+{
+    winrt::com_ptr<IRegistrationInfo> reg;
+    winrt::com_ptr<IPrincipal> principal;
+    winrt::com_ptr<ITriggerCollection> triggers;
+    winrt::com_ptr<ITrigger> trigger;
+    winrt::com_ptr<ITaskSettings> settings;
+    winrt::com_ptr<IActionCollection> actions;
+    winrt::com_ptr<IAction> action;
+    if (FAILED(def->get_RegistrationInfo(reg.put())) || FAILED(reg->put_Description(Bstr(L"Starts Atrium when you sign in.").b)) ||
+        FAILED(def->get_Principal(principal.put())) || FAILED(principal->put_UserId(Bstr(sid).b)) ||
+        FAILED(principal->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN)) || FAILED(principal->put_RunLevel(TASK_RUNLEVEL_LUA)) ||
+        FAILED(def->get_Triggers(triggers.put())) || FAILED(triggers->Create(TASK_TRIGGER_LOGON, trigger.put())))
+        return false;
+    auto logon = trigger.try_as<ILogonTrigger>();
+    if (!logon || FAILED(logon->put_Enabled(VARIANT_TRUE)) || FAILED(logon->put_UserId(Bstr(sid).b)))
+        return false;
+    if (FAILED(def->get_Settings(settings.put())) || FAILED(settings->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW)) ||
+        FAILED(settings->put_DisallowStartIfOnBatteries(VARIANT_FALSE)) || FAILED(settings->put_StopIfGoingOnBatteries(VARIANT_FALSE)) ||
+        FAILED(settings->put_ExecutionTimeLimit(Bstr(L"PT0S").b)) || FAILED(settings->put_Priority(4)))
+        return false;
+    winrt::com_ptr<IIdleSettings> idle;
+    if (SUCCEEDED(settings->get_IdleSettings(idle.put())) && idle) {
+        idle->put_StopOnIdleEnd(VARIANT_FALSE);
+        idle->put_RestartOnIdle(VARIANT_FALSE);
+    }
+    if (FAILED(def->get_Actions(actions.put())) || FAILED(actions->Create(TASK_ACTION_EXEC, action.put())))
+        return false;
+    auto exec = action.try_as<IExecAction>();
+    return exec && SUCCEEDED(exec->put_Path(Bstr(exe).b));
+}
+
+bool RegisterLogonTask(const std::wstring& exe)
+{
+    ComScope com;
+    const std::wstring sid = UserSid();
+    if (sid.empty()) {
+        Log(L"startup: could not resolve user SID for logon task");
+        return false;
+    }
+    winrt::com_ptr<ITaskService> service;
+    winrt::com_ptr<ITaskFolder> folder;
+    winrt::com_ptr<ITaskDefinition> def;
+    if (!ConnectTaskService(service, folder) || FAILED(service->NewTask(0, def.put()))) {
+        Log(L"startup: could not connect to Task Scheduler for logon task");
+        return false;
+    }
+    if (!ConfigureLogonTask(def.get(), sid, exe)) {
+        Log(L"startup: could not configure logon task definition");
+        return false;
+    }
+    VARIANT none{};
+    VariantInit(&none);
+    winrt::com_ptr<IRegisteredTask> registered;
+    const HRESULT hr = folder->RegisterTaskDefinition(Bstr(TaskName(sid)).b, def.get(), TASK_CREATE_OR_UPDATE, none, none, TASK_LOGON_INTERACTIVE_TOKEN, none,
+                                                      registered.put());
+    if (FAILED(hr)) {
+        Log(L"startup: the logon task could not be registered (0x%08X)", unsigned(hr));
+        return false;
+    }
+    return true;
 }
 
 } // namespace
+
+StartupMode ParseStartupMode(const std::wstring& mode) { return mode == L"task" ? StartupMode::Task : StartupMode::Run; }
 
 bool IsStartupApprovedDisabled(const uint8_t* data, size_t size)
 {
@@ -84,9 +154,9 @@ bool ShouldSyncStartupOnLaunch(bool development, bool registeredNow, bool startO
     return !development && registeredNow && startOnLogin && !startupTurnedOff;
 }
 
-StartupPlan PlanStartupChange(const StartupState& state, bool enabled)
+StartupPlan PlanStartupChange(const StartupState& state, bool enabled, StartupMode mode)
 {
-    if (state.exe.empty())
+    if (state.exe.empty() || !state.taskReadOk)
         return {};
     const std::wstring command = L"\"" + state.exe + L"\"";
     const bool ownTask = !state.taskProgram.empty() && _wcsicmp(state.taskProgram.c_str(), state.exe.c_str()) == 0;
@@ -97,22 +167,42 @@ StartupPlan PlanStartupChange(const StartupState& state, bool enabled)
         // Another distribution's entries are not ours to remove.
         if (!state.runReadOk || otherRun || otherTask)
             return {};
-        return {.ok = true, .removeTask = ownTask, .writeRun = false, .deleteRun = state.hasRunValue};
+        return {.ok = true, .removeTask = ownTask, .writeRun = false, .deleteRun = state.hasRunValue, .createTask = false};
     }
-    return {.ok = true, .removeTask = ownTask, .writeRun = !state.hasRunValue || state.runValue != command, .deleteRun = false};
+    if (mode == StartupMode::Task) {
+        if (!state.runReadOk)
+            return {};
+        return {.ok = true, .removeTask = false, .writeRun = false, .deleteRun = state.hasRunValue, .createTask = !ownTask};
+    }
+    return {.ok = true,
+            .removeTask = !state.taskProgram.empty(),
+            .writeRun = !state.hasRunValue || state.runValue != command,
+            .deleteRun = false,
+            .createTask = false};
 }
 
-std::wstring LogonTaskProgram()
+namespace {
+struct TaskQuery {
+    std::wstring program;
+    bool readOk = false;
+};
+
+TaskQuery QueryLogonTask()
 {
     ComScope com;
     const std::wstring sid = UserSid();
     auto folder = sid.empty() ? nullptr : RootFolder();
+    if (!folder)
+        return {};
     winrt::com_ptr<IRegisteredTask> task;
+    const HRESULT hr = folder->GetTask(Bstr(TaskName(sid)).b, task.put());
+    if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+        return {{}, true};
     winrt::com_ptr<ITaskDefinition> definition;
     winrt::com_ptr<IActionCollection> actions;
     winrt::com_ptr<IAction> action;
-    if (!folder || FAILED(folder->GetTask(Bstr(TaskName(sid)).b, task.put())) || FAILED(task->get_Definition(definition.put())) ||
-        FAILED(definition->get_Actions(actions.put())) || FAILED(actions->get_Item(1, action.put())))
+    if (FAILED(hr) || !task || FAILED(task->get_Definition(definition.put())) || FAILED(definition->get_Actions(actions.put())) ||
+        FAILED(actions->get_Item(1, action.put())))
         return {};
     auto exec = action.try_as<IExecAction>();
     BSTR path = nullptr;
@@ -122,8 +212,11 @@ std::wstring LogonTaskProgram()
     SysFreeString(path);
     if (result.size() >= 2 && result.front() == L'"' && result.back() == L'"')
         result = result.substr(1, result.size() - 2);
-    return result;
+    return {std::move(result), true};
 }
+} // namespace
+
+std::wstring LogonTaskProgram() { return QueryLogonTask().program; }
 
 bool RemoveLogonTask()
 {
@@ -133,10 +226,13 @@ bool RemoveLogonTask()
     if (!folder)
         return false;
     HRESULT hr = folder->DeleteTask(Bstr(TaskName(sid)).b, 0);
-    return SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
+        return true;
+    Log(L"startup: could not remove logon task (0x%08X)", unsigned(hr));
+    return false;
 }
 
-bool SetStartOnLogin(bool enabled)
+bool UpdateLogonTask(bool startOnLogin, StartupMode mode)
 {
     if (IsDevelopmentBuild())
         return true;
@@ -150,28 +246,45 @@ bool SetStartOnLogin(bool enabled)
     wchar_t current[32771]{};
     DWORD size = sizeof(current);
     LSTATUS read = RegGetValueW(HKEY_CURRENT_USER, kRunKey, L"Atrium", RRF_RT_REG_SZ, nullptr, current, &size);
+    const TaskQuery taskQuery = QueryLogonTask();
     const StartupState state{
         .exe = exe,
-        .taskProgram = LogonTaskProgram(),
+        .taskProgram = taskQuery.program,
         .runValue = read == ERROR_SUCCESS ? current : std::wstring{},
         .hasRunValue = read == ERROR_SUCCESS,
         .runReadOk = read == ERROR_SUCCESS || read == ERROR_FILE_NOT_FOUND || read == ERROR_PATH_NOT_FOUND,
+        .taskReadOk = taskQuery.readOk,
     };
-    const StartupPlan plan = PlanStartupChange(state, enabled);
-    if (!plan.ok)
+    const StartupPlan plan = PlanStartupChange(state, startOnLogin, mode);
+    if (!plan.ok) {
+        Log(L"startup: skipped logon update because existing startup entries belong to another install or could not be read");
         return false;
+    }
+    if (plan.createTask && !RegisterLogonTask(state.exe))
+        return false;
+    if (plan.writeRun) {
+        const std::wstring command = L"\"" + state.exe + L"\"";
+        const LSTATUS result = RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, L"Atrium", REG_SZ, command.c_str(), DWORD((command.size() + 1) * sizeof(wchar_t)));
+        if (result != ERROR_SUCCESS) {
+            Log(L"startup: could not write Run entry (%lu)", result);
+            return false;
+        }
+    }
     if (plan.removeTask && !RemoveLogonTask())
         return false;
     if (plan.deleteRun) {
-        LSTATUS result = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"Atrium");
-        return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
-    }
-    if (plan.writeRun) {
-        const std::wstring command = L"\"" + state.exe + L"\"";
-        return RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, L"Atrium", REG_SZ, command.c_str(), DWORD((command.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+        const LSTATUS result = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"Atrium");
+        if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) {
+            Log(L"startup: could not remove Run entry (%lu)", result);
+            return false;
+        }
     }
     return true;
 }
+
+bool UpdateLogonTask(bool startOnLogin, const std::wstring& mode) { return UpdateLogonTask(startOnLogin, ParseStartupMode(mode)); }
+
+bool SetStartOnLogin(bool enabled, StartupMode mode) { return UpdateLogonTask(enabled, mode); }
 
 bool StartupTurnedOff()
 {

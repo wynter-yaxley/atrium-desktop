@@ -15,7 +15,7 @@
 namespace atrium {
 
 // The control centre's optional modules (controlModules), in the settings app's order.
-inline constexpr const wchar_t* kControlModules[] = {L"stage", L"energysaver", L"darkmode", L"hotspot"};
+inline constexpr const wchar_t* kControlModules[] = {L"stage", L"energysaver", L"darkmode", L"hotspot", L"dnd", L"airplane"};
 
 struct Settings {
     static constexpr int kVersion = 2; // 2: Windows notifications on by default (v1 files are migrated)
@@ -90,16 +90,17 @@ struct Settings {
     // auto follows Windows' UI language (Chinese -> zh, anything else -> en).
     std::wstring language = L"auto"; // auto | zh | en
     std::wstring textColor = L"auto"; // auto | light | dark
-    // When the bar steps out of the way: never | fullscreen (a maximized or full-screen app is in
-    // front) | always (it waits below the screen's bottom edge). The pointer there brings it up.
+    // When the bar steps out of the way: never | fullscreen (a maximized or full-screen app is in front) | always (waits at the screen edge).
+    // The pointer at the edge brings it up. With barDodge (not in always), any overlapping non-transient window also hides it.
     std::wstring autoHide = L"fullscreen";
+    bool barDodge = false;           // always or fullscreen: also hide whenever any window overlaps the bar
     bool barReserve = true;          // always shown: the bar keeps its strip of the screen, maximized windows end before it (#40, #129)
     bool barFullscreenHide = true;   // always shown: a full-screen app in front (a video, F11) has the screen, the bar goes (#134)
     std::wstring barEdge = L"bottom"; // bottom | top | left | right
     std::wstring statusStyle = L"ring"; // the status entry: ring (a ring round the Wi-Fi fan) | icons (network, volume, battery)
     std::vector<std::wstring> controlModules{L"stage"}; // the control centre's optional modules, in order (kControlModules)
     // One Dock, summoned at another display's bottom edge, as on macOS.
-    std::wstring dockDisplayMode = L"primary"; // primary (as before several displays were known) | follow | fixed | all
+    std::wstring dockDisplayMode = L"follow"; // follow (at the active display) | primary | fixed | all
     double dockDisplayDelay = 450;   // milliseconds at another display's bottom edge (100..2000)
     std::wstring dockDisplay;        // fixed display's device-interface ID
     std::wstring desktopDisplay;     // widgets and Stage Manager; empty follows the system primary
@@ -158,6 +159,8 @@ struct Settings {
     bool trayHost = true;            // Atrium receives the apps' tray icons itself (shell/tray_host.h)
     bool remoteVisible = false;      // remote-control apps see Atrium; the glass shows the wallpaper
     bool startOnLogin = true;        // independent of starting/stopping the current session
+    std::wstring startupMode = L"run"; // run (HKCU Run entry) | task (Task Scheduler logon task)
+    bool autoUpdate = true;          // check GitHub releases on startup and periodically
     // Pinned apps; nullopt = never saved yet (first run imports the Windows pins).
     std::optional<std::vector<PinnedApp>> pins;
 
@@ -187,7 +190,7 @@ Settings LoadSettingsFrom(const std::wstring& path, SettingsFileState* stateOut 
 Settings LoadSettings();
 // True means the file was saved. A failed save says why in `error` (the path,
 // the system's reason). `startupChangedOut`, when non-null, reports whether
-// `startOnLogin` differs from the prior valid file on disk.
+// `startOnLogin` or `startupMode` differs from the prior valid file on disk.
 [[nodiscard]] bool SaveSettingsTo(const std::wstring& path, const Settings& s, std::wstring* error = nullptr,
                                   const std::function<bool(const std::wstring&)>& backupCorrupt = {}, bool* startupChangedOut = nullptr);
 [[nodiscard]] bool SaveSettings(const Settings& s, std::wstring* error = nullptr, bool* startupChangedOut = nullptr);

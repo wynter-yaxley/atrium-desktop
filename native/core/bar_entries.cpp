@@ -13,7 +13,7 @@ std::wstring FormatNetworkTooltip(const SystemStatus& st)
 {
     auto wifiLine = [](const std::wstring& n, int s) { return s >= 0 ? TrFormat(L"Wi-Fi %s · signal %d%%", n.c_str(), s) : TrFormat(L"Wi-Fi %s", n.c_str()); };
     if (st.links.size() < 2)
-        return !st.connected ? Tr(L"No network") : st.wifi ? wifiLine(st.network, st.signal) : st.network;
+        return !st.connected ? (st.airplane ? Tr(L"Airplane mode") : Tr(L"No network")) : st.wifi ? wifiLine(st.network, st.signal) : st.network;
     std::wstring out;
     size_t n = 0;
     auto add = [&](bool primary) {
@@ -99,8 +99,11 @@ std::wstring Bar::TooltipText(const std::wstring& key) const
         return musicTip_.empty() ? std::wstring(Tr(L"Now Playing")) : musicTip_;
     if (key == kStacksKey)
         return Tr(L"File Stacks");
-    if (key == kNotifyKey)
+    if (key == kNotifyKey) {
+        if (dnd_)
+            return unread_ ? TrFormat(L"%d unread notifications · Do Not Disturb", int(unread_)) : Tr(L"Notifications · Do Not Disturb");
         return unread_ ? TrFormat(L"%d unread notifications", int(unread_)) : Tr(L"Notifications");
+    }
     if (key == kTrayKey)
         return Tr(L"Tray");
     if (key == kImeKey)

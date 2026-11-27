@@ -34,7 +34,7 @@
     "autoHide": {"type": "enum", "default": "fullscreen", "values": ["never", "fullscreen", "always"], "fallback": "fullscreen"},
     "barEdge": {"type": "enum", "default": "bottom", "values": ["bottom", "top", "left", "right"], "fallback": "bottom"},
     "statusStyle": {"type": "enum", "default": "ring", "values": ["ring", "icons"], "fallback": "ring"},
-    "controlModules": {"type": "stringArray", "default": ["stage"], "maxCount": 4},
+    "controlModules": {"type": "stringArray", "default": ["stage"], "maxCount": 6},
     "iconSize": {"type": "number", "default": 30, "min": 16, "max": 64, "uiMin": 16, "uiMax": 64, "uiScale": 1, "sliderProp": "IconSize"},
     "magnify": {"type": "number", "default": 1.7, "min": 1, "max": 2, "uiMin": 100, "uiMax": 200, "uiScale": 100, "sliderProp": "Magnify"},
     "hoverRise": {"type": "bool", "default": false},
@@ -60,7 +60,7 @@
     "folderStackMax": {"type": "number", "default": 8, "min": 4, "max": 24},
     "folderStacks": {"type": "stringArray", "default": [], "maxCount": 32},
     "folderStackFiles": {"type": "stringArray", "default": [], "maxCount": 32},
-    "dockDisplayMode": {"type": "enum", "default": "primary", "values": ["primary", "follow", "fixed", "all"], "fallback": "primary"},
+    "dockDisplayMode": {"type": "enum", "default": "follow", "values": ["primary", "follow", "fixed", "all"], "fallback": "follow"},
     "dockDisplayDelay": {"type": "number", "default": 450, "min": 100, "max": 2000},
     "dockDisplay": {"type": "string", "default": ""},
     "desktopDisplay": {"type": "string", "default": ""},
@@ -101,6 +101,7 @@
     "hideTaskbar": {"type": "bool", "default": true},
     "genieMinimize": {"type": "bool", "default": false},
     "windowPeek": {"type": "bool", "default": true},
+    "barDodge": {"type": "bool", "default": false},
     "barReserve": {"type": "bool", "default": true},
     "barFullscreenHide": {"type": "bool", "default": true},
     "hideBanners": {"type": "bool", "default": false},
@@ -108,6 +109,8 @@
     "remoteVisible": {"type": "bool", "default": false},
     "winNumbers": {"type": "bool", "default": false},
     "startOnLogin": {"type": "bool", "default": true},
+    "startupMode": {"type": "enum", "default": "run", "values": ["run", "task"], "fallback": "run"},
+    "autoUpdate": {"type": "bool", "default": true},
     "pins": {"type": "pins", "default": null, "optional": true, "maxCount": 64}
   }
 }

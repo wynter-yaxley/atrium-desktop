@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <exception>
 #include <vector>
 
 namespace atrium {
@@ -271,25 +270,33 @@ void Bar::UpdateAppBar(HMONITOR monitor, RECT bounds, int reserve)
     constexpr UINT kAppBarEdge[] = {ABE_BOTTOM, ABE_TOP, ABE_LEFT, ABE_RIGHT}; // in BarEdge's order
     abd.uEdge = kAppBarEdge[int(edge_)];
     abd.rc = want;
-    AppBarMessage(ABM_QUERYPOS, abd); // inside another app bar (the system taskbar, if shown) on the same edge
+    UINT_PTR queryOut = 0, setOut = 0;
+    if (!TryAppBarMessage(ABM_QUERYPOS, abd, queryOut)) // inside another app bar (the system taskbar, if shown) on the same edge
+        return;
     RECT rc = frame.FromArea(abd.rc);
     rc.top = rc.bottom - reserve;
     abd.rc = frame.ToArea(rc);
-    AppBarMessage(ABM_SETPOS, abd);
+    if (!TryAppBarMessage(ABM_SETPOS, abd, setOut))
+        return;
     const RECT granted = frame.FromArea(abd.rc);
+    const bool exact = EqualRect(&abd.rc, &want) != FALSE;
+    const bool changed = appBarMonitor_ != monitor || appBarEdge_ != edge_ || !EqualRect(&appBarRect_, &abd.rc);
     appBarRect_ = abd.rc;
-    appBarWant_ = want;
+    // Leave appBarWant_ empty when clipped so the next relayout reclaims the full edge once Explorer releases it.
+    appBarWant_ = exact ? want : RECT{};
     appBarReserved_ = int(std::max(0L, granted.bottom - granted.top));
     appBarMonitor_ = monitor;
     appBarEdge_ = edge_;
-    if (!EqualRect(&abd.rc, &want)) {
-        MONITORINFO mi{sizeof(mi)};
-        GetMonitorInfoW(monitor, &mi);
-        Log(L"bar: appbar granted (%ld,%ld,%ld,%ld) != want (%ld,%ld,%ld,%ld), monitor (%ld,%ld,%ld,%ld), work (%ld,%ld,%ld,%ld)", abd.rc.left, abd.rc.top,
-            abd.rc.right, abd.rc.bottom, want.left, want.top, want.right, want.bottom, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right,
-            mi.rcMonitor.bottom, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom);
+    if (changed) {
+        if (!exact) {
+            MONITORINFO mi{sizeof(mi)};
+            GetMonitorInfoW(monitor, &mi);
+            Log(L"bar: appbar granted (%ld,%ld,%ld,%ld) != want (%ld,%ld,%ld,%ld), monitor (%ld,%ld,%ld,%ld), work (%ld,%ld,%ld,%ld)", abd.rc.left, abd.rc.top,
+                abd.rc.right, abd.rc.bottom, want.left, want.top, want.right, want.bottom, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right,
+                mi.rcMonitor.bottom, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom);
+        }
+        Log(L"bar: keeps %d px of the screen's %s edge (always shown)", appBarReserved_, settings_.barEdge.c_str());
     }
-    Log(L"bar: keeps %d px of the screen's %s edge (always shown)", appBarReserved_, settings_.barEdge.c_str());
 }
 
 void Bar::ReadDisplays()
@@ -587,6 +594,14 @@ void Bar::SetUnread(int count)
     Relayout();
 }
 
+void Bar::SetDoNotDisturb(bool on)
+{
+    if (on == dnd_)
+        return;
+    dnd_ = on;
+    Relayout();
+}
+
 void Bar::Publish(bool bar)
 {
     {
@@ -677,8 +692,6 @@ void Bar::RenderThread()
             end = RenderSession();
         } catch (const winrt::hresult_error& e) {
             Log(L"render: 0x%08X %s; rebuilding in 1 s", static_cast<unsigned>(e.code()), e.message().c_str());
-        } catch (const std::exception& e) {
-            Log(L"render: %hs; rebuilding in 1 s", e.what());
         }
         if (end == SessionEnd::Exit || (end == SessionEnd::Retry && WaitForSingleObject(quit_, 1000) != WAIT_TIMEOUT))
             break;

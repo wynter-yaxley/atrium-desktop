@@ -2,6 +2,7 @@
 
 #include "localization.h"
 #include "log.h"
+#include "shell/process_integrity.h"
 #include "shell/logon_task.h"
 #include "ui/desktop_widgets.h"
 
@@ -82,7 +83,9 @@ struct PipeSecurity {
             Log(L"pipe: could not resolve user SID for DACL (%lu), using default security", GetLastError());
             return;
         }
-        const std::wstring sddl = L"D:P(A;;GA;;;" + sid + L")(A;;GA;;;SY)(A;;GA;;;BA)";
+        std::wstring sddl = L"D:P(A;;GA;;;" + sid + L")(A;;GA;;;SY)(A;;GA;;;BA)";
+        if (IsElevatedProcess())
+            sddl += L"S:(ML;;NW;;;ME)";
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
             Log(L"pipe: ConvertStringSecurityDescriptorToSecurityDescriptorW failed (%lu), using default security", GetLastError());
             sd = nullptr;
@@ -144,6 +147,64 @@ bool Wait(HANDLE pipe, OVERLAPPED& ov, HANDLE quit, DWORD& bytes, DWORD& error)
     return error == ERROR_SUCCESS || error == ERROR_MORE_DATA;
 }
 
+struct ScopedEvent {
+    HANDLE handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~ScopedEvent()
+    {
+        if (handle)
+            CloseHandle(handle);
+    }
+    ScopedEvent() = default;
+    ScopedEvent(const ScopedEvent&) = delete;
+    ScopedEvent& operator=(const ScopedEvent&) = delete;
+};
+
+struct PipeDisconnectGuard {
+    HANDLE pipe;
+    explicit PipeDisconnectGuard(HANDLE p) : pipe(p) {}
+    ~PipeDisconnectGuard() { DisconnectNamedPipe(pipe); }
+    PipeDisconnectGuard(const PipeDisconnectGuard&) = delete;
+    PipeDisconnectGuard& operator=(const PipeDisconnectGuard&) = delete;
+};
+
+bool ConnectPipe(HANDLE pipe, OVERLAPPED& ov, HANDLE quit)
+{
+    if (ConnectNamedPipe(pipe, &ov))
+        return true;
+    DWORD bytes = 0;
+    DWORD error = GetLastError();
+    if (error == ERROR_IO_PENDING)
+        return Wait(pipe, ov, quit, bytes, error);
+    return error == ERROR_PIPE_CONNECTED || error == ERROR_SUCCESS;
+}
+
+bool ReadPipeMessage(HANDLE pipe, OVERLAPPED& ov, HANDLE quit, std::string& buffer, std::string& message)
+{
+    message.clear();
+    DWORD error = 0;
+    do {
+        ResetEvent(ov.hEvent);
+        DWORD bytes = 0;
+        if (!ReadFile(pipe, buffer.data(), kBuffer, &bytes, &ov)) {
+            error = GetLastError();
+            if (error == ERROR_IO_PENDING) {
+                if (!Wait(pipe, ov, quit, bytes, error))
+                    return false;
+            } else if (error != ERROR_MORE_DATA) {
+                return false; // client gone
+            }
+        } else {
+            error = ERROR_SUCCESS;
+        }
+        message.append(buffer.data(), bytes);
+    } while (error == ERROR_MORE_DATA && message.size() < 1024 * 1024);
+    if (error == ERROR_MORE_DATA) {
+        Log(L"pipe: request exceeded 1 MB, disconnecting");
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 std::wstring SettingsPipeName()
@@ -153,13 +214,15 @@ std::wstring SettingsPipeName()
     return L"\\\\.\\pipe\\Atrium.Core." + std::to_wstring(session);
 }
 
-SettingsServer::SettingsServer(HWND host, const Settings& saved, std::wstring pipeName, std::wstring settingsPath)
+SettingsServer::SettingsServer(HWND host, const Settings& saved, std::wstring pipeName, std::wstring settingsPath,
+                               std::function<void(bool)> onAutoUpdateCommitted)
     : host_(host),
       pipeName_(pipeName.empty() ? SettingsPipeName() : std::move(pipeName)),
       settingsPath_(std::move(settingsPath)),
       instanceId_(MakeInstanceId()),
       saved_(saved),
       current_(saved),
+      onAutoUpdateCommitted_(std::move(onAutoUpdateCommitted)),
       quit_(CreateEventW(nullptr, TRUE, FALSE, nullptr))
 {
     thread_ = std::thread([this] { Run(); });
@@ -179,13 +242,19 @@ Settings SettingsServer::Current()
     return current_;
 }
 
+Settings SettingsServer::Saved()
+{
+    std::lock_guard g(lock_);
+    return saved_;
+}
+
 bool SettingsServer::Save(const Settings& s, std::wstring* warning, std::wstring* error) const
 {
     if (warning)
         warning->clear();
     bool startupChanged = false;
     const bool ok = settingsPath_.empty() ? SaveSettings(s, error, &startupChanged) : SaveSettingsTo(settingsPath_, s, error);
-    if (ok && settingsPath_.empty() && startupChanged && !SetStartOnLogin(s.startOnLogin)) {
+    if (ok && settingsPath_.empty() && startupChanged && !UpdateLogonTask(s.startOnLogin, s.startupMode)) {
         Log(L"settings: settings saved, but Windows startup could not be changed");
         if (warning)
             *warning = Tr(L"Settings were saved, but Windows startup could not be changed. Toggle Start with Windows again, then save.");
@@ -212,11 +281,15 @@ bool SettingsServer::Modify(const std::function<void(Settings&)>& change)
     }
     change(current);
     current.Clamp();
+    std::function<void(bool)> onAutoUpdateCommitted;
     {
         std::lock_guard g(lock_);
         saved_ = saved;
         ++revision_;
+        onAutoUpdateCommitted = onAutoUpdateCommitted_;
     }
+    if (onAutoUpdateCommitted)
+        onAutoUpdateCommitted(saved.autoUpdate);
     SetCurrent(current);
     return true;
 }
@@ -274,55 +347,30 @@ void SettingsServer::Run()
 
 void SettingsServer::Serve(HANDLE pipe)
 {
+    ScopedEvent event;
+    if (!event.handle)
+        return;
     OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    DWORD bytes = 0, error = 0;
-    if (!ConnectNamedPipe(pipe, &ov)) {
-        error = GetLastError();
-        if (error == ERROR_IO_PENDING && !Wait(pipe, ov, quit_, bytes, error)) {
-            CloseHandle(ov.hEvent);
-            return;
-        }
-        if (error != ERROR_IO_PENDING && error != ERROR_PIPE_CONNECTED && error != ERROR_SUCCESS) {
-            CloseHandle(ov.hEvent);
-            return;
-        }
-    }
+    ov.hEvent = event.handle;
+    if (!ConnectPipe(pipe, ov, quit_))
+        return;
+    PipeDisconnectGuard disconnect{pipe};
+
     std::string buffer(kBuffer, '\0');
     for (;;) {
         std::string message;
-        do {
-            ResetEvent(ov.hEvent);
-            bytes = 0;
-            if (!ReadFile(pipe, buffer.data(), kBuffer, &bytes, &ov)) {
-                error = GetLastError();
-                if (error == ERROR_IO_PENDING) {
-                    if (!Wait(pipe, ov, quit_, bytes, error))
-                        goto done;
-                } else if (error != ERROR_MORE_DATA) {
-                    goto done; // client gone
-                }
-            } else {
-                error = ERROR_SUCCESS;
-            }
-            message.append(buffer.data(), bytes);
-        } while (error == ERROR_MORE_DATA && message.size() < 1024 * 1024);
-        if (error == ERROR_MORE_DATA) {
-            Log(L"pipe: request exceeded 1 MB, disconnecting");
-            goto done;
-        }
+        if (!ReadPipeMessage(pipe, ov, quit_, buffer, message))
+            return;
 
         std::string reply = Handle(message);
         ResetEvent(ov.hEvent);
+        DWORD bytes = 0;
         if (!WriteFile(pipe, reply.data(), DWORD(reply.size()), &bytes, &ov)) {
-            error = GetLastError();
+            DWORD error = GetLastError();
             if (error != ERROR_IO_PENDING || !Wait(pipe, ov, quit_, bytes, error))
-                break;
+                return;
         }
     }
-done:
-    DisconnectNamedPipe(pipe);
-    CloseHandle(ov.hEvent);
 }
 
 std::string SettingsServer::Handle(const std::string& request)
@@ -361,10 +409,17 @@ std::string SettingsServer::Handle(const std::string& request)
         r.SetNamedValue(L"protocol", json::JsonValue::CreateNumberValue(kProtocol));
         r.SetNamedValue(L"instanceId", json::JsonValue::CreateStringValue(instanceId_));
         r.SetNamedValue(L"revision", json::JsonValue::CreateNumberValue(double(revision)));
+        r.SetNamedValue(L"elevated", json::JsonValue::CreateBooleanValue(IsElevatedProcess()));
         r.SetNamedValue(L"saved", json::JsonObject::Parse(saved.ToJson()));
         r.SetNamedValue(L"current", json::JsonObject::Parse(current.ToJson()));
         r.SetNamedValue(L"path", json::JsonValue::CreateStringValue(EffectiveSettingsPath()));
         return Narrow(std::wstring(r.Stringify()));
+    }
+    if (op == L"quit") {
+        if (!host_)
+            return Reply(L"error", L"no host window");
+        PostMessageW(host_, WM_CLOSE, 0, 0);
+        return Reply(L"ok");
     }
     if (op == L"cancel") {
         Log(L"pipe: cancel, back to the saved settings");
@@ -387,11 +442,15 @@ std::string SettingsServer::Handle(const std::string& request)
             }
             Log(L"pipe: commit saved");
             uint64_t nextRevision = 0;
+            std::function<void(bool)> onAutoUpdateCommitted;
             {
                 std::lock_guard g(lock_);
                 saved_ = next;
                 nextRevision = ++revision_;
+                onAutoUpdateCommitted = onAutoUpdateCommitted_;
             }
+            if (onAutoUpdateCommitted)
+                onAutoUpdateCommitted(next.autoUpdate);
             SetCurrent(next);
             json::JsonObject reply;
             reply.SetNamedValue(L"op", json::JsonValue::CreateStringValue(L"ok"));

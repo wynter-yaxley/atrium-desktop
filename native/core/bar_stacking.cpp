@@ -177,6 +177,57 @@ bool Bar::MonitorCoveredByApp() const
     return false;
 }
 
+bool WindowOverlapsBar(const RECT& windowBounds, const RECT& barZone)
+{
+    RECT overlap{};
+    return IntersectRect(&overlap, &windowBounds, &barZone) != FALSE && overlap.right > overlap.left && overlap.bottom > overlap.top;
+}
+
+RECT Bar::BarOverlapZone() const
+{
+    const LONG barLeft = LONG(scene_.bar.left), barTop = LONG(scene_.bar.top), barRight = LONG(scene_.bar.right);
+    const LONG barBottom = LONG(scene_.bar.bottom);
+    if (barRight <= barLeft || barBottom <= barTop)
+        return RECT{};
+    const EdgeFrame frame{edge_, window_};
+    const LONG outer = std::max<LONG>(barBottom, frame.FromArea(monitor_).bottom);
+    return frame.ToArea(RECT{barLeft, barTop, barRight, outer});
+}
+
+bool Bar::MonitorOverlappedByApp() const
+{
+    const RECT zone = BarOverlapZone();
+    if (zone.right <= zone.left || zone.bottom <= zone.top)
+        return false;
+    for (HWND window = GetTopWindow(nullptr); window; window = GetWindow(window, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(window) || IsIconic(window))
+            continue;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(window, &pid);
+        if (pid == GetCurrentProcessId())
+            continue;
+        const LONG_PTR ex = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if (!(ex & WS_EX_APPWINDOW) && ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || GetWindow(window, GW_OWNER)))
+            continue;
+        if ((ex & WS_EX_TRANSPARENT) && (ex & WS_EX_LAYERED))
+            continue;
+        BOOL cloaked = FALSE;
+        DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+        if (cloaked)
+            continue;
+        wchar_t cls[64] = {};
+        GetClassNameW(window, cls, 64);
+        if (wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 || wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0)
+            continue;
+        RECT bounds{};
+        if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))) && !GetWindowRect(window, &bounds))
+            continue;
+        if (WindowOverlapsBar(bounds, zone))
+            return true;
+    }
+    return false;
+}
+
 void Bar::UpdateCover()
 {
     if (!visible_) {
@@ -188,6 +239,7 @@ void Bar::UpdateCover()
     }
     // Apply the hide mode independently on each display.
     const std::wstring& mode = settings_.autoHide;
+    const bool dodge = settings_.barDodge && mode != L"always";
     const bool allowFullscreenHide = mode != L"never" || settings_.barFullscreenHide;
     const bool expected = mode != L"never" && GetTickCount64() < expectCoverUntil_;
     bool knownFullScreen = false;
@@ -196,26 +248,31 @@ void Bar::UpdateCover()
         // Respect autoHide == "never" + barFullscreenHide == false for non-exclusive windows/games;
         // exclusive D3D fullscreen still owns the display.
         knownFullScreen = ExclusiveD3dInFront(hmonitor_);
-        covered = knownFullScreen;
+        covered = knownFullScreen || (dodge && MonitorOverlappedByApp());
     } else if (mode == L"never") {
         knownFullScreen = FullScreenInFront(hmonitor_);
-        covered = knownFullScreen;
+        covered = knownFullScreen || (dodge && MonitorOverlappedByApp());
+    } else if (mode == L"always") {
+        knownFullScreen = GameInFront(hmonitor_);
+        covered = true;
     } else {
         const bool game = GameInFront(hmonitor_);
         knownFullScreen = game;
-        covered = mode == L"always" || MonitorCoveredByApp() || game || expected;
+        covered = (dodge && MonitorOverlappedByApp()) || MonitorCoveredByApp() || game || expected;
     }
     if (covered == covered_)
         return;
     covered_ = covered;
-    // Maximizing with the pointer on the bar keeps it up until the pointer leaves.
+    // Maximizing with the pointer on the bar keeps it up until the pointer leaves;
+    // in dodge mode, dragging a window edge down with the mouse button pressed lets it tuck right away.
     POINT p{};
     GetCursorPos(&p);
     RECT zone = EdgeZone();
-    revealed_ = covered && !slidOut_ && PtInRect(&zone, p) && !(knownFullScreen || FullScreenInFront(hmonitor_));
+    const bool draggingWindow = dodge && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    revealed_ = covered && !slidOut_ && !draggingWindow && PtInRect(&zone, p) && !(knownFullScreen || FullScreenInFront(hmonitor_));
     leftAt_ = 0;
-    if (mode == L"fullscreen")
-        Log(L"bar: monitor %p %s", hmonitor_, covered ? L"covered by its top app: auto-hide" : L"not covered by its top app");
+    if (mode == L"fullscreen" || dodge)
+        Log(L"bar: monitor %p %s (%s%s)", hmonitor_, covered ? L"covered: auto-hide" : L"clear", mode.c_str(), dodge ? L"+dodge" : L"");
     else
         Log(L"bar: auto-hide %s (%s)", covered ? L"always" : L"never", mode.c_str());
     if (covered)

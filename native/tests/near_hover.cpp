@@ -1,17 +1,19 @@
 #include "near_hover.h"
 
 #include <iostream>
-#include <stdexcept>
 
 using namespace atrium;
 
 namespace {
 const D2D1_RECT_F kGlass{20, 200, 420, 264};
+bool g_failed = false;
 
 void Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (!condition) {
+        std::cerr << message << '\n';
+        g_failed = true;
+    }
 }
 
 void CheckApproach()
@@ -117,17 +119,11 @@ void CheckSmallLeaveScale()
 
 int main()
 {
-    bool passed = true;
     for (auto check : {CheckApproach, CheckBarDeparture, CheckDirectVisit, CheckEdges, CheckScale, CheckReset, CheckSmallLeave, CheckSmallLeaveApproach,
-                       CheckSmallLeaveScale}) {
-        try {
-            check();
-        } catch (const std::exception& error) {
-            std::cerr << error.what() << '\n';
-            passed = false;
-        }
-    }
-    if (!passed)
+                       CheckSmallLeaveScale})
+        check();
+    if (g_failed)
         return 1;
     std::cout << "Early hover entry, bar departure, leave distance, DPI and reset checks passed.\n";
+    return 0;
 }

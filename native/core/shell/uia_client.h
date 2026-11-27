@@ -103,16 +103,21 @@ private:
 
 class UiaWindowWake {
 public:
-    UiaWindowWake(HANDLE wake, const wchar_t* windowClass, bool watchNameChanges = true)
+    UiaWindowWake(HANDLE wake, const wchar_t* windowClass, bool watchNameChanges = true, bool watchForeground = false)
         : wake_(wake),
           windowClass_(windowClass),
           watchNameChanges_(watchNameChanges),
-          show_(SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, nullptr, Changed, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS))
+          show_(SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, nullptr, Changed, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)),
+          foreground_(watchForeground ? SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, Changed, 0, 0,
+                                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS) :
+                                        nullptr)
     {
         g_active = this;
     }
     ~UiaWindowWake()
     {
+        if (foreground_)
+            UnhookWinEvent(foreground_);
         if (show_)
             UnhookWinEvent(show_);
         for (const auto& [pid, hook] : nameHooks_)
@@ -125,12 +130,13 @@ public:
 
     template<typename Processes> void SetProcesses(const Processes& processes)
     {
-        if (!watchNameChanges_)
-            return;
         std::vector<DWORD> next;
         for (const auto& entry : processes)
             if (entry.first != 0 && std::ranges::find(next, entry.first) == next.end())
                 next.push_back(entry.first);
+        pids_ = next;
+        if (!watchNameChanges_)
+            return;
         for (size_t i = nameHooks_.size(); i-- > 0;)
             if (std::ranges::find(next, nameHooks_[i].first) == next.end()) {
                 if (nameHooks_[i].second)
@@ -152,6 +158,16 @@ private:
     {
         if (!g_active || !window)
             return;
+        if (event == EVENT_SYSTEM_FOREGROUND) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            const bool ours = std::ranges::find(g_active->pids_, pid) != g_active->pids_.end();
+            if (ours || std::exchange(g_active->targetForeground_, false)) {
+                g_active->targetForeground_ = ours;
+                SetEvent(g_active->wake_);
+            }
+            return;
+        }
         bool appearance = event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE;
         if (appearance && (object != OBJID_WINDOW || child != CHILDID_SELF || GetAncestor(window, GA_ROOT) != window))
             return;
@@ -171,8 +187,11 @@ private:
     HANDLE wake_;
     const wchar_t* windowClass_;
     bool watchNameChanges_;
+    bool targetForeground_ = false;
+    std::vector<DWORD> pids_;
     std::vector<std::pair<DWORD, HWINEVENTHOOK>> nameHooks_;
     HWINEVENTHOOK show_ = nullptr;
+    HWINEVENTHOOK foreground_ = nullptr;
 };
 
 // Out-of-context WinEvents arrive on the installing thread, which must pump

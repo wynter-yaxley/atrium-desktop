@@ -2,11 +2,11 @@
 
 #include "clock.h"
 #include "localization.h"
-#include "shell/launchpad_order.h"
 #include "ui/launchpad_page_ids.h"
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <string_view>
 
 namespace atrium {
@@ -43,13 +43,17 @@ Launchpad::Launchpad(HINSTANCE instance, AppCatalog& catalog) : surface_(instanc
 void Launchpad::Open(RECT work, HWND previous)
 {
     previous_ = previous;
-    order_ = LoadLaunchpadOrder();
+    layout_ = LoadLaunchpadLayout();
     lifted_ = -1;
-    stale_ = false;
+    liftedFromFolder_ = dragInFolder_ = false;
+    mergeTarget_ = dragPendingSlot_ = -1;
+    dragEdge_ = 0;
+    stale_ = namingFolder_ = false;
+    nameDraft_.clear();
     tilePos_.clear();
     apps_ = LaunchableApps();
     Split();
-    folderOpen_ = false;
+    openFolder_.clear();
     query_.clear();
     composition_.clear();
     searchFocused_ = false;
@@ -78,6 +82,7 @@ void Launchpad::Open(RECT work, HWND previous)
     if (const UINT blink = GetCaretBlinkTime(); blink != INFINITE)
         SetTimer(surface_.Hwnd(), kCaretTimer, std::max(1u, blink), nullptr);
     PlaceIme();
+    catalog_.Refresh();
 }
 
 void Launchpad::Size(RECT work)
@@ -112,7 +117,10 @@ std::vector<CatalogApp> Launchpad::LaunchableApps() const
     return apps;
 }
 
-std::vector<std::wstring> Launchpad::PageIconIds(int page) const { return ExpandLaunchpadPageIds(Shown(), system_, page, grid_.perPage, kFolderId); }
+std::vector<std::wstring> Launchpad::PageIconIds(int page) const
+{
+    return ExpandLaunchpadPageIds(Shown(), page, grid_.perPage, [&](std::wstring_view id) { return FolderApps(id); });
+}
 
 void Launchpad::UpdatePageTargets(bool prioritize)
 {
@@ -138,14 +146,15 @@ void Launchpad::Prewarm(RECT work)
 {
     if (surface_.Visible() || !catalog_.Loaded())
         return;
-    order_ = LoadLaunchpadOrder();
+    layout_ = LoadLaunchpadLayout();
     apps_ = LaunchableApps();
     Split();
     Size(work);
     const int px = IconPx(work);
-    std::vector<std::wstring> page0 = ExpandLaunchpadPageIds(tiles_, system_, 0, grid_.perPage, kFolderId);
+    auto lookup = [&](std::wstring_view id) { return FolderApps(id); };
+    std::vector<std::wstring> page0 = ExpandLaunchpadPageIds(tiles_, 0, grid_.perPage, lookup);
     std::vector<std::wstring> page1 =
-        PageCount(tiles_.size(), grid_.perPage) > 1 ? ExpandLaunchpadPageIds(tiles_, system_, 1, grid_.perPage, kFolderId) : std::vector<std::wstring>{};
+        PageCount(tiles_.size(), grid_.perPage) > 1 ? ExpandLaunchpadPageIds(tiles_, 1, grid_.perPage, lookup) : std::vector<std::wstring>{};
     std::vector<std::wstring> keyIds = page0;
     keyIds.insert(keyIds.end(), page1.begin(), page1.end());
     if (prewarmed_ == std::make_pair(px, keyIds))
@@ -167,8 +176,10 @@ void Launchpad::Close(bool launched)
     closedMs_ = ClockMs();
     lastClosed_ = GetTickCount64();
     KillTimer(surface_.Hwnd(), kCaretTimer);
+    KillTimer(surface_.Hwnd(), kDragTimer);
     composition_.clear();
-    searchFocused_ = false;
+    searchFocused_ = namingFolder_ = false;
+    lifted_ = -1;
     SetTimer(surface_.Hwnd(), kCloseTimer, UINT(kCloseMs) + 20, nullptr);
     surface_.Invalidate();
 }
@@ -201,11 +212,16 @@ void Launchpad::Refresh(bool listChanged)
         }
         auto apps = LaunchableApps();
         const bool changed = apps.size() != apps_.size() || !std::equal(apps.begin(), apps.end(), apps_.begin(), [](const CatalogApp& a, const CatalogApp& b) {
-                                 return a.id == b.id && a.name == b.name;
+                                 return a.id == b.id && a.name == b.name && a.system == b.system && a.microsoft == b.microsoft;
                              });
         if (changed) {
             apps_ = std::move(apps);
             Split();
+            if (!openFolder_.empty()) {
+                const auto* folder = FolderApps(openFolder_);
+                if (!folder || folder->empty())
+                    openFolder_.clear();
+            }
             if (!query_.empty())
                 Filter();
             page_ = std::min(page_, Pages() - 1);
@@ -220,7 +236,7 @@ void Launchpad::Filter()
     shown_.clear();
     const AppCatalog::PreparedQuery q = AppCatalog::PrepareQuery(query_);
     for (const auto& app : apps_)
-        if (AppCatalog::MatchesPrepared(app, q))
+        if (!Hidden(app.id) && AppCatalog::MatchesPrepared(app, q))
             shown_.push_back(app);
     page_ = 0;
     pageShown_ = pageSpeed_ = 0;
@@ -228,32 +244,80 @@ void Launchpad::Filter()
     UpdatePageTargets(true);
 }
 
-// Windows' own apps go into one folder at the end, except its Settings, which people do open.
+const std::vector<CatalogApp>* Launchpad::FolderApps(std::wstring_view id) const
+{
+    if (id == kFolderId)
+        return &system_;
+    if (id == kMicrosoftFolderId)
+        return &microsoft_;
+    if (auto it = customFolders_.find(std::wstring(id)); it != customFolders_.end())
+        return &it->second;
+    return nullptr;
+}
+
+std::wstring Launchpad::FolderTitle(std::wstring_view id) const
+{
+    if (id == kMicrosoftFolderId)
+        return Tr(L"Microsoft apps");
+    if (id == kFolderId)
+        return Tr(L"System apps");
+    if (auto it = customFolderNames_.find(std::wstring(id)); it != customFolderNames_.end() && !it->second.empty())
+        return it->second;
+    return Tr(L"New folder");
+}
+
+bool Launchpad::Hidden(const std::wstring& id) const { return std::ranges::find(layout_.hidden, id) != layout_.hidden.end(); }
+
+// Built-in utilities go into System apps, built-in Microsoft tools into Microsoft apps, user folders hold grouped apps.
 void Launchpad::Split()
 {
     tiles_.clear();
+    microsoft_.clear();
     system_.clear();
-    for (const CatalogApp& app : apps_) {
-        const bool settings =
-            CompareStringOrdinal(app.aumid.c_str(), -1, L"windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel", -1, TRUE) ==
-            CSTR_EQUAL;
-        (app.system && !settings ? system_ : tiles_).push_back(app);
+    customFolders_.clear();
+    customFolderNames_.clear();
+    std::map<std::wstring, const CatalogApp*> byId;
+    for (const CatalogApp& app : apps_)
+        if (!Hidden(app.id))
+            byId.emplace(app.id, &app);
+    std::set<std::wstring> grouped;
+    for (const LaunchpadFolder& f : layout_.folders) {
+        if (!IsCustomFolder(f.id))
+            continue;
+        std::vector<CatalogApp> members;
+        for (const std::wstring& appId : f.apps)
+            if (auto it = byId.find(appId); it != byId.end() && grouped.insert(appId).second)
+                members.push_back(*it->second);
+        if (members.empty())
+            continue;
+        const std::wstring title = f.name.empty() ? Tr(L"New folder") : f.name;
+        customFolderNames_[f.id] = title;
+        customFolders_[f.id] = std::move(members);
+        tiles_.push_back(CatalogApp{.name = title, .id = f.id});
     }
+    for (const CatalogApp& app : apps_)
+        if (!Hidden(app.id) && !grouped.contains(app.id))
+            (app.system ? system_ : app.microsoft ? microsoft_ : tiles_).push_back(app);
+    if (!microsoft_.empty())
+        tiles_.push_back(CatalogApp{.name = Tr(L"Microsoft apps"), .id = kMicrosoftFolderId});
     if (!system_.empty())
         tiles_.push_back(CatalogApp{.name = Tr(L"System apps"), .id = kFolderId});
     ApplyOrder();
 }
 
-void Launchpad::ShowFolder(bool open)
+void Launchpad::ShowFolder(const std::wstring& id)
 {
-    folderOpen_ = open;
+    if (namingFolder_)
+        FinishFolderNaming(false);
+    const std::wstring closing = openFolder_;
+    openFolder_ = id;
     sel_ = hover_ = pressed_ = -1;
     hoverAnim_.clear();
     revealedMs_ = ClockMs(); // its apps settle in as the pages' did
-    if (open) {
+    if (!id.empty()) {
         page_ = 0;
     } else {
-        auto it = std::ranges::find(tiles_, std::wstring_view(kFolderId), &CatalogApp::id);
+        auto it = std::ranges::find(tiles_, std::wstring_view(closing), &CatalogApp::id);
         const int idx = it != tiles_.end() ? int(it - tiles_.begin()) : int(tiles_.size()) - 1;
         page_ = std::clamp(idx / std::max(1, grid_.perPage), 0, Pages() - 1);
     }
@@ -263,7 +327,12 @@ void Launchpad::ShowFolder(bool open)
     surface_.Invalidate();
 }
 
-int Launchpad::Pages() const { return std::max(1, PageCount(Shown().size(), grid_.perPage)); }
+int Launchpad::Pages() const
+{
+    const bool dragHere = lifted_ >= 0 && Arranging() && (dragInFolder_ ? openFolder_ == dragFolderId_ : openFolder_.empty());
+    const size_t n = dragHere ? DragOrder().size() : Shown().size();
+    return std::max(1, PageCount(n, grid_.perPage));
+}
 
 float Launchpad::OpenAmount(double now) const
 {
@@ -352,8 +421,8 @@ void Launchpad::Paint(Canvas& c)
         c.BeginGroup(r, 1 + 0.08f * (1 - r), w_ / 2, h_ / 2);
         if (Shown().empty() && !query_.empty())
             c.Text(Tr(L"No matching apps"), D2D1::RectF(0, h_ / 2 - 14, w_, h_ / 2 + 14), 17, t.subtext, DWRITE_FONT_WEIGHT_NORMAL, 1);
-        else if (folderOpen_ && query_.empty())
-            c.Text(Tr(L"System apps"), D2D1::RectF(0, kSearchTop + kSearchH + 6, w_, grid_.gridTop), 15, t.text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+        else if (!openFolder_.empty() && query_.empty())
+            PaintFolderHeader(c, t, r);
         const int first = int(std::floor(pageShown_));
         for (int page = first; page <= first + 1; ++page)
             if (page >= 0 && page < Pages() && std::abs(float(page) - pageShown_) < 1)
@@ -396,43 +465,94 @@ void Launchpad::PaintSearch(Canvas& c, const Theme& t, float shown)
     }
     // The caret, blinking at the system's pace (kCaretTimer repaints).
     const UINT blink = GetCaretBlinkTime();
-    if (shown >= 1 && searchFocused_ && (blink == INFINITE || (ULONGLONG(c.now) / std::max(1u, blink)) % 2 == 0))
+    if (shown >= 1 && searchFocused_ && !namingFolder_ && (blink == INFINITE || (ULONGLONG(c.now) / std::max(1u, blink)) % 2 == 0))
         c.Fill(D2D1::RectF(caretX_, r.top + 9, caretX_ + 1.5f, r.bottom - 9), 0.75f, t.text);
     hits_.push_back({r, kSearch});
 }
 
+void Launchpad::PaintFolderHeader(Canvas& c, const Theme& t, float shown)
+{
+    const float top = kSearchTop + kSearchH + 6, midY = (top + grid_.gridTop) * 0.5f;
+    const std::wstring title = FolderTitle(openFolder_);
+    const float boxW = std::clamp(std::max(180.f, c.TextWidth(namingFolder_ ? nameDraft_ + composition_ : title, 15) + 32.f), 180.f, w_ * 0.5f);
+    folderTitleRect_ = D2D1::RectF((w_ - boxW) * 0.5f, midY - 15, (w_ + boxW) * 0.5f, midY + 15);
+    if (IsCustomFolder(openFolder_))
+        hits_.push_back({folderTitleRect_, kFolderTitle});
+    if (!namingFolder_) {
+        c.Text(title, D2D1::RectF(0, top, w_, grid_.gridTop), 15, t.text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+        return;
+    }
+    c.Fill(folderTitleRect_, 8, Alpha(t.hover, 1.5f));
+    c.Stroke(folderTitleRect_, 8, Alpha(t.accent, 0.85f), 1.5f);
+    const std::wstring shownText = nameDraft_.empty() && composition_.empty() ? Tr(L"New folder") : nameDraft_ + composition_;
+    const bool placeholder = nameDraft_.empty() && composition_.empty();
+    c.Text(shownText, folderTitleRect_, 15, placeholder ? t.subtext : t.text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+    const float maxTextW = boxW - 16.f;
+    const float textW = placeholder ? 0.f : std::min(c.TextWidth(shownText, 15), maxTextW);
+    const float endX = placeholder ? w_ * 0.5f - std::min(c.TextWidth(shownText, 15), maxTextW) * 0.5f : w_ * 0.5f + textW * 0.5f + 1.f;
+    if (!composition_.empty()) {
+        const float preW = std::min(c.TextWidth(nameDraft_, 15), maxTextW);
+        const float startX = w_ * 0.5f - textW * 0.5f + preW;
+        if (endX > startX)
+            c.Line(startX, midY + 10, endX, midY + 10, t.text, 1);
+    }
+    const UINT blink = GetCaretBlinkTime();
+    if (shown >= 1 && (blink == INFINITE || (ULONGLONG(c.now) / std::max(1u, blink)) % 2 == 0))
+        c.Fill(D2D1::RectF(endX, midY - 9, endX + 1.5f, midY + 9), 0.75f, t.text);
+}
+
 void Launchpad::PaintPage(Canvas& c, const Theme& t, int page, float dx)
 {
+    const bool dragHere = lifted_ >= 0 && Arranging() && (dragInFolder_ ? openFolder_ == dragFolderId_ : openFolder_.empty());
+    if (dragHere) {
+        const std::vector<int> order = DragOrder();
+        const LaunchpadSlice slice = PageSlice(order.size(), page, grid_.perPage);
+        for (size_t s = slice.begin; s < slice.end; ++s) {
+            const int idx = order[s];
+            if (idx < 0)
+                continue;
+            const D2D1_RECT_F cell = Cell(int(s - slice.begin));
+            const D2D1_RECT_F at = D2D1::RectF(cell.left + dx, cell.top, cell.right + dx, cell.bottom);
+            if (at.right >= 0 && at.left <= w_)
+                PaintTile(c, t, Shown()[size_t(idx)], idx, Glide(Shown()[size_t(idx)].id, cell, page, dx));
+        }
+        return;
+    }
     const LaunchpadSlice slice = PageSlice(Shown().size(), page, grid_.perPage);
     for (size_t i = slice.begin; i < slice.end; ++i) {
         const D2D1_RECT_F cell = Cell(int(i - slice.begin));
         const D2D1_RECT_F at = D2D1::RectF(cell.left + dx, cell.top, cell.right + dx, cell.bottom);
         if (at.right < 0 || at.left > w_)
             continue;
-        if (int(i) == lifted_ && Arranging())
-            continue; // under the pointer (PaintLifted)
-        PaintTile(c, t, int(i), Arranging() ? Glide(Shown()[i].id, cell, page, dx) : at);
+        PaintTile(c, t, Shown()[i], int(i), Arranging() ? Glide(Shown()[i].id, cell, page, dx) : at);
         if (std::abs(dx) < 1)
             hits_.push_back({at, int(i)});
     }
 }
 
-void Launchpad::PaintTile(Canvas& c, const Theme& t, int index, D2D1_RECT_F cell)
+void Launchpad::PaintTile(Canvas& c, const Theme& t, const CatalogApp& app, int index, D2D1_RECT_F cell)
 {
-    const CatalogApp& app = Shown()[size_t(index)];
     const float icon = grid_.iconDip, block = icon + kLabelGap + kLabelH;
     const float cx = (cell.left + cell.right) / 2, top = cell.top + (cell.bottom - cell.top - block) / 2;
     const D2D1_RECT_F ir = D2D1::RectF(cx - icon / 2, top, cx + icon / 2, top + icon);
     // Under the pointer or the keys: a soft plate behind the icon and its name.
-    const float hv = Hover(c, index, hover_ == index || sel_ == index);
+    const float hv = index >= 0 ? Hover(c, index, hover_ == index || sel_ == index) : 0.f;
     if (hv > 0.001f) {
         const float half = std::min((cell.right - cell.left) / 2 - 4, icon * 0.5f + 22);
         const D2D1_RECT_F plate = D2D1::RectF(cx - half, top - 12, cx + half, top + block + 10);
         c.Fill(plate, 18, Alpha(sel_ == index && hover_ != index ? t.accent : t.hover, (sel_ == index && hover_ != index ? 0.28f : 1.f) * hv));
     }
-    c.BeginGroup(1, pressed_ == index ? 0.92f : 1 + 0.03f * hv, cx, top + icon / 2);
-    if (app.id == kFolderId)
-        PaintFolder(c, t, ir);
+    const float into = index >= 0 ? Hover(c, -10000 - index, lifted_ >= 0 && !dragInFolder_ && mergeTarget_ == index) : 0.f;
+    const float scale = index >= 0 && pressed_ == index && lifted_ < 0 ? 0.92f : 1 + 0.03f * hv + 0.10f * into;
+    c.BeginGroup(1, scale, cx, top + icon / 2);
+    if (into > 0.01f) {
+        const float r = icon * 0.24f + 4.f;
+        const D2D1_RECT_F ring = D2D1::RectF(ir.left - 5, ir.top - 5, ir.right + 5, ir.bottom + 5);
+        c.Fill(ring, r, Alpha(t.hover, into));
+        c.Stroke(ring, r, Alpha(t.accent, 0.85f * into), 1.75f);
+    }
+    if (const auto* folderApps = FolderApps(app.id))
+        PaintFolder(c, t, *folderApps, ir);
     else
         PaintIcon(c, t, app.id, ir);
     c.EndGroup();
@@ -455,14 +575,14 @@ void Launchpad::PaintIcon(Canvas& c, const Theme& t, const std::wstring& id, D2D
 }
 
 // A folder as on macOS: a plate of the glass's wash holding its first nine apps, three by three.
-void Launchpad::PaintFolder(Canvas& c, const Theme& t, D2D1_RECT_F r)
+void Launchpad::PaintFolder(Canvas& c, const Theme& t, const std::vector<CatalogApp>& apps, D2D1_RECT_F r)
 {
     const float s = r.right - r.left, pad = s * 0.13f, gap = s * 0.05f, mini = (s - 2 * pad - 2 * gap) / 3;
     c.Fill(r, s * 0.24f, Alpha(t.hover, 1.6f));
-    for (size_t i = 0; i < system_.size() && i < 9; ++i) {
+    for (size_t i = 0; i < apps.size() && i < 9; ++i) {
         const int col = int(i % 3), row = int(i / 3);
         const float x = r.left + pad + float(col) * (mini + gap), y = r.top + pad + float(row) * (mini + gap);
-        PaintIcon(c, t, system_[i].id, D2D1::RectF(x, y, x + mini, y + mini));
+        PaintIcon(c, t, apps[i].id, D2D1::RectF(x, y, x + mini, y + mini));
     }
 }
 

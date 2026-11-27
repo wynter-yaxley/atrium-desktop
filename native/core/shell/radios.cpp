@@ -17,12 +17,32 @@ namespace atrium {
 using namespace winrt;
 using namespace winrt::Windows::Devices;
 
+namespace {
+
+template<typename DeviceT> void CollectBluetoothDevices(bool lowEnergy, std::vector<BluetoothDevice>& raw)
+{
+    for (const auto& d : Enumeration::DeviceInformation::FindAllAsync(DeviceT::GetDeviceSelectorFromPairingState(true)).get()) {
+        BluetoothDevice b;
+        b.name = std::wstring(d.Name());
+        b.lowEnergy = lowEnergy;
+        try {
+            if (auto dev = DeviceT::FromIdAsync(d.Id()).get())
+                b.connected = dev.ConnectionStatus() == Bluetooth::BluetoothConnectionStatus::Connected;
+        } catch (const winrt::hresult_error& error) {
+            Log(L"radios: reading %s Bluetooth device state failed (0x%08X)", lowEnergy ? L"LE" : L"classic", unsigned(error.code()));
+        }
+        raw.push_back(std::move(b));
+    }
+}
+
+} // namespace
+
 RadioState QueryRadios()
 {
     RadioState s;
     try {
         for (const Radios::Radio& r : Radios::Radio::GetRadiosAsync().get()) {
-            bool on = r.State() == Radios::RadioState::On;
+            const bool on = r.State() == Radios::RadioState::On;
             if (r.Kind() == Radios::RadioKind::WiFi) {
                 s.wifiPresent = true;
                 s.wifiOn = s.wifiOn || on;
@@ -31,68 +51,54 @@ RadioState QueryRadios()
                 s.btOn = s.btOn || on;
             }
         }
-    } catch (...) {
-        Log(L"radios: reading the radios failed");
+    } catch (const winrt::hresult_error& error) {
+        Log(L"radios: reading the radios failed (0x%08X)", unsigned(error.code()));
     }
     return s;
 }
 
 bool SetRadio(bool bluetooth, bool on)
 {
+    bool allowed = false;
+    bool ok = false;
     try {
-        if (Radios::Radio::RequestAccessAsync().get() != Radios::RadioAccessStatus::Allowed) {
-            Log(L"radios: access to the radios was refused");
-            return false;
+        allowed = Radios::Radio::RequestAccessAsync().get() == Radios::RadioAccessStatus::Allowed;
+        if (allowed) {
+            for (const Radios::Radio& r : Radios::Radio::GetRadiosAsync().get())
+                if (r.Kind() == (bluetooth ? Radios::RadioKind::Bluetooth : Radios::RadioKind::WiFi))
+                    ok = r.SetStateAsync(on ? Radios::RadioState::On : Radios::RadioState::Off).get() == Radios::RadioAccessStatus::Allowed || ok;
         }
-        bool ok = false;
-        for (const Radios::Radio& r : Radios::Radio::GetRadiosAsync().get())
-            if (r.Kind() == (bluetooth ? Radios::RadioKind::Bluetooth : Radios::RadioKind::WiFi))
-                ok = r.SetStateAsync(on ? Radios::RadioState::On : Radios::RadioState::Off).get() == Radios::RadioAccessStatus::Allowed || ok;
-        Log(L"radios: %s %s %s", bluetooth ? L"Bluetooth" : L"Wi-Fi", on ? L"on" : L"off", ok ? L"done" : L"refused");
-        return ok;
-    } catch (...) {
-        Log(L"radios: switching the radio failed");
+    } catch (const winrt::hresult_error& error) {
+        Log(L"radios: switching the radio failed (0x%08X)", unsigned(error.code()));
         return false;
     }
+    if (!allowed) {
+        Log(L"radios: access to the radios was refused");
+        return false;
+    }
+    Log(L"radios: %s %s %s", bluetooth ? L"Bluetooth" : L"Wi-Fi", on ? L"on" : L"off", ok ? L"done" : L"refused");
+    return ok;
 }
 
 std::vector<BluetoothDevice> ListBluetooth()
 {
+    std::vector<BluetoothDevice> raw;
+    try {
+        // Classic devices (headsets, keyboards, phones), then Bluetooth LE.
+        CollectBluetoothDevices<Bluetooth::BluetoothDevice>(false, raw);
+        CollectBluetoothDevices<Bluetooth::BluetoothLEDevice>(true, raw);
+    } catch (const winrt::hresult_error& error) {
+        Log(L"radios: listing Bluetooth devices failed (0x%08X)", unsigned(error.code()));
+    }
     std::vector<BluetoothDevice> out;
-    auto add = [&](const BluetoothDevice& b) {
+    for (const BluetoothDevice& b : raw) {
         if (b.name.empty())
-            return;
+            continue;
         auto it = std::ranges::find_if(out, [&](const BluetoothDevice& existing) { return existing.name == b.name; });
         if (it != out.end())
             it->connected |= b.connected;
         else
             out.push_back(b);
-    };
-    try {
-        // Classic devices (headsets, keyboards, phones), then Bluetooth LE.
-        for (const auto& d : Enumeration::DeviceInformation::FindAllAsync(Bluetooth::BluetoothDevice::GetDeviceSelectorFromPairingState(true)).get()) {
-            BluetoothDevice b;
-            b.name = std::wstring(d.Name());
-            try {
-                if (auto dev = Bluetooth::BluetoothDevice::FromIdAsync(d.Id()).get())
-                    b.connected = dev.ConnectionStatus() == Bluetooth::BluetoothConnectionStatus::Connected;
-            } catch (const winrt::hresult_error&) {
-            }
-            add(b);
-        }
-        for (const auto& d : Enumeration::DeviceInformation::FindAllAsync(Bluetooth::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true)).get()) {
-            BluetoothDevice b;
-            b.name = std::wstring(d.Name());
-            b.lowEnergy = true;
-            try {
-                if (auto dev = Bluetooth::BluetoothLEDevice::FromIdAsync(d.Id()).get())
-                    b.connected = dev.ConnectionStatus() == Bluetooth::BluetoothConnectionStatus::Connected;
-            } catch (const winrt::hresult_error&) {
-            }
-            add(b);
-        }
-    } catch (...) {
-        Log(L"radios: listing Bluetooth devices failed");
     }
     std::ranges::stable_sort(out, [](const BluetoothDevice& a, const BluetoothDevice& b) { return a.connected > b.connected; });
     return out;

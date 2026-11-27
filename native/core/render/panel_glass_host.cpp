@@ -246,9 +246,10 @@ PanelGlassHost::StepResult PanelGlassHost::SyncPanelCaptures(const std::vector<G
         HMONITOR monitor = MonitorFromRect(&p.window, MONITOR_DEFAULTTONEAREST);
         if (p.desktop || monitor == captureMonitor_ || panelCaptures_.contains(monitor))
             continue;
-        PanelCapture& extra = panelCaptures_[monitor];
         MONITORINFO info{sizeof(info)};
-        GetMonitorInfoW(monitor, &info);
+        if (!monitor || GetMonitorInfoW(monitor, &info) == FALSE)
+            continue;
+        PanelCapture& extra = panelCaptures_[monitor];
         extra.bounds = info.rcMonitor;
         HRESULT why = S_OK;
         bool elsewhere = false;

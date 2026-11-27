@@ -28,6 +28,7 @@ struct SystemStatus {
     std::wstring audioDevice; // its name
     bool online = false;    // internet connectivity
     bool connected = false; // any network
+    bool airplane = false;  // system radio switch is in airplane mode
     std::wstring network;   // name of the connected network
     bool wifi = false;      // the connection is Wi-Fi (else wired or other)
     int signal = 0;         // Wi-Fi signal 0..100, or -1 unknown

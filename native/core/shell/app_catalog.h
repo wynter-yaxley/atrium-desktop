@@ -28,7 +28,8 @@ struct CatalogApp {
     std::wstring target;  // link target exe, may be empty
     std::wstring args;    // the link's arguments (a browser's --app=..., a profile)
     int64_t installed = 0; // when it came (FILETIME ticks): a package's install, a shortcut's creation; 0 unknown
-    bool system = false;   // Windows' own (shipped with it or by Microsoft's packages), not an app the user installed
+    bool system = false;   // Windows' own tools/drivers, placed in the System apps folder
+    bool microsoft = false; // built-in Microsoft user apps, placed in the Microsoft apps folder
 };
 
 // A folder of the Windows start menu's All apps list (a folder of shortcuts under Start Menu\Programs,
@@ -85,6 +86,9 @@ public:
     static bool LaunchAsAdmin(const CatalogApp& app);
     static std::wstring FileLocation(const CatalogApp& app);
     static PinnedApp PinFor(const CatalogApp& app);
+    // Looks up the Start Menu / AppsFolder shell target for an app by AUMID, executable, or pin path.
+    static std::wstring IconTargetFor(const std::wstring& aumid, const std::wstring& exePath, const std::wstring& pinPath);
+    static bool HasPendingInitialRefresh();
     // Case-insensitive match of `query` against the name (and words in it), or the start of
     // its initials (NameInitials: "wx" finds 微信).
     static PreparedQuery PrepareQuery(const std::wstring& query);
@@ -119,12 +123,16 @@ private:
     std::thread thread_;
 };
 
-// Internal helpers shared between app_catalog.cpp and start_pins.cpp.
+// Internal helpers shared between app_catalog.cpp, app_catalog_stamp.cpp, and start_pins.cpp.
 std::wstring ExpandKnownEnvFolders(const std::wstring& value);
 void CollectStartLinks(const std::wstring& dir, std::vector<std::pair<std::wstring, std::wstring>>& links, int depth = 0);
 std::vector<CatalogFolder> ReadStartMenuFolders(const std::vector<CatalogApp>& apps);
 bool IsSystemStartFolder(const std::wstring& foldedName);
 bool IsToolStartFolder(const std::wstring& foldedName);
+bool IsStartupStartFolder(const std::wstring& foldedName);
 bool NotAnAppShortcut(const CatalogApp& app);
+void SortCatalogApps(std::vector<CatalogApp>& apps);
+bool IsCatalogTargetMissing(const std::wstring& path);
+void StampInstalledApps(std::vector<CatalogApp>& apps);
 
 } // namespace atrium

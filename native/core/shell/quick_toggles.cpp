@@ -34,6 +34,16 @@ constexpr wchar_t kNightLightKey[] =
     L"default$windows.data.bluelightreduction.bluelightreductionstate\\windows.data.bluelightreduction.bluelightreductionstate";
 constexpr wchar_t kPersonalizeKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr wchar_t kEnergySaverKey[] = L"Software\\Atrium\\EnergySaver";
+constexpr wchar_t kRadioStateKey[] = L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement\\SystemRadioState";
+constexpr CLSID kRadioManagementClsid = {0x581333F6, 0x28DB, 0x41BE, {0xBC, 0x7A, 0xFF, 0x20, 0x1F, 0x12, 0xF3, 0xF6}};
+constexpr IID kIRadioManagerIid = {0xDB3AFBFB, 0x08E6, 0x46C6, {0xAA, 0x70, 0xBF, 0x9A, 0x34, 0xC3, 0x0A, 0xB7}};
+
+struct IRadioManager : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsRMSupported(DWORD* pdwState) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetUIRadioInstances(IUnknown** ppCollection) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetSystemRadioState(int* pbEnabled, int* param2, DWORD* pReason) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetSystemRadioState(int bEnabled) = 0;
+};
 constexpr size_t kTimestampOffset = 10;
 constexpr uint32_t kDefaultAcThreshold = 0;
 constexpr uint32_t kDefaultDcThreshold = 20;
@@ -422,6 +432,46 @@ bool SetMobileHotspot(bool on)
     if (FAILED(hr))
         return false;
     return AwaitTetheringOp(op.Get());
+}
+
+std::optional<bool> ParseAirplaneRadioState(HRESULT isSupportedHr, uint32_t supported, HRESULT stateHr, int systemRadiosEnabled)
+{
+    if (FAILED(isSupportedHr) || supported == 0 || FAILED(stateHr))
+        return std::nullopt;
+    return systemRadiosEnabled == 0;
+}
+
+bool IsQuietProfileActive(const std::wstring& profile) { return !profile.empty() && profile != L"Microsoft.QuietHoursProfile.Unrestricted"; }
+
+std::optional<bool> ReadAirplaneMode()
+{
+    ComPtr<IRadioManager> mgr;
+    if (FAILED(CoCreateInstance(kRadioManagementClsid, nullptr, CLSCTX_LOCAL_SERVER, kIRadioManagerIid, reinterpret_cast<void**>(mgr.GetAddressOf()))) || !mgr)
+        return std::nullopt;
+    DWORD supported = 0;
+    const HRESULT supHr = mgr->IsRMSupported(&supported);
+    int enabled = 1;
+    int param2 = 0;
+    DWORD reason = 0;
+    const HRESULT stateHr = SUCCEEDED(supHr) && supported != 0 ? mgr->GetSystemRadioState(&enabled, &param2, &reason) : E_FAIL;
+    return ParseAirplaneRadioState(supHr, supported, stateHr, enabled);
+}
+
+bool SetAirplaneMode(bool on)
+{
+    ComPtr<IRadioManager> mgr;
+    if (FAILED(CoCreateInstance(kRadioManagementClsid, nullptr, CLSCTX_LOCAL_SERVER, kIRadioManagerIid, reinterpret_cast<void**>(mgr.GetAddressOf()))) || !mgr)
+        return false;
+    DWORD supported = 0;
+    if (FAILED(mgr->IsRMSupported(&supported)) || supported == 0)
+        return false;
+    return SUCCEEDED(mgr->SetSystemRadioState(on ? 0 : 1));
+}
+
+bool ReadAirplaneModeFast()
+{
+    const auto value = ReadRegDword(HKEY_LOCAL_MACHINE, kRadioStateKey, nullptr);
+    return value.value_or(0) != 0;
 }
 
 } // namespace atrium

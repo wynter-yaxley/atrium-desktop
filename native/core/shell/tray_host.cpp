@@ -102,11 +102,12 @@ const wchar_t* Name(tray::HostAction action)
 
 } // namespace
 
-TrayHost::TrayHost(HWND notify, UINT msg, DWORD readyWaitMs, DWORD startDelayMs, std::function<void()> onYieldChange)
+TrayHost::TrayHost(HWND notify, UINT msg, DWORD readyWaitMs, DWORD startDelayMs, std::function<void()> onYieldChange, std::function<void()> onIconsChange)
     : notify_(notify),
       msg_(msg),
       startDelayMs_(startDelayMs),
       onYieldChange_(std::move(onYieldChange)),
+      onIconsChange_(std::move(onIconsChange)),
       taskbarCreated_(RegisterWindowMessageW(L"TaskbarCreated")),
       quit_(RegisterWindowMessageW(L"Atrium.TrayHost.Quit")),
       hover_(RegisterWindowMessageW(L"Atrium.TrayHost.Hover")),
@@ -125,7 +126,8 @@ TrayHost::~TrayHost()
         // Behind Explorer's taskbar first, so that calls from now on go to Explorer; the
         // ones already on their way are answered before the window goes.
         SetWindowPos(w, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        Sleep(100);
+        if (stop_)
+            WaitForSingleObject(stop_, 100);
         PostMessageW(w, quit_, 0, 0);
     }
     if (stop_)
@@ -237,15 +239,7 @@ LRESULT CALLBACK TrayHost::Proc(HWND h, UINT m, WPARAM w, LPARAM l)
     auto* self = reinterpret_cast<TrayHost*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (!self)
         return DefWindowProcW(h, m, w, l);
-    try {
-        return self->Message(h, m, w, l);
-    } catch (...) {
-        // Whatever went wrong here, the app's call still reaches Explorer.
-        Log(L"tray host: message 0x%04X failed; passed on", m);
-        if (m == WM_COPYDATA || m == WM_COMMAND || m >= WM_USER)
-            return self->Forward(m, w, l);
-        return DefWindowProcW(h, m, w, l);
-    }
+    return self->Message(h, m, w, l);
 }
 
 void TrayHost::OnTimer(HWND h, WPARAM w)
@@ -262,8 +256,13 @@ void TrayHost::OnTimer(HWND h, WPARAM w)
             if (flashing != flashingKeys_)
                 flashingKeys_ = std::move(flashing), dirty_ = true;
         }
-        if (dirty_.exchange(false))
-            PostMessageW(notify_, msg_, 0, 0), LogList();
+        if (dirty_.exchange(false)) {
+            LogList();
+            if (onIconsChange_)
+                onIconsChange_();
+            else if (notify_)
+                PostMessageW(notify_, msg_, 0, 0);
+        }
     } else if (w == kPruneTimer) {
         Prune();
     } else if (w == kPopupTimer) {
@@ -359,13 +358,9 @@ LRESULT TrayHost::OnNotifyIcon(WPARAM w, const COPYDATASTRUCT* cds)
     // The picture is the app's: copied now, while the app waits for this call.
     std::shared_ptr<const IconImage> image;
     if ((data->message == NIM_ADD || data->message == NIM_MODIFY) && (nid.uFlags & NIF_ICON) && nid.hIcon) {
-        try {
-            IconImage img;
-            if (HIconToImage(reinterpret_cast<HICON>(static_cast<ULONG_PTR>(nid.hIcon)), img))
-                image = std::make_shared<const IconImage>(std::move(img));
-        } catch (...) {
-            image = nullptr;
-        }
+        IconImage img;
+        if (HIconToImage(reinterpret_cast<HICON>(static_cast<ULONG_PTR>(nid.hIcon)), img))
+            image = std::make_shared<const IconImage>(std::move(img));
     }
 
     // Explorer first: what it answers is what the app is told.
@@ -396,11 +391,7 @@ LRESULT TrayHost::OnNotifyIcon(WPARAM w, const COPYDATASTRUCT* cds)
         Log(L"tray host: forward refused msg=%s target=0x%p(%s pid=%lu) sent=%d err=%lu res=%ld accepted=%d", Name(data->message), static_cast<void*>(shell),
             targetPath.empty() ? L"-" : PathFindFileNameW(targetPath.c_str()), targetPid, sent ? 1 : 0, err, long(forwardResult), result ? 1 : 0);
     }
-    try {
-        Record(data->message, cds->cbData, &nid, hwnd, hasGuid, key, std::move(image), result);
-    } catch (...) {
-        Log(L"tray host: could not record a %s", Name(data->message));
-    }
+    Record(data->message, cds->cbData, &nid, hwnd, hasGuid, key, std::move(image), result);
     return result;
 }
 
@@ -676,6 +667,17 @@ std::vector<std::wstring> TrayHost::Flashing() const
     return out;
 }
 
+std::vector<FlashingTrayIcon> TrayHost::FlashingIcons() const
+{
+    std::lock_guard g(mutex_);
+    std::vector<FlashingTrayIcon> out;
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& [key, icon] : icons_)
+        if (icon.flash.until > now && (!icon.exe.empty() || icon.pid != 0))
+            out.push_back({key, icon.exe, icon.tip, icon.pid, icon.hwnd});
+    return out;
+}
+
 void TrayHost::Hover(const std::wstring& key, POINT at, RECT cell)
 {
     HWND w = window_.load();
@@ -711,7 +713,7 @@ void TrayHost::Popup(bool open)
     }
 }
 
-bool TrayHost::Send(const std::wstring& key, tray::HostAction action, POINT at, RECT cell)
+HostSendStatus TrayHost::Send(const std::wstring& key, tray::HostAction action, POINT at, RECT cell)
 {
     const bool click = action != tray::HostAction::HoverIn && action != tray::HostAction::PopupOpen && action != tray::HostAction::PopupClose;
     HWND hwnd = nullptr;
@@ -721,29 +723,35 @@ bool TrayHost::Send(const std::wstring& key, tray::HostAction action, POINT at, 
         std::lock_guard g(mutex_);
         auto it = icons_.find(key);
         if (it == icons_.end())
-            return false;
+            return HostSendStatus::NotSent;
         hwnd = it->second.hwnd, uid = it->second.uid, callback = it->second.callback, version = it->second.version, pid = it->second.pid;
         if (click)
             clickedKey_ = key, clicked_ = tray::CellOrBox(cell, at);
     }
     if (!callback || !hwnd || !IsWindow(hwnd))
-        return false;
+        return HostSendStatus::NotSent;
     // Atrium has the foreground (its panel): the app may take it for its window or menu.
     if (click)
         AllowSetForegroundWindow(pid);
-    bool ok = true;
-    for (UINT notification : tray::CallbackSequence(action, version)) {
+    const std::vector<UINT> seq = tray::CallbackSequence(action, version);
+    if (seq.empty())
+        return HostSendStatus::NotSent;
+    size_t sentCount = 0;
+    for (UINT notification : seq) {
         WPARAM wp = 0;
         LPARAM lp = 0;
         tray::EncodeCallback(version, uid, notification, at, wp, lp);
-        if (!SendNotifyMessageW(hwnd, callback, wp, lp)) {
-            ok = false; // an elevated app's window refuses Atrium's messages (UIPI)
-            break;
-        }
+        if (!SendNotifyMessageW(hwnd, callback, wp, lp))
+            break; // an elevated app's window refuses Atrium's messages (UIPI)
+        ++sentCount;
     }
+    const HostSendStatus status = sentCount == 0 ? HostSendStatus::NotSent : sentCount == seq.size() ? HostSendStatus::Sent : HostSendStatus::Partial;
     if (click)
-        Log(L"tray host: %s on %s v%u -> %s", Name(action), key.c_str(), version, ok ? L"sent" : L"refused");
-    return ok;
+        Log(L"tray host: %s on %s v%u -> %s", Name(action), key.c_str(), version,
+            status == HostSendStatus::Sent    ? L"sent" :
+            status == HostSendStatus::Partial ? L"partial" :
+                                                L"refused");
+    return status;
 }
 
 } // namespace atrium

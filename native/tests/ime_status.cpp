@@ -1,16 +1,18 @@
 #include "shell/ime_status.h"
 
 #include <iostream>
-#include <stdexcept>
 
 using namespace atrium;
 
 namespace {
+bool g_failed = false;
 
 void Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        g_failed = true;
+    }
 }
 
 ImeStatus Status(DWORD layout, bool ime, bool open, bool native, bool upper = false)
@@ -104,16 +106,13 @@ void CheckWakeKeys()
 
 int main()
 {
-    try {
-        CheckGlyphs();
-        CheckNews();
-        CheckWatch();
-        CheckCarryForward();
-        CheckWakeKeys();
-        std::cout << "ime status checks passed\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "FAIL: " << error.what() << '\n';
+    CheckGlyphs();
+    CheckNews();
+    CheckWatch();
+    CheckCarryForward();
+    CheckWakeKeys();
+    if (g_failed)
         return 1;
-    }
+    std::cout << "ime status checks passed\n";
+    return 0;
 }

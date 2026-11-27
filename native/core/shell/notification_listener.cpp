@@ -64,18 +64,22 @@ Notice ToNotice(const wun::UserNotification& un)
     try {
         auto info = un.AppInfo();
         n.appId = std::wstring(info.AppUserModelId());
-        n.app = std::wstring(info.DisplayInfo().DisplayName());
+        n.app = StripInvisibleUiChars(info.DisplayInfo().DisplayName());
     } catch (const winrt::hresult_error&) {
         n.app.clear(); // unpackaged senders have no AppInfo
     }
     if (!n.appId.empty())
         n.action = L"app:" + n.appId;
+    const bool isAutoPlay = FoldCase(n.appId).find(L"autoplay") != std::wstring::npos;
     try {
         if (auto binding = FindBinding(un.Notification().Visual())) {
             for (const auto& text : binding.GetTextElements()) {
-                std::wstring s(text.Text());
+                std::wstring s = StripInvisibleUiChars(text.Text());
                 if (std::ranges::all_of(s, [](wchar_t c) { return std::iswspace(static_cast<wint_t>(c)) != 0; }))
                     continue;
+                const bool hasDriveTag = s.size() >= 5 && s[s.size() - 4] == L'(' && iswalpha(s[s.size() - 3]) && s[s.size() - 2] == L':' && s.back() == L')';
+                if (isAutoPlay || hasDriveTag)
+                    s = SanitizeAutoPlayText(s);
                 if (n.title.empty())
                     n.title = std::move(s);
                 else

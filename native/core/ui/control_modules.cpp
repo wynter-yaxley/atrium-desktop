@@ -7,6 +7,7 @@
 #include "localization.h"
 #include "log.h"
 #include "shell/quick_toggles.h"
+#include "shell/system_chrome.h"
 #include "ui/control_layout.h"
 
 #include <shellapi.h>
@@ -30,10 +31,8 @@ struct ModuleSpec {
     const wchar_t* title;
 };
 constexpr ModuleSpec kSpecs[] = {
-    {L"stage", L"\uE7C4", L"Stage Manager"},
-    {L"energysaver", L"\uEC0A", L"Energy saver"},
-    {L"darkmode", L"\uE708", L"Dark mode"},
-    {L"hotspot", L"\uE88A", L"Mobile hotspot"},
+    {L"stage", L"\uE7C4", L"Stage Manager"},    {L"energysaver", L"\uEC0A", L"Energy saver"}, {L"darkmode", L"\uE708", L"Dark mode"},
+    {L"hotspot", L"\uE88A", L"Mobile hotspot"}, {L"dnd", L"\uE7ED", L"Do Not Disturb"},       {L"airplane", L"\uE709", L"Airplane mode"},
 };
 
 const ModuleSpec* Spec(const std::wstring& id)
@@ -53,6 +52,8 @@ std::optional<bool> ReadSwitch(const std::wstring& id)
         return ReadDarkMode();
     if (id == L"hotspot")
         return ReadMobileHotspot();
+    if (id == L"airplane")
+        return ReadAirplaneMode();
     return std::nullopt;
 }
 
@@ -62,7 +63,9 @@ bool SetSwitch(const std::wstring& id, bool on)
         return SetEnergySaver(on);
     if (id == L"darkmode")
         return SetDarkMode(on);
-    return id == L"hotspot" && SetMobileHotspot(on);
+    if (id == L"hotspot")
+        return SetMobileHotspot(on);
+    return id == L"airplane" && SetAirplaneMode(on);
 }
 
 std::wstring ModuleStateText(bool stage, bool wide, bool stageOn, bool stageRight, bool known, const std::optional<bool>& on)
@@ -96,6 +99,16 @@ std::wstring WifiTileSubtitle(const SystemStatus& status, bool radiosRead, bool 
     if (hasWired && hasWifi)
         return TrFormat(L"Ethernet · %s", wifiLabel.c_str());
     return hasWifi ? wifiLabel : Tr(hasWired ? L"Ethernet" : L"Not connected");
+}
+
+void ControlCenter::SetDoNotDisturb(bool on)
+{
+    if (dndOn_ == on)
+        return;
+    dndOn_ = on;
+    moduleOn_[L"dnd"] = on;
+    if (surface_.Visible())
+        surface_.Invalidate();
 }
 
 void ControlCenter::SetModules(std::vector<std::wstring> ids)
@@ -136,11 +149,14 @@ void ControlCenter::PaintModules(Canvas& c, const Theme& t)
         const std::wstring& id = modules_[i];
         const ModuleSpec& spec = *Spec(id);
         const D2D1_RECT_F r = rects[i];
-        const bool stage = id == L"stage", wide = r.right - r.left > kW / 2;
+        const bool stage = id == L"stage", dnd = id == L"dnd", wide = r.right - r.left > kW / 2;
         const auto read = moduleOn_.find(id);
-        const bool known = stage || read != moduleOn_.end();
-        const std::optional<bool> on = stage ? std::optional<bool>(stageOn_) : known ? read->second : std::nullopt;
-        const bool live = stage || on.has_value(); // unknown yet or unavailable: nothing to press
+        const bool known = stage || dnd || read != moduleOn_.end();
+        const std::optional<bool> on = stage                   ? std::optional<bool>(stageOn_) :
+                                       read != moduleOn_.end() ? read->second :
+                                       dnd                     ? std::optional<bool>(dndOn_) :
+                                                                 std::nullopt;
+        const bool live = stage || dnd || on.has_value(); // unknown yet or unavailable: nothing to press
         const std::wstring hit = stage ? std::wstring(L"stage") : L"mod:" + id;
         const float h = live ? Hover(c, hit, hover_ == hit) : 0;
         if (h > 0.001f || pressed_ == hit)
@@ -166,16 +182,46 @@ void ControlCenter::ReadModules()
     std::erase(ids, L"stage");
     if (ids.empty())
         return;
-    slowWorker_.Post(L"modules", [this, ids = std::move(ids)] {
+    const bool dndLocal = dndOn_;
+    const bool ours = quietIsOurs && quietIsOurs();
+    slowWorker_.Post(L"modules", [this, ids = std::move(ids), dndLocal, ours] {
         std::map<std::wstring, std::optional<bool>> read;
-        for (const std::wstring& id : ids)
-            read[id] = ReadSwitch(id);
+        for (const std::wstring& id : ids) {
+            if (id == L"dnd")
+                read[id] = dndLocal ? true : (ours ? false : IsQuietProfileActive(QuietProfile()));
+            else
+                read[id] = ReadSwitch(id);
+        }
         PostResult(WM_CC_MODULES, [&] { moduleSlot_ = std::move(read); });
     });
 }
 
 void ControlCenter::FlipModule(const std::wstring& id)
 {
+    if (id == L"dnd") {
+        if (moduleBusy_.contains(id))
+            return;
+        const auto it = moduleOn_.find(id);
+        const bool cur = it != moduleOn_.end() && it->second.has_value() ? *it->second : dndOn_;
+        const bool want = !cur;
+        dndOn_ = want;
+        moduleOn_[id] = want;
+        moduleBusy_.insert(id);
+        surface_.Invalidate();
+        if (onDnd)
+            onDnd(want);
+        const bool ours = quietIsOurs && quietIsOurs();
+        slowWorker_.Post({}, [this, want, ours] {
+            if (!ours && !SetQuietProfile(want ? kQuietProfile : kQuietProfileOff))
+                Log(L"control: dnd could not be switched %s in Windows", want ? L"on" : L"off");
+            PostResult(WM_CC_MODULES, [&] {
+                if (!moduleSlot_)
+                    moduleSlot_.emplace();
+                (*moduleSlot_)[L"dnd"] = want;
+            });
+        });
+        return;
+    }
     const auto it = moduleOn_.find(id);
     if (it == moduleOn_.end() || !it->second || moduleBusy_.contains(id))
         return;
@@ -184,8 +230,11 @@ void ControlCenter::FlipModule(const std::wstring& id)
     moduleBusy_.insert(id);
     surface_.Invalidate();
     slowWorker_.Post({}, [this, id, want] {
-        if (!SetSwitch(id, want))
+        const bool switched = SetSwitch(id, want);
+        if (!switched)
             Log(L"control: %s could not be switched %s", id.c_str(), want ? L"on" : L"off");
+        if (id == L"airplane" && !switched)
+            ShellExecuteW(nullptr, L"open", L"ms-settings:network-airplanemode", nullptr, nullptr, SW_SHOWNORMAL);
         std::optional<bool> now = ReadSwitch(id);
         // Plugged in, Windows keeps energy saver to its own switch (the threshold only counts on battery):
         // the threshold goes back and its settings page opens instead.
@@ -206,9 +255,20 @@ void ControlCenter::TakeModules()
     auto read = TakeResult(moduleSlot_);
     if (!read)
         return;
+    bool airplaneChanged = false;
     for (auto& [id, on] : *read) {
+        if (id == L"dnd" && on.has_value())
+            dndOn_ = *on;
+        if (id == L"airplane" && moduleBusy_.contains(id))
+            airplaneChanged = true;
         moduleOn_[id] = on;
         moduleBusy_.erase(id);
+    }
+    if (airplaneChanged) {
+        if (onChanged)
+            onChanged();
+        if (surface_.Visible())
+            SetTimer(surface_.Hwnd(), kRadioRefreshTimer, 900, nullptr);
     }
     if (surface_.Visible())
         surface_.Invalidate();

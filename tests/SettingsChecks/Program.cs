@@ -64,6 +64,12 @@ var visibleOff = BarSettings.FromJson(JsonNode.Parse("""{"barReserve":false,"bar
 Require(new BarSettings().BarReserve && new BarSettings().BarFullscreenHide && !visibleOff.BarReserve && !visibleOff.BarFullscreenHide &&
         BarSettings.FromJson(visibleOff.ToJson(), new()) is { BarReserve: false, BarFullscreenHide: false } && !new BarSettings().SameAs(visibleOff),
     "The always-shown bar keeps room and hides for full-screen apps by default; both off survive a round trip and mark the settings dirty.");
+var dodgeOn = BarSettings.FromJson(JsonNode.Parse("""{"barDodge":true}""")!.AsObject(), new());
+Require(!new BarSettings().BarDodge && dodgeOn.BarDodge &&
+        BarSettings.FromJson(dodgeOn.ToJson(), new()).BarDodge && !new BarSettings().SameAs(dodgeOn) &&
+        BarSettings.FromJson(JsonNode.Parse("""{"autoHide":"dodge"}""")!.AsObject(), new()) is { AutoHide: "fullscreen", BarDodge: true } &&
+        BarSettings.FromJson(JsonNode.Parse("""{"autoHide":"__invalid__"}""")!.AsObject(), new()) is { AutoHide: "fullscreen", BarDodge: false },
+    "BarDodge defaults off, survives a round trip, marks settings dirty, and migrates legacy autoHide dodge.");
 var peekOff = BarSettings.FromJson(JsonNode.Parse("""{"windowPeek":false}""")!.AsObject(), new());
 Require(new BarSettings().WindowPeek && !peekOff.WindowPeek && !BarSettings.FromJson(peekOff.ToJson(), new()).WindowPeek && !new BarSettings().SameAs(peekOff),
     "Peeking at windows is on by default, and off survives a round trip and marks the settings dirty.");
@@ -158,8 +164,10 @@ Require(BarSettings.FromJson(JsonNode.Parse("""{"notifyPlacement":"bad"}""")!.As
 Require(BarSettings.FromJson(JsonNode.Parse("""{"notifyPlacement":false}""")!.AsObject(), settings).NotifyPlacement == "topRight",
     "Malformed notification placement must retain the current value.");
 parsed = BarSettings.FromJson(JsonNode.Parse("""{"dockDisplayMode":"bad","taskbarApps":"bad","dockDisplayDelay":99999}""")!.AsObject(), new());
-Require(parsed.DockDisplayMode == "primary" && parsed.TaskbarApps == "all" && parsed.DockDisplayDelay == 2000,
+Require(parsed.DockDisplayMode == "follow" && parsed.TaskbarApps == "all" && parsed.DockDisplayDelay == 2000,
     "Invalid values must normalize like the native core.");
+Require(new BarSettings().DockDisplayMode == "follow" && BarSettings.FromJson([], new()).DockDisplayMode == "follow",
+    "DockDisplayMode must default to follow.");
 parsed = BarSettings.FromJson(JsonNode.Parse("""{"dockDisplayDelay":-1}""")!.AsObject(), new());
 Require(parsed.DockDisplayDelay == 100, "Delay must have a lower bound.");
 parsed = BarSettings.FromJson(JsonNode.Parse("""{"dockDisplayDelay":"bad","desktopDisplay":false}""")!.AsObject(), settings);
@@ -186,6 +194,21 @@ foreach (var edit in new Action<BarSettings>[]
     edit(changed);
     Require(!settings.SameAs(changed), "Every display preference must participate in the Save/Revert dirty state.");
 }
+var autoUpdateOff = BarSettings.FromJson(JsonNode.Parse("""{"autoUpdate":false}""")!.AsObject(), new());
+Require(new BarSettings().AutoUpdate && BarSettings.FromJson([], new()).AutoUpdate &&
+        !autoUpdateOff.AutoUpdate && !BarSettings.FromJson(autoUpdateOff.ToJson(), new()).AutoUpdate &&
+        !BarSettings.FromJson([], autoUpdateOff).AutoUpdate &&
+        !BarSettings.FromJson(JsonNode.Parse("""{"autoUpdate":"bad"}""")!.AsObject(), autoUpdateOff).AutoUpdate &&
+        !new BarSettings().SameAs(autoUpdateOff),
+    "AutoUpdate must default true and survive round trips, partial updates, malformed values, and dirty tracking.");
+var startupTask = BarSettings.FromJson(JsonNode.Parse("""{"startupMode":"task"}""")!.AsObject(), new());
+Require(new BarSettings().StartupMode == "run" && BarSettings.FromJson([], new()).StartupMode == "run" &&
+        startupTask.StartupMode == "task" && BarSettings.FromJson(startupTask.ToJson(), new()).StartupMode == "task" &&
+        BarSettings.FromJson([], startupTask).StartupMode == "task" &&
+        BarSettings.FromJson(JsonNode.Parse("""{"startupMode":123}""")!.AsObject(), startupTask).StartupMode == "task" &&
+        BarSettings.FromJson(JsonNode.Parse("""{"startupMode":"bad"}""")!.AsObject(), startupTask).StartupMode == "run" &&
+        !new BarSettings().SameAs(startupTask),
+    "StartupMode must default to run, survive round trips and malformed values, clamp unknown strings to run, and mark settings dirty.");
 var menuOff = BarSettings.FromJson(JsonNode.Parse("""{"windowsContextMenu":false}""")!.AsObject(), new());
 Require(!menuOff.WindowsContextMenu && BarSettings.FromJson(menuOff.ToJson(), new()).SameAs(menuOff),
     "The Windows-style context menu must turn off and survive a round trip.");
@@ -222,9 +245,11 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
 {
     var modulesDefault = new BarSettings();
     Require(modulesDefault.ControlModules.SequenceEqual(["stage"]), "Control centre modules must default to Stage Manager.");
-    var modules = BarSettings.FromJson(JsonNode.Parse("""{"controlModules":[" darkmode ","wifi","stage","darkmode","","hotspot"]}""")!.AsObject(), new());
-    Require(modules.ControlModules.SequenceEqual(["darkmode", "stage", "hotspot"]) && BarSettings.FromJson(modules.ToJson(), new()).SameAs(modules) &&
-            !modules.SameAs(modulesDefault),
+    var modules = BarSettings.FromJson(
+        JsonNode.Parse("""{"controlModules":[" darkmode ","wifi","stage","dnd","darkmode","","airplane","hotspot"]}""")!.AsObject(),
+        new());
+    Require(modules.ControlModules.SequenceEqual(["darkmode", "stage", "dnd", "airplane", "hotspot"]) &&
+            BarSettings.FromJson(modules.ToJson(), new()).SameAs(modules) && !modules.SameAs(modulesDefault),
         "Control centre modules must keep known ids once, in order, and survive a round trip.");
     var nightLight = BarSettings.FromJson(JsonNode.Parse("""{"controlModules":["nightlight","stage","darkmode"]}""")!.AsObject(), new());
     Require(nightLight.ControlModules.SequenceEqual(["darkmode", "stage"]),
@@ -499,8 +524,7 @@ for (int i = 0; i < cases.Count; i++)
     if (label == "v2:no-migration") Require(!cs["notifyListener"]!.GetValue<bool>(), "v2 must apply notifyListener=false.");
 }
 
-string xamlCs = File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "MainWindow.xaml.cs")) +
-                File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "MainWindow.Sliders.cs"));
+string xamlCs = File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "MainWindow.xaml.cs"));
 var sliderMatches = SliderRegex().Matches(xamlCs);
 var schemaSliders = schemaKeys.Where(kv => kv.Value!["sliderProp"] != null)
     .ToDictionary(kv => kv.Value!["sliderProp"]!.GetValue<string>(), kv => (kv.Key, Spec: kv.Value!.AsObject()));
@@ -676,7 +700,8 @@ finally
     string cppFacesH = File.ReadAllText(Path.Combine(repoRoot!, "native", "core", "ui", "widget_faces.h"));
     string cppFaces = File.ReadAllText(Path.Combine(repoRoot!, "native", "core", "ui", "widget_faces.cpp"));
     string csFaces = File.ReadAllText(Path.Combine(repoRoot!, "settings", "Atrium.Settings", "WidgetFaces.cs"));
-    string cppWidgets = File.ReadAllText(Path.Combine(repoRoot!, "native", "core", "ui", "desktop_widgets.cpp"));
+    string cppWidgets = File.ReadAllText(Path.Combine(repoRoot!, "native", "core", "ui", "desktop_widgets.cpp")) + "\n" +
+                        File.ReadAllText(Path.Combine(repoRoot!, "native", "core", "ui", "widget_storage.cpp"));
     var zhHans = JsonNode.Parse(File.ReadAllText(Path.Combine(repoRoot!, "locales", "zh-Hans.json")))!["strings"]!.AsObject();
     static string Slice(string src, string marker)
     {
@@ -740,6 +765,18 @@ finally
         var concurrentLoaded = SettingsPersistence.ReadSettings(settingsPath);
         Require(concurrentLoaded.Height is >= 40 and <= 47 && !Directory.EnumerateFiles(persistTemp, "*.tmp").Any(),
             "Concurrent WriteSettings must serialize cleanly without .tmp leftovers.");
+
+        string startupPath = Path.Combine(persistTemp, "startup-settings.json");
+        Require(!SettingsPersistence.WriteSettings(startupPath, new BarSettings { StartOnLogin = true, StartupMode = "run" }),
+            "Writing default startup settings must report startupChanged=false.");
+        Require(SettingsPersistence.WriteSettings(startupPath, new BarSettings { StartOnLogin = true, StartupMode = "task" }),
+            "Switching StartupMode while StartOnLogin is true must report startupChanged=true.");
+        Require(!SettingsPersistence.WriteSettings(startupPath, new BarSettings { StartOnLogin = true, StartupMode = "task" }),
+            "Unchanged StartupMode=task must report startupChanged=false.");
+        Require(SettingsPersistence.WriteSettings(startupPath, new BarSettings { StartOnLogin = false, StartupMode = "task" }),
+            "Disabling StartOnLogin must report startupChanged=true.");
+        Require(!SettingsPersistence.WriteSettings(startupPath, new BarSettings { StartOnLogin = false, StartupMode = "run" }),
+            "Changing StartupMode while StartOnLogin is false must report startupChanged=false.");
 
         byte[] corruptBytes = Encoding.UTF8.GetBytes("{broken-cs");
         File.WriteAllBytes(settingsPath, corruptBytes);
@@ -1358,11 +1395,11 @@ finally
                 new BarSettings { ControlModules = ["stage", "darkmode"] },
                 new BarSettings { ControlModules = ["stage", "darkmode"] },
                 "i1", 1);
-            cmAll.Draft.ControlModules = ["darkmode", "stage", "energysaver"];
-            cmAll.ApplyConflict(new BarSettings { ControlModules = ["stage", "darkmode", "hotspot"] }, 2, "i1");
-            Require(cmAll.Draft.ControlModules.Count <= 4 &&
-                    cmAll.Draft.ControlModules.SequenceEqual(["darkmode", "stage", "energysaver", "hotspot"]),
-                "ControlModules 3-way merge must preserve reorder and cap at 4 known modules.");
+            cmAll.Draft.ControlModules = ["darkmode", "stage", "energysaver", "dnd"];
+            cmAll.ApplyConflict(new BarSettings { ControlModules = ["stage", "darkmode", "hotspot", "airplane"] }, 2, "i1");
+            Require(cmAll.Draft.ControlModules.Count <= 6 &&
+                    cmAll.Draft.ControlModules.SequenceEqual(["darkmode", "stage", "energysaver", "dnd", "hotspot", "airplane"]),
+                "ControlModules 3-way merge must preserve reorder and cap at 6 known modules.");
         }
 
         // 7c. SettingsSession.Initialized & early-edit before ConnectAsync/GetAsync completes
@@ -1455,6 +1492,10 @@ finally
         Require(!devRoot.UseShellExecute &&
                 devRoot.ArgumentList.SequenceEqual(["--development", "--data-dir", @"D:\"]),
             "Dev mode CoreStartInfo must preserve root drive trailing backslash in ArgumentList.");
+
+        var adminStart = CoreClient.CoreStartInfo(exe, ["Atrium.Settings.exe"], development: false, runAsAdmin: true, replace: true);
+        Require(adminStart.UseShellExecute && adminStart.Verb == "runas" && adminStart.Arguments.Contains("--replace"),
+            "Elevated CoreStartInfo must set UseShellExecute, Verb=runas, and --replace in Arguments.");
     }
 }
 Console.WriteLine("Hardening regression checks passed.");

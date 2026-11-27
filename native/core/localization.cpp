@@ -119,15 +119,14 @@ bool LoadLocale(const std::filesystem::path& path, Locale& locale)
     const std::string bytes = ReadFile(path);
     if (bytes.empty())
         return false;
-    try {
-        const json::JsonObject root = json::JsonObject::Parse(Utf8ToWide(bytes));
-        LoadStrings(root, locale);
-        return !locale.strings.empty() || !locale.plurals.empty();
-    } catch (...) {
-        locale.strings.clear();
-        locale.plurals.clear();
+    const std::wstring wide = Utf8ToWide(bytes);
+    if (wide.empty())
         return false;
-    }
+    json::JsonObject root{nullptr};
+    if (!json::JsonObject::TryParse(wide, root) || !root)
+        return false;
+    LoadStrings(root, locale);
+    return !locale.strings.empty() || !locale.plurals.empty();
 }
 
 void LoadLegacy(Locale& locale)

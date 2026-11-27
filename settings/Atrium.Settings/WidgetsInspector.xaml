@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="Atrium.Settings.WidgetsInspector"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Atrium.Settings">
+
+    <StackPanel Style="{StaticResource InspectorPageStyle}">
+        <StackPanel>
+            <TextBlock Text="Desktop" Style="{StaticResource SectionStyle}" />
+            <local:ToggleTile x:Name="WidgetsSwitch" Title="Desktop Widgets" SwitchName="Desktop Widgets" Toggled="OnWidgetsToggled"
+                              Flat="True" Note="Drag to move, drag the lower corner to resize, right-click to remove." />
+            <StackPanel Style="{StaticResource FlatRowStyle}">
+                <TextBlock Text="Align to the edge" Style="{StaticResource RowTitleStyle}" />
+                <local:SegmentTrack>
+                    <RadioButton x:Name="WidgetsLeft" GroupName="widgetside" Content="Left side" Tag="left"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetAlignmentChecked" />
+                    <RadioButton x:Name="WidgetsRight" GroupName="widgetside" Content="Right side" Tag="right"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetAlignmentChecked" />
+                </local:SegmentTrack>
+            </StackPanel>
+            <StackPanel Style="{StaticResource FlatRowStyle}">
+                <TextBlock Text="Material" Style="{StaticResource RowTitleStyle}" />
+                <local:SegmentTrack>
+                    <RadioButton x:Name="MaterialGlass" GroupName="widgetmaterial" Content="Follow taskbar" Tag="glass"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetMaterialChecked" />
+                    <RadioButton x:Name="MaterialDusk" GroupName="widgetmaterial" Content="Dusk" Tag="dusk"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetMaterialChecked" />
+                    <RadioButton x:Name="MaterialColor" GroupName="widgetmaterial" Content="Color" Tag="color"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetMaterialChecked" />
+                </local:SegmentTrack>
+            </StackPanel>
+            <StackPanel Style="{StaticResource FlatRowStyle}">
+                <TextBlock Text="Glass reflects" Style="{StaticResource RowTitleStyle}" />
+                <local:SegmentTrack>
+                    <RadioButton x:Name="BackdropDesktop" GroupName="backdrop" Content="Live" Tag="desktop"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetBackdropChecked" />
+                    <RadioButton x:Name="BackdropWallpaper" GroupName="backdrop" Content="Wallpaper" Tag="wallpaper"
+                                 Style="{StaticResource SegmentStyle}" Checked="OnWidgetBackdropChecked" />
+                </local:SegmentTrack>
+            </StackPanel>
+        </StackPanel>
+    </StackPanel>
+</UserControl>

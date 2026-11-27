@@ -21,6 +21,8 @@ struct Notice {
     ULONGLONG time = 0;      // GetTickCount64 of the latest update
     int count = 1;           // merged notices
     bool unread = true;
+    DWORD pid = 0;                 // sender process id when known (multi-instance isolation)
+    std::wstring trayHostKey;      // hosted tray icon key when originated from a tray flash
 };
 
 } // namespace atrium

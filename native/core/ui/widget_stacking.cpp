@@ -121,11 +121,14 @@ void ApplyWidgetZOrder(const std::vector<HWND>& widgetHwnds, const WidgetStackPl
             after = hw;
             continue;
         }
-        swpErr = GetLastError();
-        if (plan.lowestApp && after != plan.lowestApp && SetWindowPos(hw, plan.lowestApp, 0, 0, 0, 0, flags))
+        const DWORD err = GetLastError();
+        if (plan.lowestApp && after != plan.lowestApp && SetWindowPos(hw, plan.lowestApp, 0, 0, 0, 0, flags)) {
             after = hw;
-        else if (after != HWND_BOTTOM)
-            SetWindowPos(hw, HWND_BOTTOM, 0, 0, 0, 0, flags);
+            continue;
+        }
+        if (after != HWND_BOTTOM && SetWindowPos(hw, HWND_BOTTOM, 0, 0, 0, 0, flags) && err == ERROR_ACCESS_DENIED)
+            continue;
+        swpErr = err;
     }
 }
 

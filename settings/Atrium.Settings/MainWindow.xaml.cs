@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
@@ -8,31 +7,57 @@ using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
-using Windows.Storage;
-using Windows.Storage.Pickers;
 using Windows.UI;
 
 namespace Atrium.Settings;
 
 public sealed partial class MainWindow : Window, IDisposable
 {
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MonitorRect { public int Left, Top, Right, Bottom; }
+    // One slider tile: its group, UI range, and the mapping between the stored
+    // value and the slider value (percentages are stored as 0..1).
+    private sealed record SliderDef(string Group, string Title, double Min, double Max, double Step, string Unit,
+        Func<BarSettings, double> Get, Action<BarSettings, double> Set, bool Material);
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MonitorInfo { public int Size; public MonitorRect Bounds, Work; public uint Flags; }
+    private static SliderDef[] Sliders =>
+    [
+        new("clarity", Loc.T("Transparency"), 0, 100, 1, "%",
+            s => s.Transparency * 100, (s, v) => s.Transparency = v / 100, true),
+        new("clarity", Loc.T("Blur"), 0, 100, 1, "%",
+            s => s.Blur * 100, (s, v) => s.Blur = v / 100, true),
+        new("edge", Loc.T("Refraction"), 0, 60, 1, "px",
+            s => s.Refraction, (s, v) => s.Refraction = v, true),
+        new("edge", Loc.T("Refraction edge"), 1, 80, 1, "px",
+            s => s.Edge, (s, v) => s.Edge = v, true),
+        new("edge", Loc.T("Dispersion"), 0, 50, 1, "%",
+            s => s.Dispersion * 100, (s, v) => s.Dispersion = v / 100, true),
+        new("edge", Loc.T("Rim softness"), 80, 300, 5, "%",
+            s => s.EdgeSoftness * 100, (s, v) => s.EdgeSoftness = v / 100, true),
+        new("edge", Loc.T("Rim over light"), 0, 150, 5, "%",
+            s => s.EdgeLightBoost * 100, (s, v) => s.EdgeLightBoost = v / 100, true),
+        new("light", Loc.T("Highlight"), 0, 100, 1, "%",
+            s => s.Highlight * 100, (s, v) => s.Highlight = v / 100, true),
+        new("light", Loc.T("Shadow"), 0, 100, 1, "%",
+            s => s.Shadow * 100, (s, v) => s.Shadow = v / 100, true),
 
-    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] private static extern IntPtr MonitorFromRect(IntPtr rect, uint flags);
-    [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW")] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool SetProp(IntPtr hwnd, string name, IntPtr data);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr RemoveProp(IntPtr hwnd, string name);
-    private delegate IntPtr SubclassProc(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, UIntPtr id, UIntPtr data);
-    [DllImport("comctl32.dll")] private static extern bool SetWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id, UIntPtr data);
-    [DllImport("comctl32.dll")] private static extern bool RemoveWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id);
-    [DllImport("comctl32.dll")] private static extern IntPtr DefSubclassProc(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam);
-    private readonly SubclassProc? _updateMessage;
-    // The Material page's sliders and their SliderDef record: MainWindow.Sliders.cs.
+        new("size", Loc.T("Height"), 32, 120, 1, "px",
+            s => s.Height, (s, v) => s.Height = v, false),
+        new("size", Loc.T("Corner radius"), 0, 80, 1, "px",
+            s => s.CornerRadius, (s, v) => s.CornerRadius = v, false),
+        new("dock", Loc.T("Icon size"), 16, 64, 1, "px",
+            s => s.IconSize, (s, v) => s.IconSize = v, false),
+        new("width", Loc.T("Maximum width"), 300, 2400, 10, "px",
+            s => s.Width, (s, v) => s.Width = v, false),
+        new("dock", Loc.T("Edge spacing"), 0, 200, 1, "px",
+            s => s.Margin, (s, v) => s.Margin = v, false),
+        new("dock", Loc.T("Hover magnification"), 100, 200, 5, "%",
+            s => s.Magnify * 100, (s, v) => s.Magnify = v / 100, false),
+
+        // The band above the bar that answers the pointer ahead of time (riseNear, magnifyNear).
+        new("near", Loc.T("Enter distance"), 2, 160, 2, "px",
+            s => s.NearEnter, (s, v) => s.NearEnter = v, false),
+        new("near", Loc.T("Leave distance"), 2, 200, 2, "px",
+            s => s.NearLeave, (s, v) => s.NearLeave = v, false),
+    ];
 
     private static string[] PageTitles =>
     [
@@ -41,6 +66,7 @@ public sealed partial class MainWindow : Window, IDisposable
         Loc.T("Start menu"), Loc.T("Tray"), Loc.T("Status bar"), Loc.T("Time"), Loc.T("Input method"), Loc.T("Now Playing"), Loc.T("File Stacks"),
         Loc.T("Launchpad"),
     ];
+
     private readonly CoreClient _client = new();
     private readonly SettingsSession _session = new();
     private readonly List<(SliderDef Def, SliderTile Tile)> _rows = [];
@@ -71,9 +97,9 @@ public sealed partial class MainWindow : Window, IDisposable
         RootGrid.Loaded += (_, _) => DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
         {
             var logo = new BitmapImage(new Uri("ms-appx:///Assets/atrium-256.png"));
-            TitleLogo.Source = AboutLogo.Source = logo;
+            TitleLogo.Source = MainAbout.LogoImage.Source = logo;
         });
-        PopulateLanguagePicker();
+        BindPages();
         Title = App.WindowTitle;
         Loc.Localize(RootGrid);
         // The inspector lives in its own ScrollViewer; localize it directly as
@@ -155,6 +181,7 @@ public sealed partial class MainWindow : Window, IDisposable
             SideStart, SideTray, SideStatus, SideClock, SideIme, ExtrasSide(NowPlayingPage), ExtrasSide(StacksPage), ExtrasSide(LaunchpadPage),
         ];
         InitDisplays();
+        InitUpdates();
         LoupeSwitch.IsOn = true;
         BuildRows();
         BuildBackupSection();
@@ -170,48 +197,45 @@ public sealed partial class MainWindow : Window, IDisposable
             if (_page == 5) ShowStagePreview(false);
             if (_page >= 10) ShowModulePreview(_page);
         };
-        PathText.Text = CoreClient.SettingsPath;
-        StartupSwitch.IsEnabled = !CoreClient.Development;
-        if (CoreClient.Development) ToolTipService.SetToolTip(StartupSwitch, Loc.T("Development builds do not change Windows startup."));
+        MainAbout.PathLabel.Text = CoreClient.SettingsPath;
         var v = typeof(MainWindow).Assembly.GetName().Version;
-        VersionText.Text = Loc.F("Version {0}", v?.ToString(3) ?? "1.0.0");
+        MainAbout.VersionLabel.Text = Loc.F("Version {0}", v?.ToString(3) ?? "1.0.0");
         ShowStatus(false);
         // `--page widgets` (the widgets' menu): open on that page.
         int page = startPage >= 0 ? startPage : App.PageFromArgs(Environment.GetCommandLineArgs()) ?? 0;
         SelectPage(page);
         _ = ConnectAndLoadAsync();
-        if (!Environment.GetCommandLineArgs().Contains("--development")) _ = CheckForUpdatesAsync();
     }
 
-    private void UpdateWindowMinimumSize(uint dpi = 0, IntPtr suggestedRect = 0)
+    private void BindPages()
     {
-        if (AppWindow.Presenter is not OverlappedPresenter presenter) return;
-        if (dpi == 0) dpi = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
-        double scale = (dpi > 0 ? dpi : 96) / 96.0;
-        int minWidth = (int)(980 * scale), minHeight = (int)(680 * scale);
-        int workW = 0, workH = 0;
-        if (suggestedRect != IntPtr.Zero)
+        MainSystem.Bind(() => CurrentSettings, () => _loading, Changed);
+        SideStage.Bind(() => CurrentSettings, () => _loading, (refreshPreview, syncWidgets) =>
         {
-            nint monitor = MonitorFromRect(suggestedRect, 2 /* MONITOR_DEFAULTTONEAREST */);
-            var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
-            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
+            if (syncWidgets)
             {
-                workW = info.Work.Right - info.Work.Left;
-                workH = info.Work.Bottom - info.Work.Top;
+                CurrentSettings.WidgetsOnRight = !CurrentSettings.StageOnRight;
+                SideWidgets.SetSide(CurrentSettings.WidgetsOnRight);
             }
-        }
-        else if (DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary) is { } area)
-        {
-            workW = area.WorkArea.Width;
-            workH = area.WorkArea.Height;
-        }
-        if (workW > 0 && workH > 0)
-        {
-            minWidth = Math.Min(minWidth, workW);
-            minHeight = Math.Min(minHeight, workH);
-        }
-        presenter.PreferredMinimumWidth = minWidth;
-        presenter.PreferredMinimumHeight = minHeight;
+            Changed();
+            if (refreshPreview && _page == 5) ShowStagePreview(true);
+        });
+        SideWidgets.Bind(
+            () => CurrentSettings,
+            () => _loading,
+            () => { UpdateGallery(); if (!_loading) Changed(); },
+            () =>
+            {
+                if (CurrentSettings.StageManager)
+                {
+                    CurrentSettings.StageOnRight = !CurrentSettings.WidgetsOnRight;
+                    SideStage.SetSide(CurrentSettings.StageOnRight);
+                }
+                ShowWidgetMap();
+                Changed();
+            },
+            () => { Changed(); if (_page == 4) { ShowWidgetMap(); RefreshGallery(); } },
+            Changed);
     }
 
     // A language switch builds the new settings window while this one is
@@ -336,236 +360,6 @@ public sealed partial class MainWindow : Window, IDisposable
         foreach (var (rgb, _, ring) in _tintButtons) ring.Opacity = rgb == CurrentSettings.Tint ? 1 : 0;
     }
 
-    // ---- Connection ----
-
-    private async Task ConnectAndLoadAsync()
-    {
-        try { await LoadFromCoreAsync(); }
-        finally { FinishCoreChange(); }
-    }
-
-    private async Task LoadFromCoreAsync()
-    {
-        long draftBefore = _session.DraftVersion;
-        await _client.ConnectAsync(800);
-        var state = await _client.GetAsync();
-        if (_updatesClosed || _session.Closed) return;
-        var pending = App.TakePendingState();
-        if (pending.Current != null && pending.Saved != null)
-            _session.ApplyInitialState(state.Saved, state.Current, state.InstanceId, state.Revision, pending.Saved, pending.Current);
-        else if (draftBefore != _session.DraftVersion)
-            _session.ApplyReconnectSnapshot(state.Saved, state.Current, state.InstanceId, state.Revision, draftBefore);
-        else
-            _session.ApplyInitialState(state.Saved, state.Current, state.InstanceId, state.Revision);
-        _coreChanging = false;
-        WatchCore();
-        WatchSettingsFile();
-        ShowStatus(_client.Connected);
-        LoadIntoControls();
-        UpdateButtons();
-        if (_session.HasUnsavedChanges && !_session.HasPinOverflow) SchedulePreview();
-        if (Content is FrameworkElement { IsLoaded: true }) App.SignalStartupReady(_client.Connected && _client.StateConfirmed);
-        else if (Content is FrameworkElement root) root.Loaded += (_, _) => App.SignalStartupReady(_client.Connected && _client.StateConfirmed);
-        if (_reconnectTimer == null && !_updatesClosed)
-        {
-            _reconnectTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-            _reconnectTimer.Tick += async (_, _) => await ReconnectAsync();
-            _reconnectTimer.Start();
-        }
-    }
-
-    private async Task SyncConnectedStateAsync()
-    {
-        long draftBefore = _session.DraftVersion;
-        var state = await _client.GetAsync();
-        if (_updatesClosed || _session.Closed || !state.FromCore) return;
-        bool preview = _session.ApplyReconnectSnapshot(state.Saved, state.Current, state.InstanceId, state.Revision, draftBefore);
-        LoadIntoControls();
-        UpdateButtons();
-        if (preview && !_session.HasPinOverflow) SchedulePreview();
-    }
-
-    private void FinishCoreChange(bool watch = false)
-    {
-        _coreChanging = false;
-        if (_updatesClosed) return;
-        if (watch) WatchCore();
-        ShowStatus(_client.Connected);
-        if (_closeAfterCore) { _closeAfterCore = false; _ = CloseRequestedAsync(); }
-    }
-
-    // The core started again on its own (an update, the guard after a crash, a launch from
-    // elsewhere): this window connects to it by itself. Edits made meanwhile stay and are previewed.
-    private DispatcherTimer? _reconnectTimer;
-    private bool _reconnecting;
-
-    private async Task ReconnectAsync()
-    {
-        if (_reconnecting || _coreChanging || _updatesClosed || _client.Connected) return;
-        _reconnecting = true;
-        try
-        {
-            if (!await _client.ConnectAsync(300) || _updatesClosed)
-            {
-                if (!_updatesClosed && !_coreChanging) ShowStatus(_client.Connected);
-                return;
-            }
-            await SyncConnectedStateAsync();
-            if (_updatesClosed) return;
-            WatchCore();
-            ShowStatus(_client.Connected);
-        }
-        finally { _reconnecting = false; }
-    }
-
-    private static readonly SolidColorBrush RunningBrush = new(Color.FromArgb(255, 76, 194, 106));
-    private static readonly SolidColorBrush IdleBrush = new(Color.FromArgb(255, 150, 150, 156));
-
-    private void ShowStatus(bool connected)
-    {
-        StatusDot.Fill = connected ? RunningBrush : IdleBrush;
-        _updatingCoreSwitch = true;
-        CoreSwitch.IsOn = connected || (_coreProcess != null && !_coreProcess.HasExited);
-        _updatingCoreSwitch = false;
-        CoreSwitch.IsEnabled = !_coreChanging && CoreClient.CoreExe() != null;
-        if (!_coreChanging)
-        {
-            StatusMessage.Text = connected ? Loc.T("Running") : _client.ConnectionError ??
-                (_coreProcess != null && !_coreProcess.HasExited
-                    ? Loc.T("The core is still running; the settings connection closed")
-                    : Loc.T("Closed; Windows' taskbar is back"));
-        }
-    }
-
-    // The banner itself lives in MainWindow.Status.cs: the project's card material, closing itself.
-
-    // WinUI shows one dialog at a time and none on a window that is closing: then the answer is None.
-    private async Task<ContentDialogResult> AskAsync(ContentDialog dialog)
-    {
-        if (_dialog != null || Content.XamlRoot == null) return ContentDialogResult.None;
-        dialog.Style = (Style)Application.Current.Resources["AtriumDialogStyle"];
-        dialog.XamlRoot = Content.XamlRoot;
-        _dialog = dialog;
-        try { return await dialog.ShowAsync(); }
-        finally { _dialog = null; }
-    }
-
-    // An app (.exe or .lnk) the user picks; null when cancelled. Windows shows no picker to an
-    // unpackaged app run as administrator.
-    private async Task<StorageFile?> PickProgramAsync()
-    {
-        var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.ComputerFolder };
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
-        picker.FileTypeFilter.Add(".exe");
-        picker.FileTypeFilter.Add(".lnk");
-        try { return await picker.PickSingleFileAsync(); }
-        catch (COMException)
-        {
-            ShowMessage(InfoBarSeverity.Warning, Loc.T("The file picker is unavailable"),
-                Loc.T("Windows does not show it to apps run as administrator. Open the settings without administrator rights."));
-            return null;
-        }
-    }
-
-    // Follow the process exit event rather than polling the pipe while the settings window is idle.
-    private void WatchCore()
-    {
-        if (_updatesClosed) return;
-        if (!_client.Connected && _coreProcess != null && !_coreProcess.HasExited) return;
-        _coreProcess?.Dispose();
-        _coreProcess = null;
-        if (!_client.Connected || _updatesClosed) return;
-        try
-        {
-            var process = Process.GetProcessById(_client.ProcessId);
-            _coreProcess = process;
-            process.Exited += (_, _) => DispatcherQueue.TryEnqueue(() =>
-            {
-                if (_coreProcess != process) return;
-                _client.Disconnect(coreStopped: true);
-                _coreProcess.Dispose();
-                _coreProcess = null;
-                ShowStatus(false);
-            });
-            process.EnableRaisingEvents = true;
-        }
-        catch (ArgumentException) { _client.Disconnect(coreStopped: true); }
-    }
-
-    private async void OnCoreToggled(object sender, RoutedEventArgs e)
-    {
-        if (_updatingCoreSwitch || _coreChanging) return;
-        bool start = CoreSwitch.IsOn;
-        _coreChanging = true;
-        CoreSwitch.IsEnabled = false;
-        StatusMessage.Text = start ? Loc.T("Starting…") : Loc.T("Closing…");
-        HideStatus();
-        try
-        {
-            string exe = CoreClient.CoreExe() ?? throw new FileNotFoundException(Loc.T("Atrium.exe was not found"));
-            if (start)
-            {
-                using var launched = Process.Start(CoreClient.CoreStartInfo(exe));
-                if (!await _client.ConnectAsync(8000)) throw new TimeoutException(Loc.T("Could not connect to Atrium. Try again later."));
-                await SyncConnectedStateAsync();
-            }
-            else
-            {
-                _client.Disconnect();
-                WatchCore();
-                using var quit = Process.Start(new ProcessStartInfo(exe, "--exit") { UseShellExecute = false, CreateNoWindow = true })
-                    ?? throw new InvalidOperationException(Loc.T("Could not send the quit request."));
-                using var waitTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                try { await quit.WaitForExitAsync(waitTimeout.Token); }
-                catch (OperationCanceledException) { throw new TimeoutException(Loc.T("Atrium has not quit yet. Try again later.")); }
-                if (quit.ExitCode != 0) throw new InvalidOperationException(Loc.T("Atrium has not quit yet. Try again later."));
-                _client.Disconnect(coreStopped: true);
-            }
-        }
-        catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException or TimeoutException or IOException)
-        {
-            ShowMessage(InfoBarSeverity.Error, start ? Loc.T("Could not start") : Loc.T("Could not close"), error.Message);
-        }
-        finally { FinishCoreChange(watch: true); }
-    }
-
-    // ---- Changes made elsewhere ----
-
-    // The core writes settings.json for changes made at the bar (its menu, the control centre):
-    // what changed there comes into the controls, the edits made here meanwhile stay.
-    private FileSystemWatcher? _settingsWatcher;
-    private int _settingsReload;
-
-    private void WatchSettingsFile()
-    {
-        string? dir = Path.GetDirectoryName(CoreClient.SettingsPath);
-        if (_settingsWatcher != null || dir == null || !Directory.Exists(dir)) return;
-        _settingsWatcher = new FileSystemWatcher(dir, "settings.json")
-        {
-            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
-            EnableRaisingEvents = true,
-        };
-        void OnChanged(object _1, FileSystemEventArgs _2) => DispatcherQueue.TryEnqueue(ReloadExternal);
-        _settingsWatcher.Changed += OnChanged;
-        _settingsWatcher.Created += OnChanged;
-        _settingsWatcher.Renamed += (_, _) => DispatcherQueue.TryEnqueue(ReloadExternal);
-    }
-
-    private async void ReloadExternal()
-    {
-        int id = ++_settingsReload;
-        await Task.Delay(120); // one reload for a burst of writes
-        if (id != _settingsReload || _updatesClosed || _session.Closed || !_client.Connected) return;
-        var state = await _client.GetAsync();
-        if (id != _settingsReload || _updatesClosed || _session.Closed || !state.FromCore) return;
-        if (!_session.ApplyExternalChange(state.Saved, state.Revision)) return;
-        LoadIntoControls();
-        UpdateButtons();
-        if (_page == 4) ShowWidgetMap();
-        if (_page == 5) ShowStagePreview(true);
-        if (_session.HasUnsavedChanges && !_session.HasPinOverflow) SchedulePreview(); // the edits made here, over the new state
-    }
-
     // ---- Controls <-> settings ----
 
     private void LoadIntoControls()
@@ -616,46 +410,24 @@ public sealed partial class MainWindow : Window, IDisposable
         LoadExtras();
         BarSwitch.IsOn = CurrentSettings.Bar;
         UpdateBarModule();
-        WidgetsSwitch.IsOn = CurrentSettings.Widgets;
-        (CurrentSettings.WidgetsOnRight ? WidgetsRight : WidgetsLeft).IsChecked = true;
-        HideTaskbarSwitch.IsOn = CurrentSettings.HideTaskbar;
-        GenieSwitch.IsOn = CurrentSettings.GenieMinimize;
-        PeekSwitch.IsOn = CurrentSettings.WindowPeek;
-        StageSwitch.IsOn = CurrentSettings.StageManager;
-        (CurrentSettings.StageOnRight ? StageRight : StageLeft).IsChecked = true;
-        (CurrentSettings.StageAutoHide ? StageAutoHide : StageAlways).IsChecked = true;
-        StageMinimizeSwitch.IsOn = CurrentSettings.StageMinimize;
-        StageDragMergeSwitch.IsOn = CurrentSettings.StageDragMerge;
-        StageCloseButtonSwitch.IsOn = CurrentSettings.StageCloseButton;
-        StageScrollWrapSwitch.IsOn = CurrentSettings.StageScrollWrap;
-        StageAvoidSwitch.IsOn = CurrentSettings.StageAvoid;
+        SideWidgets.Load(CurrentSettings);
+        SideStage.Load(CurrentSettings);
         RebuildExcluded();
-        (CurrentSettings.WidgetBackdrop == "wallpaper" ? BackdropWallpaper : BackdropDesktop).IsChecked = true;
-        (CurrentSettings.WidgetMaterial switch { "dusk" => MaterialDusk, "color" => MaterialColor, _ => MaterialGlass }).IsChecked = true;
-        HideBannersSwitch.IsOn = CurrentSettings.HideBanners;
-        WinKeySwitch.IsOn = CurrentSettings.WinKeyStart;
-        WinNumbersSwitch.IsOn = CurrentSettings.WinNumbers;
-        RemoteVisibleSwitch.IsOn = CurrentSettings.RemoteVisible;
+        MainSystem.Load(CurrentSettings);
+        MainAbout.Load(CurrentSettings);
         (CurrentSettings.StatusStyle == "icons" ? StatusIcons : StatusRing).IsChecked = true;
         (CurrentSettings.AutoHide switch { "never" => HideNever, "always" => HideAlways, _ => HideFullscreen }).IsChecked = true;
+        BarDodgeSwitch.IsOn = CurrentSettings.BarDodge;
+        BarDodgeSwitch.Visibility = CurrentSettings.AutoHide != "always" ? Visibility.Visible : Visibility.Collapsed;
         BarReserveSwitch.IsOn = CurrentSettings.BarReserve;
         BarFullscreenHideSwitch.IsOn = CurrentSettings.BarFullscreenHide;
         VisibleOptions.Visibility = CurrentSettings.AutoHide == "never" ? Visibility.Visible : Visibility.Collapsed;
         (CurrentSettings.BarEdge switch { "top" => EdgeTop, "left" => EdgeLeft, "right" => EdgeRight, _ => EdgeBottom }).IsChecked = true;
-        StartupSwitch.IsOn = CurrentSettings.StartOnLogin;
-        string currentLanguage = CurrentSettings.Language == "zh" ? "zh-Hans" : CurrentSettings.Language;
-        LanguagePicker.SelectedIndex = 0;
-        for (int i = 0; i < LanguagePicker.Items.Count; i++)
-        {
-            if (LanguagePicker.Items[i] is ComboBoxItem item && (item.Tag as string) == currentLanguage)
-                LanguagePicker.SelectedIndex = i;
-        }
-
         LoadDisplayControls();
         (CurrentSettings.TextColor switch { "light" => TextLight, "dark" => TextDark, _ => TextAuto }).IsChecked = true;
         UpdateGallery();
         RebuildPins();
-        WindowsContextMenuSwitch.IsOn = CurrentSettings.WindowsContextMenu;
+        MainDock.ContextMenuSwitch.IsOn = CurrentSettings.WindowsContextMenu;
         TintPicker.Color = TintColor(CurrentSettings.Tint);
         ShowTint();
         _loading = false;
@@ -663,6 +435,13 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     private static Color TintColor(uint rgb) => Color.FromArgb(255, (byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb);
+
+    private void Set(Action<BarSettings> apply)
+    {
+        if (_loading) return;
+        apply(CurrentSettings);
+        Changed();
+    }
 
     private void OnSliderChanged(SliderDef d, double v)
     {
@@ -715,55 +494,21 @@ public sealed partial class MainWindow : Window, IDisposable
         ClockSecondsSwitch.Opacity = CurrentSettings.ShowClock ? 1 : 0.45;
     }
 
-    private void OnClockSecondsToggled(object sender, RoutedEventArgs e)
+    private void OnBarContentToggled(object sender, RoutedEventArgs e) => Set(s =>
     {
-        if (_loading) return;
-        CurrentSettings.ShowClockSeconds = ClockSecondsSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnBarContentToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.ShowTray = TraySwitch.IsOn;
-        CurrentSettings.TrayHost = TrayHostSwitch.IsOn;
-        CurrentSettings.StartTray = StartTraySwitch.IsOn;
-        CurrentSettings.StartStatus = StartStatusSwitch.IsOn;
-        CurrentSettings.ShowStatus = StatusSwitch.IsOn;
-        CurrentSettings.ShowNotifications = NotificationsSwitch.IsOn;
-        CurrentSettings.ShowDesktop = DesktopSwitch.IsOn;
-        CurrentSettings.StartCentered = StartCenteredSwitch.IsOn;
-        CurrentSettings.StartWithBar = StartWithBarSwitch.IsOn;
-        CurrentSettings.AttentionLight = AttentionLightSwitch.IsOn;
-        CurrentSettings.AttentionBounce = AttentionBounceSwitch.IsOn;
-        CurrentSettings.BarBadges = BarBadgesSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnWidgetAlignmentChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.WidgetsOnRight = tag == "right";
-        // With Stage Manager on, it keeps to the widgets' other side.
-        if (CurrentSettings.StageManager) SetSide(v => CurrentSettings.StageOnRight = v, StageLeft, StageRight, !CurrentSettings.WidgetsOnRight);
-        ShowWidgetMap();
-        Changed();
-    }
-
-    private void SetSide(Action<bool> set, RadioButton left, RadioButton right, bool isRight)
-    {
-        set(isRight);
-        _loading = true;
-        (isRight ? right : left).IsChecked = true;
-        _loading = false;
-    }
-
-    private void OnAutoWidthToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.AutoWidth = AutoWidthSwitch.IsOn;
-        Changed();
-    }
+        s.ShowTray = TraySwitch.IsOn;
+        s.TrayHost = TrayHostSwitch.IsOn;
+        s.StartTray = StartTraySwitch.IsOn;
+        s.StartStatus = StartStatusSwitch.IsOn;
+        s.ShowStatus = StatusSwitch.IsOn;
+        s.ShowNotifications = NotificationsSwitch.IsOn;
+        s.ShowDesktop = DesktopSwitch.IsOn;
+        s.StartCentered = StartCenteredSwitch.IsOn;
+        s.StartWithBar = StartWithBarSwitch.IsOn;
+        s.AttentionLight = AttentionLightSwitch.IsOn;
+        s.AttentionBounce = AttentionBounceSwitch.IsOn;
+        s.BarBadges = BarBadgesSwitch.IsOn;
+    });
 
     private void OnHoverRiseToggled(object sender, RoutedEventArgs e)
     {
@@ -780,39 +525,11 @@ public sealed partial class MainWindow : Window, IDisposable
         RiseNearSwitch.IsHitTestVisible = CurrentSettings.HoverRise;
     }
 
-    private void OnRiseNearToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.RiseNear = RiseNearSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnMagnifyNearToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.MagnifyNear = MagnifyNearSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnRunningToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.ShowRunning = RunningSwitch.IsOn;
-        Changed();
-    }
-
     private void OnImeStatusToggled(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
         CurrentSettings.ImeStatus = ImeStatusSwitch.IsOn;
         ImeBubbleSwitch.IsEnabled = ImeStatusSwitch.IsOn; // the bubble announces what the status reads
-        Changed();
-    }
-
-    private void OnImeBubbleToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.ImeBubble = ImeBubbleSwitch.IsOn;
         Changed();
     }
 
@@ -834,239 +551,29 @@ public sealed partial class MainWindow : Window, IDisposable
         }
     }
 
-    private void OnWidgetsToggled(object sender, RoutedEventArgs e)
-    {
-        UpdateGallery();
-        if (_loading) return;
-        CurrentSettings.Widgets = WidgetsSwitch.IsOn;
-        Changed();
-    }
-
-    // The widgets' material: the map and the gallery show it at once, the core with the preview.
-    private void OnWidgetMaterialChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag } || tag == CurrentSettings.WidgetMaterial) return;
-        CurrentSettings.WidgetMaterial = tag;
-        Changed();
-        if (_page == 4) { ShowWidgetMap(); RefreshGallery(); }
-    }
-
-    private void OnWidgetBackdropChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.WidgetBackdrop = tag;
-        Changed();
-    }
-
-    private void OnGenieToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.GenieMinimize = GenieSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnPeekToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.WindowPeek = PeekSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnHideTaskbarToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.HideTaskbar = HideTaskbarSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStageToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StageManager = StageSwitch.IsOn;
-        // The widgets go to the other side.
-        if (CurrentSettings.StageManager) SetSide(v => CurrentSettings.WidgetsOnRight = v, WidgetsLeft, WidgetsRight, !CurrentSettings.StageOnRight);
-        Changed();
-        if (_page == 5) ShowStagePreview(true);
-    }
-
-    private void OnStageSideChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.StageOnRight = tag == "right";
-        if (CurrentSettings.StageManager) SetSide(v => CurrentSettings.WidgetsOnRight = v, WidgetsLeft, WidgetsRight, !CurrentSettings.StageOnRight);
-        Changed();
-        if (_page == 5) ShowStagePreview(true);
-    }
-
-    private void OnStageModeChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.StageAutoHide = tag == "hover";
-        Changed();
-        if (_page == 5) ShowStagePreview(true);
-    }
-
-    private void OnStartupToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StartOnLogin = StartupSwitch.IsOn;
-        Changed();
-    }
-
-    // The picker follows locales/manifest.json: adding a language file and a
-    // manifest entry is enough; no code change here.
-    private void PopulateLanguagePicker()
-    {
-        bool loading = _loading;
-        _loading = true;
-        LanguagePicker.Items.Clear();
-        LanguagePicker.Items.Add(new ComboBoxItem { Content = Loc.T("Follow system"), Tag = "auto" });
-        foreach (var (tag, name) in Loc.Languages)
-            LanguagePicker.Items.Add(new ComboBoxItem { Content = name, Tag = tag });
-        _loading = loading;
-    }
-
-    private void OnLanguageChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.Language = (LanguagePicker.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
-        Changed();
-    }
-
-    private void OnHideBannersToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.HideBanners = HideBannersSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStageAvoidToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StageAvoid = StageAvoidSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStageCloseButtonToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StageCloseButton = StageCloseButtonSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStageDragMergeToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StageDragMerge = StageDragMergeSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStageMinimizeToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.StageMinimize = StageMinimizeSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnWinKeyToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.WinKeyStart = WinKeySwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStartSizeChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.StartSize = tag;
-        Changed();
-    }
-
-    private void OnStartIconSizeChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.StartIcon = tag;
-        Changed();
-    }
-
-    private void OnWinNumbersToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.WinNumbers = WinNumbersSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnRemoteVisibleToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.RemoteVisible = RemoteVisibleSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnStatusStyleChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.StatusStyle = tag;
-        Changed();
-    }
-
     private void OnAutoHideChecked(object sender, RoutedEventArgs e)
     {
         if (_loading || sender is not RadioButton { Tag: string tag }) return;
         CurrentSettings.AutoHide = tag;
+        BarDodgeSwitch.Visibility = tag != "always" ? Visibility.Visible : Visibility.Collapsed;
         VisibleOptions.Visibility = tag == "never" ? Visibility.Visible : Visibility.Collapsed;
         Changed();
     }
 
-    private void OnBarReserveToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.BarReserve = BarReserveSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnBarFullscreenHideToggled(object sender, RoutedEventArgs e)
-    {
-        if (_loading) return;
-        CurrentSettings.BarFullscreenHide = BarFullscreenHideSwitch.IsOn;
-        Changed();
-    }
-
-    private void OnBarEdgeChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.BarEdge = tag;
-        Changed();
-    }
-
-    private void OnTextColorChecked(object sender, RoutedEventArgs e)
-    {
-        if (_loading || sender is not RadioButton { Tag: string tag }) return;
-        CurrentSettings.TextColor = tag;
-        Changed();
-    }
-
-    private void OnNotifyPlacementChecked(object sender, RoutedEventArgs e)
-    {
-        bool corner = (string)((RadioButton)sender).Tag == "corner";
-        NotifyCornerRow.Visibility = corner ? Visibility.Visible : Visibility.Collapsed;
-        if (_loading) return;
-        // A corner: the one chosen last (top right at first, as before there were four).
-        CurrentSettings.NotifyPlacement = corner ? _notifyCorner : "dock";
-        _notifyEntrancePending = true;
-        Changed();
-    }
-
-    private void OnNotifyCornerChecked(object sender, RoutedEventArgs e)
-    {
-        _notifyCorner = (string)((RadioButton)sender).Tag;
-        if (_loading || CurrentSettings.NotifyPlacement == _notifyCorner) return;
-        CurrentSettings.NotifyPlacement = _notifyCorner;
-        _notifyEntrancePending = true;
-        Changed();
-    }
-
-    private string _notifyCorner = "topRight";
+    private void OnClockSecondsToggled(object s, RoutedEventArgs e) => Set(x => x.ShowClockSeconds = ClockSecondsSwitch.IsOn);
+    private void OnAutoWidthToggled(object s, RoutedEventArgs e) => Set(x => x.AutoWidth = AutoWidthSwitch.IsOn);
+    private void OnRiseNearToggled(object s, RoutedEventArgs e) => Set(x => x.RiseNear = RiseNearSwitch.IsOn);
+    private void OnMagnifyNearToggled(object s, RoutedEventArgs e) => Set(x => x.MagnifyNear = MagnifyNearSwitch.IsOn);
+    private void OnRunningToggled(object s, RoutedEventArgs e) => Set(x => x.ShowRunning = RunningSwitch.IsOn);
+    private void OnImeBubbleToggled(object s, RoutedEventArgs e) => Set(x => x.ImeBubble = ImeBubbleSwitch.IsOn);
+    private void OnBarDodgeToggled(object s, RoutedEventArgs e) => Set(x => x.BarDodge = BarDodgeSwitch.IsOn);
+    private void OnBarReserveToggled(object s, RoutedEventArgs e) => Set(x => x.BarReserve = BarReserveSwitch.IsOn);
+    private void OnBarFullscreenHideToggled(object s, RoutedEventArgs e) => Set(x => x.BarFullscreenHide = BarFullscreenHideSwitch.IsOn);
+    private void OnStartSizeChecked(object s, RoutedEventArgs e) { if (s is RadioButton { Tag: string t }) Set(x => x.StartSize = t); }
+    private void OnStartIconSizeChecked(object s, RoutedEventArgs e) { if (s is RadioButton { Tag: string t }) Set(x => x.StartIcon = t); }
+    private void OnStatusStyleChecked(object s, RoutedEventArgs e) { if (s is RadioButton { Tag: string t }) Set(x => x.StatusStyle = t); }
+    private void OnBarEdgeChecked(object s, RoutedEventArgs e) { if (s is RadioButton { Tag: string t }) Set(x => x.BarEdge = t); }
+    private void OnTextColorChecked(object s, RoutedEventArgs e) { if (s is RadioButton { Tag: string t }) Set(x => x.TextColor = t); }
 
     private void Changed()
     {
@@ -1238,58 +745,5 @@ public sealed partial class MainWindow : Window, IDisposable
         CurrentSettings.ApplyMaterial(BarSettings.Liquid());
         LoadIntoControls();
         Changed();
-    }
-
-    private async void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
-    {
-        args.Cancel = true;
-        await CloseRequestedAsync();
-    }
-
-    // Window.Close does not raise AppWindow.Closing. Both the title-bar close
-    // and update button explicitly use the same save/exit path before calling it.
-    private async Task CloseRequestedAsync()
-    {
-        if (_closePending) return;
-        if (_coreChanging) { _closeAfterCore = true; return; }
-        if (_dialog != null) // a close while a dialog is up dismisses the dialog
-        {
-            _dialog.Hide();
-            return;
-        }
-        _closePending = true;
-        try
-        {
-            if (_session.HasUnsavedChanges)
-            {
-                var dialog = new ContentDialog
-                {
-                    Title = Loc.T("Save changes?"),
-                    Content = Loc.T("Unsaved changes will be discarded when this window closes."),
-                    PrimaryButtonText = Loc.T("Save"),
-                    SecondaryButtonText = Loc.T("Don't save"),
-                    CloseButtonText = Loc.T("Cancel"),
-                    DefaultButton = ContentDialogButton.Primary,
-                };
-                var result = await AskAsync(dialog);
-                if (result == ContentDialogResult.None) { _restartUpdate = null; return; }
-                if (result == ContentDialogResult.Primary && !await SaveAsync()) { _restartUpdate = null; return; }
-            }
-            if (_restartUpdate != null)
-            {
-                try { ReleaseInstaller.Restart(_restartUpdate, _client.Connected); }
-                catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
-                {
-                    _restartUpdate = null;
-                    UpdateStatus.Text = error is UnauthorizedAccessException
-                        ? Loc.T("The installation folder is not writable; the update was not installed")
-                        : Loc.F("Could not restart for the update: {0}", error.Message);
-                    return;
-                }
-            }
-            _client.Dispose(); // the core reverts any unsaved preview on disconnect
-            Close();
-        }
-        finally { _closePending = false; }
     }
 }

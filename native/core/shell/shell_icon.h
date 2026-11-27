@@ -32,6 +32,12 @@ IconImage FitToSquare(const IconImage& src, int size);
 IconImage CropToSquare(const IconImage& src, int size);
 // Pull-decodes encoded image bytes into a centred square targetSize x targetSize premultiplied BGRA IconImage via WIC.
 bool DecodeWicSquareImage(IWICImagingFactory* wic, std::vector<uint8_t>& bytes, int targetSize, IconImage& out);
+// True when `path` is a PE/icon file with at least one embedded icon resource.
+bool HasEmbeddedExeIcon(const std::wstring& path);
+// True when `img` is a square icon whose 4 corners and outer perimeter are opaque (alpha >= 240).
+bool IsFullBleedSquareIcon(const IconImage& img);
+// Applies a G3 continuous-corner alpha mask when `img` is a full-bleed square icon; leaves other icons untouched.
+IconImage ApplySquircleMaskIfFullBleed(const IconImage& img);
 inline bool IsLink(const std::wstring& path) { return path.size() > 4 && _wcsicmp(path.c_str() + path.size() - 4, L".lnk") == 0; }
 
 } // namespace atrium

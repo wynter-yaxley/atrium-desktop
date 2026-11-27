@@ -152,6 +152,10 @@ private:
     // The same as the Windows taskbar shows it: the network, the speaker and the battery side by
     // side in `r` (its height the icons'), redrawn in the bar's ink.
     void DrawStatusIcons(ID2D1DeviceContext2* d2d, const SystemStatus& st, D2D1_RECT_F r, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink, bool darkInk);
+    void DrawStatusSpeakerIcon(ID2D1DeviceContext2* d2d, ID2D1Factory* factory, ID2D1StrokeStyle* round, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink, float l,
+                               float mid, float h, float stroke, const SystemStatus& st);
+    void DrawStatusBatteryIcon(ID2D1DeviceContext2* d2d, ID2D1Factory* factory, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink, bool darkInk, float bx0,
+                               float mid, float h, float stroke, const SystemStatus& st);
     float MapX(float u) const; // base x -> displayed x under the magnification
 
     struct Motion {
@@ -179,11 +183,40 @@ private:
     BarExtrasPainter extras_;
     ImeGlyphCache imeCache_;
     MusicBars music_;
-    struct StatusArc {
-        winrt::com_ptr<ID2D1PathGeometry> path;
-        float sweep = -1;
-    } ringTrack_, ringLevel_;
-    winrt::com_ptr<ID2D1PathGeometry> chargingBolt_;
+    // Device-independent geometries scoped to the painter and invalidated if the factory changes.
+    struct StatusGeometryCache {
+        struct ArcEntry {
+            winrt::com_ptr<ID2D1PathGeometry> path;
+            float sweep = -1;
+        };
+        struct BatteryEntry {
+            float h = 0, stroke = 0;
+            int pct = -1;
+            winrt::com_ptr<ID2D1PathGeometry> cut;
+            winrt::com_ptr<ID2D1PathGeometry> rest;
+            uint64_t lastUsed = 0;
+        };
+        winrt::com_ptr<ID2D1Factory> factory;
+        ArcEntry ringTrack, ringLevel;
+        winrt::com_ptr<ID2D1PathGeometry> chargingBolt;
+        winrt::com_ptr<ID2D1PathGeometry> speakerCone;
+        winrt::com_ptr<ID2D1PathGeometry> speakerWave;
+        std::vector<BatteryEntry> batteryCharging;
+        uint64_t stamp = 0;
+
+        void SyncFactory(ID2D1Factory* f)
+        {
+            if (factory.get() == f)
+                return;
+            ringTrack = {};
+            ringLevel = {};
+            chargingBolt = nullptr;
+            speakerCone = nullptr;
+            speakerWave = nullptr;
+            batteryCharging.clear();
+            factory.copy_from(f);
+        }
+    } statusGeo_;
     std::map<std::wstring, Motion> motion_;
     std::map<uint64_t, winrt::com_ptr<ID2D1Bitmap1>> bitmaps_;
     std::vector<uint64_t> usedBitmaps_; // scratch storage for one DrawContent

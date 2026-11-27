@@ -2,18 +2,21 @@
 #include "shell/messengers.h"
 #include "shell/notification_listener.h"
 #include "shell/wechat_source.h"
+#include "ui/notification_layout.h"
 
 #include <iostream>
-#include <stdexcept>
 
 using namespace atrium;
 
 namespace {
+bool g_failed = false;
 
 void Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (!condition) {
+        std::cerr << "messengers: " << message << '\n';
+        g_failed = true;
+    }
 }
 
 void CheckWeChatTime()
@@ -147,6 +150,44 @@ void CheckWeChatDiff()
     Require(DiffWeChatRows({{L"g", {L"Group", L"m1", 1, true}}}, true, false, muteStates).empty(), "muted chat suppressed");
     auto unmuted = DiffWeChatRows({{L"g", {L"Group", L"m2", 2, false}}}, true, false, muteStates);
     Require(unmuted.size() == 1 && unmuted[0].unread && unmuted[0].title == L"Group", "unmuted chat alerts again");
+
+    // #190: open-chat (unread == 0) summary change alerts once; unchanged/unseen/muted/collapsed/blocked ignored;
+    // oldUnread > 0 -> 0 stays withdrawal; baseline == false syncs silently.
+    std::map<std::wstring, WeChatChatState> openStates{
+        {L"open", {0, L"msg1"}}, {L"muted0", {0, L"m1"}}, {L"collapsed0", {0, L"c1"}}, {L"official0", {0, L"o1"}}, {L"wasunread", {2, L"old"}},
+    };
+    Require(DiffWeChatRows({{L"open", {L"OpenChat", L"msg1", 0}}}, true, false, openStates).empty(), "#190: unchanged unread==0 summary is ignored");
+    Require(DiffWeChatRows({{L"unseen0", {L"Unseen", L"hi", 0}}}, true, false, openStates).empty(),
+            "#190: unseen unread==0 chat does not alert on first appearance");
+    Require(DiffWeChatRows({{L"muted0", {L"Muted0", L"m2", 0, true}}}, true, false, openStates).empty(), "#190: muted unread==0 summary change is ignored");
+    Require(DiffWeChatRows({{L"collapsed0", {L"Collapsed0", L"c2", 0, false, true}}}, true, false, openStates).empty(),
+            "#190: collapsed unread==0 summary change is ignored");
+    Require(DiffWeChatRows({{L"official0", {L"Official0", L"o2", 0, false, false, true}}}, true, true, openStates).empty(),
+            "#190: blocked official unread==0 summary change is ignored");
+
+    const auto openAlert = DiffWeChatRows({{L"open", {L"OpenChat", L"msg2", 0}}}, true, false, openStates);
+    Require(openAlert.size() == 1 && openAlert[0].unread && openAlert[0].title == L"OpenChat" && openAlert[0].body == L"msg2",
+            "#190: open-chat unread==0 summary change alerts once");
+    Require(DiffWeChatRows({{L"open", {L"OpenChat", L"msg2", 0}}}, true, false, openStates).empty(),
+            "#190: open-chat unread==0 summary change does not repeat");
+
+    const auto withdrawn = DiffWeChatRows({{L"wasunread", {L"WasUnread", L"new summary", 0}}}, true, false, openStates);
+    Require(withdrawn.size() == 1 && !withdrawn[0].unread, "#190: oldUnread > 0 -> 0 stays withdrawal even when summary changes");
+
+    // baseline == false (e.g. ForegroundShown -> None silent sync) updates summary without posting a card.
+    Require(DiffWeChatRows({{L"open", {L"OpenChat", L"sent in foreground", 0}}}, false, false, openStates).empty(),
+            "#190: baseline==false suppresses open-chat unread==0 summary alert");
+    Require(openStates[L"open"].summary == L"sent in foreground" &&
+                DiffWeChatRows({{L"open", {L"OpenChat", L"sent in foreground", 0}}}, true, false, openStates).empty(),
+            "#190: baseline==false silently syncs summary so next baseline==true poll stays quiet");
+
+    // ForegroundShown -> None sync frame (allowOpenSummary = false) suppresses openSummaryRose
+    // while still alerting when real unread messages arrive immediately after leaving WeChat.
+    std::map<std::wstring, WeChatChatState> switchStates{{L"open", {0, L"before"}}, {L"peer", {0, L"p0"}}};
+    const auto switchEv =
+        DiffWeChatRows({{L"open", {L"OpenChat", L"typed in front", 0}}, {L"peer", {L"Peer", L"new msg", 1}}}, true, false, switchStates, false);
+    Require(switchEv.size() == 1 && switchEv[0].unread && switchEv[0].title == L"Peer" && switchStates[L"open"].summary == L"typed in front",
+            "#190: ForegroundShown -> None sync silences open-chat summary while delivering real unread 0 -> 1");
 }
 
 void CheckWeChatThrottle()
@@ -195,6 +236,17 @@ void CheckWeChatThrottle()
         WeChatThrottleInput leave{WeChatBusyState::None, true, 3, 1500, 1000, 1700, true, false, 0, true};
         const auto leaveOut = EvaluateWeChatThrottle(leave);
         Require(leaveOut.waitMs == 0, "breakCooldown bypasses busyUntilTick and 1s gap on None");
+
+        // #190: ForegroundShown with unread==0 keeps 1000 ms wait and 0 polls even on breakCooldown.
+        WeChatThrottleInput fgZeroBreak{WeChatBusyState::ForegroundShown, true, 0, 1500, 1000, 0, true, false, 0, true};
+        const auto fgZeroBreakOut = EvaluateWeChatThrottle(fgZeroBreak);
+        Require(fgZeroBreakOut.waitMs == 1000 && fgZeroBreakOut.clearReadingAndBaseline,
+                "#190: ForegroundShown with unread==0 keeps 1000 ms wait and zero UIA polls on breakCooldown");
+
+        // #190: None 300 ms cooldown wait keeps !clearReadingAndBaseline.
+        WeChatThrottleInput noneCooldown{WeChatBusyState::None, true, 0, 1100, 1000, 1300, false, false, 0, false};
+        const auto noneCooldownOut = EvaluateWeChatThrottle(noneCooldown);
+        Require(noneCooldownOut.waitMs == 200 && !noneCooldownOut.clearReadingAndBaseline, "#190: None 300 ms cooldown keeps !clearReadingAndBaseline");
     }
 }
 
@@ -228,53 +280,68 @@ void CheckToastDiff()
 
 int main()
 {
-    try {
-        auto require = [](bool condition, const char* message) {
-            if (!condition)
-                throw std::runtime_error(message);
-        };
-        require(MessengerOfProgram(L"D:\\Download App\\Tencent\\Weixin\\Weixin.exe") == Messenger::WeChat, "WeChat 4 by its program");
-        require(MessengerOfProgram(L"c:\\program files\\wxwork\\WXWork.exe") == Messenger::WeCom, "WeCom by its program");
-        require(MessengerOfProgram(L"D:\\Tencent\\WXWorkLocalPro\\WXWorkLocalPro.exe") == Messenger::WeCom, "WeCom private edition");
-        require(MessengerOfProgram(L"DingTalk.exe") == Messenger::DingTalk, "DingTalk by its file name");
-        require(MessengerOfProgram(L"C:\\Windows\\explorer.exe") == Messenger::None, "other programs are none of them");
-        require(MessengerOfNotice(L"windows", L"QQ", L"QQ") == Messenger::QQ, "QQ's Windows notification (AUMID QQ)");
-        require(MessengerOfNotice(L"windows", L"\u9489\u9489", L"") == Messenger::DingTalk, "a notification by its shown name");
-        require(MessengerOfNotice(L"wechat", L"WeChat", L"") == Messenger::WeChat, "the WeChat reader's card");
-        require(MessengerOfNotice(L"windows", L"Mail", L"microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.mail") == Messenger::None,
-                "other apps' notifications follow notifyListener");
-        require(MessengerOfNotice(L"windows", L"QQ Music", L"QQMusic") == Messenger::None, "a name only containing QQ is not QQ");
+    auto require = Require;
+    require(MessengerOfProgram(L"D:\\Download App\\Tencent\\Weixin\\Weixin.exe") == Messenger::WeChat, "WeChat 4 by its program");
+    require(MessengerOfProgram(L"C:\\Program Files (x86)\\Tencent\\TIM\\Bin\\TIM.exe") == Messenger::QQ, "TIM recognized as QQ");
+    require(MessengerOfNotice(L"windows", L"TIM", L"TIM") == Messenger::QQ, "TIM notification recognized as QQ");
+    require(MessengerOfProgram(L"c:\\program files\\wxwork\\WXWork.exe") == Messenger::WeCom, "WeCom by its program");
+    require(MessengerOfProgram(L"D:\\Tencent\\WXWorkLocalPro\\WXWorkLocalPro.exe") == Messenger::WeCom, "WeCom private edition");
+    require(MessengerOfProgram(L"DingTalk.exe") == Messenger::DingTalk, "DingTalk by its file name");
+    require(MessengerOfProgram(L"C:\\Windows\\explorer.exe") == Messenger::None, "other programs are none of them");
+    require(MessengerOfNotice(L"windows", L"QQ", L"QQ") == Messenger::QQ, "QQ's Windows notification (AUMID QQ)");
+    require(MessengerOfNotice(L"windows", L"\u9489\u9489", L"") == Messenger::DingTalk, "a notification by its shown name");
+    require(MessengerOfNotice(L"wechat", L"WeChat", L"") == Messenger::WeChat, "the WeChat reader's card");
+    require(MessengerOfNotice(L"windows", L"Mail", L"microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.mail") == Messenger::None,
+            "other apps' notifications follow notifyListener");
+    require(MessengerOfNotice(L"windows", L"QQ Music", L"QQMusic") == Messenger::None, "a name only containing QQ is not QQ");
 
-        MessengerAlerts alerts;
-        require(alerts.Flash(Messenger::WeCom, 1000), "a first flash begins a burst");
-        require(!alerts.Flash(Messenger::WeCom, 1500), "flashes within a burst add nothing");
-        require(alerts.Due(3000).empty(), "nothing is due before the wait");
-        auto due = alerts.Due(4000);
-        require(due.size() == 1 && due[0] == Messenger::WeCom, "a burst with no card gets a plain one");
-        require(alerts.Due(9000).empty(), "once");
-        require(!alerts.Flash(Messenger::WeCom, 9000), "a flash soon after the last is the same burst");
-        require(alerts.Flash(Messenger::WeCom, 30000), "after a quiet spell a new burst");
-        alerts.Noticed(Messenger::WeCom, 31000);
-        require(alerts.Due(34000).empty(), "a card with the text follows: no plain card");
-        alerts.Noticed(Messenger::QQ, 50000);
-        require(alerts.Flash(Messenger::QQ, 52000), "a QQ burst");
-        require(alerts.Due(56000).empty(), "a card just before the flash counts too");
-        bool waiting = false;
-        require(alerts.Flash(Messenger::WeChat, 60000) && alerts.Due(61000, &waiting).empty() && waiting, "still waiting");
-        alerts.Cancel(Messenger::WeChat);
-        require(alerts.Due(65000, &waiting).empty() && !waiting, "cancelled burst produces no plain card");
-        require(alerts.Flash(Messenger::WeChat, 66000), "flash after cancel begins a new burst");
+    MessengerAlerts alerts;
+    require(alerts.Flash(Messenger::WeCom, 1000), "a first flash begins a burst");
+    require(!alerts.Flash(Messenger::WeCom, 1500), "flashes within a burst add nothing");
+    require(alerts.Due(3000).empty(), "nothing is due before the wait");
+    auto due = alerts.Due(4000);
+    require(due.size() == 1 && due[0] == Messenger::WeCom, "a burst with no card gets a plain one");
+    require(alerts.Due(9000).empty(), "once");
+    require(!alerts.Flash(Messenger::WeCom, 9000), "a flash soon after the last is the same burst");
+    require(alerts.Flash(Messenger::WeCom, 30000), "after a quiet spell a new burst");
+    alerts.Noticed(Messenger::WeCom, 31000);
+    require(alerts.Due(34000).empty(), "a card with the text follows: no plain card");
+    alerts.Noticed(Messenger::QQ, 50000);
+    require(alerts.Flash(Messenger::QQ, 52000), "a QQ burst");
+    require(alerts.Due(56000).empty(), "a card just before the flash counts too");
+    bool waiting = false;
+    require(alerts.Flash(Messenger::WeChat, 60000) && alerts.Due(61000, &waiting).empty() && waiting, "still waiting");
+    alerts.Cancel(Messenger::WeChat);
+    require(alerts.Due(65000, &waiting).empty() && !waiting, "cancelled burst produces no plain card");
+    require(alerts.Flash(Messenger::WeChat, 66000), "flash after cancel begins a new burst");
 
-        CheckWeChatTime();
-        CheckWeChatRows();
-        CheckWeChatDiff();
-        CheckWeChatThrottle();
-        CheckNoticeRouting();
-        CheckToastDiff();
-        std::cout << "messengers: all checks passed\n";
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "messengers: " << e.what() << "\n";
+    // Multi-instance isolation (two WeChat/QQ PIDs).
+    MessengerAlerts multi;
+    require(multi.Flash(Messenger::QQ, 1000, 101) && multi.Flash(Messenger::QQ, 1100, 202), "two QQ PIDs begin independent flash bursts");
+    multi.Noticed(Messenger::QQ, 1200, 101);
+    multi.Cancel(Messenger::WeChat, 303);
+    const auto dueMulti = multi.DueInstances(5000);
+    require(dueMulti.size() == 1 && dueMulti[0] == (MessengerAlerts::DueAlert{Messenger::QQ, 202}), "noticed/cancel on PID 101 does not suppress PID 202");
+    require(multi.Flash(Messenger::WeChat, 10000, 111) && multi.Flash(Messenger::WeChat, 10100, 222), "two WeChat PIDs begin independent flash bursts");
+    multi.Cancel(Messenger::WeChat, 111);
+    const auto dueWeChat = multi.DueInstances(14000);
+    require(dueWeChat.size() == 1 && dueWeChat[0] == (MessengerAlerts::DueAlert{Messenger::WeChat, 222}),
+            "cancelling one WeChat PID keeps sibling PID pending");
+
+    Notice cardPid1{.source = L"wechat", .title = L"文件传输助手", .pid = 111};
+    Notice cardPid2{.source = L"wechat", .title = L"文件传输助手", .pid = 222};
+    const Notice withdrawPid1{.source = L"wechat", .title = L"文件传输助手", .unread = false, .pid = 111};
+    require(notification::WithdrawNotice(cardPid1, withdrawPid1), "matching PID withdraws notice");
+    require(!notification::WithdrawNotice(cardPid2, withdrawPid1), "mismatched PID must not withdraw sibling account notice");
+
+    CheckWeChatTime();
+    CheckWeChatRows();
+    CheckWeChatDiff();
+    CheckWeChatThrottle();
+    CheckNoticeRouting();
+    CheckToastDiff();
+    if (g_failed)
         return 1;
-    }
+    std::cout << "messengers: all checks passed\n";
+    return 0;
 }

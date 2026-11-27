@@ -56,9 +56,16 @@ private:
     struct Widget;
     static void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
     static LRESULT CALLBACK HostProc(HWND, UINT, WPARAM, LPARAM);
+    void OnHostTimer(WPARAM timerId);
+    void BlinkCaret();
+    void OnPhotoReady(LPARAM lp);
+    void InvalidateKind(WidgetKind kind);
     void Build();
     void Clear();
     void Load();
+    bool AddLoadedWidget(WidgetKind kind, WidgetSize size, int col, int row, const WidgetContent& content);
+    bool LoadFromJson(const std::wstring& text);
+    void LoadDefaults();
     void Save() const;
     void SaveSoon(); // while typing
     Widget& Create(WidgetKind kind, WidgetSize size, int col, int row);
@@ -89,6 +96,14 @@ private:
     LRESULT MouseActivate(const Widget& w, LPARAM lp) const;
     bool UpdateCursor(const Widget& w, LPARAM lp, LRESULT& r) const;
     bool Message(Widget& w, UINT m, WPARAM wp, LPARAM lp, LRESULT& r);
+    bool OnWindowPosChanging(WINDOWPOS* pos);
+    bool OnMouseWheel(Widget& w, WPARAM wp) const;
+    bool OnMouseLeave(Widget& w) const;
+    bool OnLButtonDown(Widget& w);
+    bool OnMouseMove(Widget& w);
+    bool OnLButtonUpOrCapture(Widget& w, UINT m, LPARAM lp);
+    void FinishResize(Widget& w);
+    void FinishDrag(Widget& w);
     void Menu(Widget& w);
     void Activate(Widget& w);
     void Paint(Widget& w, Canvas& c);
@@ -98,6 +113,10 @@ private:
     void StartEdit(Widget& w, int item);
     void EndEdit(Widget& w);
     bool Key(Widget& w, UINT m, WPARAM wp);
+    bool HandleKeyDown(Widget& w, std::wstring& text, WPARAM wp, bool& changed);
+    bool HandleKeyChar(Widget& w, std::wstring& text, wchar_t ch, bool& changed);
+    bool HandleEnter(Widget& w, std::wstring& text, bool& changed);
+    bool PasteClipboard(Widget& w);
     void Insert(Widget& w, const std::wstring& s);
     void PlaceImeWindow(Widget& w);
     // Photos: a picture from the folder, read and scaled on a worker thread.

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -210,6 +211,7 @@ public:
 
 private:
     static void HideTaskbars();
+    void ResyncStuckWorkArea();
     void ScheduleRefit();
     void StopRefit(bool stop);
     void RefitWorker();
@@ -229,6 +231,7 @@ private:
     TaskbarReshowGuard reshowGuard_;
     HWINEVENTHOOK hook_ = nullptr;
     DWORD hookedPid_ = 0;
+    std::map<HWND, RECT> resyncedWork_;
     std::mutex refitMutex_;
     std::condition_variable refitCv_;
     bool refitStop_ = false;

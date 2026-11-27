@@ -11,4 +11,7 @@ namespace atrium {
 // shell surface, or click-through overlay that the bar must stay behind.
 bool ShouldIgnoreTopmostCover(std::wstring_view cls, LONG_PTR style, LONG_PTR exStyle, bool isForeground, bool ownerIsForeground);
 
+// True when a window's visual bounds overlap the bar's resting overlap zone.
+bool WindowOverlapsBar(const RECT& windowBounds, const RECT& barZone);
+
 } // namespace atrium

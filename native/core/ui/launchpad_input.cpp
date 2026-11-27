@@ -3,6 +3,7 @@
 #include "ui/launchpad.h"
 
 #include "clock.h"
+#include "localization.h"
 
 #include <windowsx.h>
 #include <imm.h>
@@ -26,11 +27,11 @@ bool Launchpad::Message(UINT m, WPARAM w, LPARAM l, LRESULT& result)
     case WM_TIMER:
         if (w == kCloseTimer)
             Finish();
-        else if (w == kCaretTimer && searchFocused_)
+        else if (w == kCaretTimer && (searchFocused_ || namingFolder_))
             surface_.Invalidate(); // the caret blinks
-        else if (w == kEdgeTimer)
-            TurnAtEdge();
-        return w == kCloseTimer || w == kCaretTimer || w == kEdgeTimer;
+        else if (w == kDragTimer)
+            DragTick();
+        return w == kCloseTimer || w == kCaretTimer || w == kDragTimer;
     case WM_ACTIVATE:
         if (LOWORD(w) == WA_INACTIVE && !menuOpen_)
             Close(false);
@@ -98,7 +99,7 @@ bool Launchpad::ImeMessage(UINT m, WPARAM w, LPARAM l, LRESULT& result)
     switch (m) {
     case WM_IME_SETCONTEXT: result = DefWindowProcW(surface_.Hwnd(), m, w, l & ~LPARAM(ISC_SHOWUICOMPOSITIONWINDOW)); return true;
     case WM_IME_STARTCOMPOSITION:
-        searchFocused_ = true;
+        searchFocused_ = !namingFolder_;
         surface_.Invalidate();
         PlaceIme();
         result = 0;
@@ -114,7 +115,7 @@ bool Launchpad::ImeMessage(UINT m, WPARAM w, LPARAM l, LRESULT& result)
                 }
                 ImmReleaseContext(surface_.Hwnd(), imc);
             }
-            searchFocused_ = searchFocused_ || !composition_.empty();
+            searchFocused_ = !namingFolder_ && (searchFocused_ || !composition_.empty());
         } else if (l == 0 || (l & GCS_RESULTSTR)) {
             composition_.clear();
         }
@@ -138,6 +139,17 @@ bool Launchpad::Key(WPARAM key)
 {
     if (closing_)
         return false;
+    if (namingFolder_) {
+        if (key == VK_ESCAPE)
+            FinishFolderNaming(false);
+        else if (key == VK_RETURN)
+            FinishFolderNaming(true);
+        else if (key == VK_BACK && !nameDraft_.empty()) {
+            nameDraft_.pop_back();
+            surface_.Invalidate();
+        }
+        return true;
+    }
     const int n = int(Shown().size());
     auto move = [&](int dx, int dy) {
         int page = page_;
@@ -151,12 +163,13 @@ bool Launchpad::Key(WPARAM key)
             composition_.clear();
             searchFocused_ = false;
             Filter();
-        } else if (folderOpen_) {
-            ShowFolder(false);
+        } else if (!openFolder_.empty()) {
+            ShowFolder({});
         } else {
             Close(false);
         }
         break;
+    case VK_F2: StartFolderNaming(); return true;
     case VK_LEFT: move(-1, 0); break;
     case VK_RIGHT: move(1, 0); break;
     case VK_UP: move(0, -1); break;
@@ -178,10 +191,20 @@ bool Launchpad::Key(WPARAM key)
     return true;
 }
 
-// Typing goes to the search, wherever the pointer is (the IME's text arrives here too).
+// Typing goes to the open folder's title while renaming, otherwise to the search.
 void Launchpad::Type(wchar_t ch)
 {
-    if (closing_ || ch < 32 || ch == 127 || query_.size() >= 64)
+    if (closing_ || ch < 32 || ch == 127)
+        return;
+    if (namingFolder_) {
+        if (nameDraft_.size() < 40) {
+            nameDraft_ += ch;
+            PlaceIme();
+            surface_.Invalidate();
+        }
+        return;
+    }
+    if (query_.size() >= 64)
         return;
     searchFocused_ = true;
     query_ += ch;
@@ -202,7 +225,9 @@ void Launchpad::Press(POINT pt)
     dragMs_ = ClockMs();
     lastDragX_ = float(pt.x) / surface_.Scale();
     pressed_ = HitAt(pt);
-    searchFocused_ = pressed_ == kSearch;
+    if (namingFolder_ && pressed_ != kFolderTitle)
+        FinishFolderNaming(true);
+    searchFocused_ = !namingFolder_ && pressed_ == kSearch;
     surface_.Invalidate();
 }
 
@@ -264,37 +289,134 @@ void Launchpad::Release(POINT pt)
     const int at = HitAt(pt);
     if (was >= 0 && at == was)
         Launch(was);
-    else if (was <= -2 && was != kGlass && at == was)
+    else if (was == kFolderTitle && at == kFolderTitle && IsCustomFolder(openFolder_))
+        StartFolderNaming();
+    else if (was <= -2 && was > kFolderTitle && at == was)
         SetPage(-2 - was);
-    else if (was == kGlass && at == kGlass && folderOpen_ && query_.empty())
-        ShowFolder(false); // the empty glass around a folder's apps closes the folder
+    else if (was == kGlass && at == kGlass && !openFolder_.empty() && query_.empty())
+        ShowFolder({}); // the empty glass around a folder's apps closes the folder
     else if (was == kGlass && at == kGlass && full_)
         Close(false); // all of the screen: its empty glass is the outside
     surface_.Invalidate();
 }
 
-void Launchpad::AppMenu(POINT pt)
+void Launchpad::OpenFolderMenu(const std::wstring& folderId, POINT screen)
 {
-    const int at = closing_ || down_ || lifted_ >= 0 ? kGlass : HitAt(pt);
-    if (at < 0 || size_t(at) >= Shown().size() || Shown()[size_t(at)].id == kFolderId || !onAppMenu)
+    if (!menu || !IsCustomFolder(folderId))
         return;
     menuOpen_ = true;
     hover_ = -1;
     surface_.Invalidate();
-    onAppMenu(Shown()[size_t(at)], surface_.ContentToScreen(pt), [this](bool picked) {
-        menuOpen_ = false;
-        if (!surface_.Visible() || closing_)
-            return;
-        // Back to Launchpad, unless a row was picked or the click that closed the menu went elsewhere.
-        DWORD pid = 0;
-        const HWND fg = GetForegroundWindow();
-        if (fg)
-            GetWindowThreadProcessId(fg, &pid);
-        if (!picked && (!fg || pid == GetCurrentProcessId()))
-            SetForegroundWindow(surface_.Hwnd());
-        else
-            Close(false);
-    });
+    std::vector<MenuEntry> entries = {{Tr(L"Open"), 1}, {Tr(L"Rename"), 2}, {}, {Tr(L"Ungroup folder"), 3}};
+    menu->Open(
+        std::move(entries), screen, MenuPlace::Below,
+        [this, folderId](int cmd) {
+            if (cmd == 1)
+                ShowFolder(folderId);
+            else if (cmd == 2) {
+                ShowFolder(folderId);
+                StartFolderNaming();
+            } else if (cmd == 3)
+                UngroupFolder(folderId);
+        },
+        [this] {
+            menuOpen_ = false;
+            if (!surface_.Visible() || closing_)
+                return;
+            DWORD pid = 0;
+            const HWND fg = GetForegroundWindow();
+            if (fg)
+                GetWindowThreadProcessId(fg, &pid);
+            if (!fg || pid == GetCurrentProcessId())
+                SetForegroundWindow(surface_.Hwnd());
+            else
+                Close(false);
+        });
+}
+
+void Launchpad::OpenBackgroundMenu(POINT screen)
+{
+    if (!menu || layout_.hidden.empty())
+        return;
+    menuOpen_ = true;
+    hover_ = -1;
+    surface_.Invalidate();
+    std::vector<MenuEntry> entries = {{Tr(L"Removed from Launchpad"), 0, false, false, true}};
+    std::vector<std::wstring> hiddenIds;
+    const size_t limit = std::min<size_t>(12, layout_.hidden.size());
+    for (size_t i = 0; i < limit; ++i) {
+        const std::wstring& id = layout_.hidden[i];
+        auto it = std::ranges::find(apps_, id, &CatalogApp::id);
+        hiddenIds.push_back(id);
+        entries.push_back({it != apps_.end() ? it->name : id, 100 + int(i)});
+    }
+    entries.push_back({});
+    entries.push_back({Tr(L"Restore all removed apps"), 1});
+    menu->Open(
+        std::move(entries), screen, MenuPlace::Below,
+        [this, hiddenIds = std::move(hiddenIds)](int cmd) {
+            if (cmd == 1)
+                RestoreAllHidden();
+            else if (cmd >= 100 && size_t(cmd - 100) < hiddenIds.size())
+                RestoreApp(hiddenIds[size_t(cmd - 100)]);
+        },
+        [this] {
+            menuOpen_ = false;
+            if (!surface_.Visible() || closing_)
+                return;
+            DWORD pid = 0;
+            const HWND fg = GetForegroundWindow();
+            if (fg)
+                GetWindowThreadProcessId(fg, &pid);
+            if (!fg || pid == GetCurrentProcessId())
+                SetForegroundWindow(surface_.Hwnd());
+            else
+                Close(false);
+        });
+}
+
+void Launchpad::AppMenu(POINT pt)
+{
+    const int at = closing_ || down_ || lifted_ >= 0 ? kGlass : HitAt(pt);
+    const POINT screen = surface_.ContentToScreen(pt);
+    if (at == kGlass) {
+        if (!closing_ && !down_ && lifted_ < 0 && query_.empty() && openFolder_.empty() && !layout_.hidden.empty())
+            OpenBackgroundMenu(screen);
+        return;
+    }
+    if (at < 0 || size_t(at) >= Shown().size())
+        return;
+    const CatalogApp app = Shown()[size_t(at)];
+    if (IsCustomFolder(app.id)) {
+        OpenFolderMenu(app.id, screen);
+        return;
+    }
+    if (FolderApps(app.id) != nullptr || !onAppMenu)
+        return;
+    std::vector<AppMenuExtra> extras;
+    if (IsCustomFolder(openFolder_))
+        extras.push_back({Tr(L"Remove from folder"), [this, f = openFolder_, id = app.id] { RemoveAppFromFolder(f, id); }, true, true});
+    extras.push_back({Tr(L"Remove from Launchpad"), [this, app] { HideApp(app); }, !IsCustomFolder(openFolder_), true});
+    menuOpen_ = true;
+    hover_ = -1;
+    surface_.Invalidate();
+    onAppMenu(
+        app, screen,
+        [this](bool picked) {
+            menuOpen_ = false;
+            if (!surface_.Visible() || closing_)
+                return;
+            // Back to Launchpad, unless a row was picked or the click that closed the menu went elsewhere.
+            DWORD pid = 0;
+            const HWND fg = GetForegroundWindow();
+            if (fg)
+                GetWindowThreadProcessId(fg, &pid);
+            if (!picked && (!fg || pid == GetCurrentProcessId()))
+                SetForegroundWindow(surface_.Hwnd());
+            else
+                Close(false);
+        },
+        std::move(extras));
 }
 
 void Launchpad::Wheel(int delta)
@@ -306,10 +428,14 @@ void Launchpad::Wheel(int delta)
     while (wheel_ >= WHEEL_DELTA) {
         wheel_ -= WHEEL_DELTA;
         SetPage(page_ - 1);
+        if (lifted_ >= 0)
+            UpdateDragTarget();
     }
     while (wheel_ <= -WHEEL_DELTA) {
         wheel_ += WHEEL_DELTA;
         SetPage(page_ + 1);
+        if (lifted_ >= 0)
+            UpdateDragTarget();
     }
 }
 
@@ -338,8 +464,8 @@ void Launchpad::Launch(int index)
     if (index < 0 || size_t(index) >= Shown().size())
         return;
     const CatalogApp app = Shown()[size_t(index)];
-    if (app.id == kFolderId) {
-        ShowFolder(true);
+    if (FolderApps(app.id) != nullptr) {
+        ShowFolder(app.id);
         return;
     }
     Close(true);
@@ -354,8 +480,10 @@ void Launchpad::PlaceIme()
         RECT win{};
         GetWindowRect(hwnd, &win);
         const RECT content = surface_.Rect();
-        const D2D1_RECT_F field = SearchRect();
-        const float s = surface_.Scale(), x = caretX_ > 0 ? caretX_ : field.left + 36, y = field.bottom + 4;
+        const D2D1_RECT_F field = namingFolder_ ? folderTitleRect_ : SearchRect();
+        const float s = surface_.Scale();
+        const float x = namingFolder_ ? (field.left + field.right) * 0.5f : caretX_ > 0 ? caretX_ : field.left + 36;
+        const float y = field.bottom + 4;
         const POINT pos{content.left - win.left + LONG(x * s), content.top - win.top + LONG(y * s)};
         COMPOSITIONFORM cf{};
         cf.dwStyle = CFS_POINT;

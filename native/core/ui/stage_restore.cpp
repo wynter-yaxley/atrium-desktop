@@ -3,6 +3,7 @@
 #include "ui/stage_manager.h"
 
 #include "log.h"
+#include "shell/process_integrity.h"
 
 #include <algorithm>
 
@@ -90,6 +91,7 @@ void StageManager::RestoreAll()
     ReleaseUp();
     items_.clear();
     excludedWindows_.clear();
+    higherIntegrityLogged_.clear();
     shrinkAfterFlight_ = false;
     // Pictures on their way back: their windows come up now.
     for (Flight& f : flights_)
@@ -118,6 +120,15 @@ void StageManager::RestoreAll()
     placeholders_.clear();
     Save();
     Rebuild();
+}
+
+bool StageManager::IsHigherIntegrity(HWND window, const std::wstring& appKey)
+{
+    if (!WindowHasHigherIntegrity(window))
+        return false;
+    if (higherIntegrityLogged_.insert(window).second)
+        Log(L"stage: skip %s (%p): higher integrity level (UIPI)", appKey.c_str(), window);
+    return true;
 }
 
 void StageManager::UnparkDirect(HWND h, bool showQuietly, ULONGLONG now)

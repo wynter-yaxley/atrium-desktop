@@ -29,4 +29,5 @@ struct NoticeActionEnv {
 };
 bool RunNoticeAction(const NoticeActionEnv& env, const Notice& n);
 void WithdrawForegroundMessenger(MessengerAlerts& alerts, Notifications* notes);
+Notice BuildMessengerCardNotice(Messenger m, DWORD pid, const MessengerSourceMeta& meta);
 } // namespace atrium

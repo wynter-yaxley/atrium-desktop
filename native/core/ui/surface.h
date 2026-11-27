@@ -173,7 +173,7 @@ public:
     // Shows the content at `rect` (screen px), popping out of `anchor` (a
     // screen point); activatable surfaces take the foreground.
     void Show(RECT rect, bool activate, POINT anchor, bool pop = true); // pop: false appears in place (a hand-over from another popup)
-    void Move(RECT rect);
+    void Move(RECT rect, bool keepZOrder = false);
     // Only `dip` (content coordinates) and the shadow margin round it are on screen and take
     // clicks, which elsewhere reach the windows below; an empty rectangle: the whole window. A
     // popup whose pieces change size inside a window that does not (the start menu).
@@ -212,12 +212,15 @@ private:
     bool HandleMouse(UINT m, LPARAM& l);
     void Paint();      // the frame now, unless one is being drawn: then the one after
     void PaintFrame();
+    bool PrepareSwapTarget(int w, int h);
+    void SetupCanvasInk(Canvas& c);
     void Present();
     bool EnsureDevice();
     void ResetDevice();
+    void RecoverDevice();
     void RetryFrame();
-    void Place(RECT rect); // texture = content + margin; desktop HWND stays stationary
-    void ApplyPlacement();
+    void Place(RECT rect, bool keepZOrder = false); // texture = content + margin; desktop HWND stays stationary
+    void ApplyPlacement(bool keepZOrder = false);
     void ApplyRegion();
     void PublishPanel();
     void StartGlassWait();

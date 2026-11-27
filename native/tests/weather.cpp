@@ -80,27 +80,27 @@ int main()
     RegisterClassW(&wc);
     auto ms = [](Clock::time_point t0) { return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count(); };
 
-    // 1. Blocked fetch detaches quickly and never posts even to a live window.
+    // 1. Teardown signals quit, joins the worker cleanly, and never posts even if the fetcher returns true.
     HWND n1 = CreateNotifyWindow();
     auto entered = ev(), release = ev(), finished = ev();
-    auto s1 = std::make_unique<atrium::WeatherSource>(n1, kWeatherMsg, [entered, release, finished](const std::atomic_bool&, atrium::Weather&) {
+    auto s1 = std::make_unique<atrium::WeatherSource>(n1, kWeatherMsg, [entered, release, finished](const std::atomic_bool& quit, atrium::Weather& out) {
         SetEvent(entered.get());
-        WaitForSingleObject(release.get(), 5000);
+        while (!quit && WaitForSingleObject(release.get(), 10) == WAIT_TIMEOUT) {}
+        out = {.ok = true, .city = L"CancelledCity", .temp = 10.0f};
         SetEvent(finished.get());
-        return false;
+        return true;
     });
     s1->SetActive(true);
     check(WaitForSingleObject(entered.get(), 3000) == WAIT_OBJECT_0, "worker entered blocked fetcher");
     auto t0 = Clock::now();
     s1.reset();
-    check(ms(t0) < 800, "destructor detaches quickly");
-    SetEvent(release.get());
-    check(WaitForSingleObject(finished.get(), 3000) == WAIT_OBJECT_0, "detached fetcher finished cleanly");
+    check(ms(t0) < 800, "destructor joins cleanly once quit interrupts the fetcher");
+    check(WaitForSingleObject(finished.get(), 0) == WAIT_OBJECT_0, "worker finished before destructor returned");
     for (auto dl = Clock::now() + std::chrono::milliseconds(30); Clock::now() < dl;) {
         for (MSG msg; PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE); DispatchMessageW(&msg)) {}
         MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
     }
-    check(!g_notified, "detached worker does not post to live notify window");
+    check(!g_notified, "cancelled worker does not post to live notify window");
     DestroyWindow(n1);
 
     // 2. Cooperative cancel joins well below the 250 ms detach threshold.

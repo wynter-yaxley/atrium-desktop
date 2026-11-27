@@ -67,6 +67,8 @@ int main()
               !both.wifi && both.network == L"CorpNet" && both.signal == 0 && noPri.online && noPri.connected && !noPri.wifi && noPri.network == L"LAN",
           "DeriveNetworkStatus");
     Check(FormatNetworkTooltip(single) == L"Wi-Fi Home", "single wifi unknown signal omits signal");
+    SystemStatus airplaneOnly{.connected = false, .airplane = true};
+    Check(FormatNetworkTooltip(airplaneOnly) == L"Airplane mode", "disconnected airplane mode tooltip");
     single.links = {{K::Wifi, 2, L"Wi-Fi", L"", true, false, -1},
                     {K::Ethernet, 1, L"Ethernet", L"Office", true, true, -1},
                     {K::Other, 3, L"WWAN", L"5G", false, false, -1},

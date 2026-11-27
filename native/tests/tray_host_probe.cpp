@@ -43,15 +43,61 @@ LRESULT CALLBACK IconProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
 void Pump(DWORD ms)
 {
+    HANDLE timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    if (timer) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(ms) * 10000LL;
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+    }
     const ULONGLONG until = GetTickCount64() + ms;
-    while (GetTickCount64() < until) {
+    for (;;) {
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
-        Sleep(10);
+        const ULONGLONG now = GetTickCount64();
+        if (now >= until)
+            break;
+        const DWORD remaining = static_cast<DWORD>(until - now);
+        if (timer) {
+            if (MsgWaitForMultipleObjects(1, &timer, FALSE, remaining, QS_ALLINPUT) == WAIT_OBJECT_0)
+                break;
+        } else {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, remaining, QS_ALLINPUT);
+        }
     }
+    if (timer)
+        CloseHandle(timer);
+}
+
+DWORD RunSelfAndWait(const wchar_t* argument, DWORD fallbackExit)
+{
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring command = L"\"" + std::wstring(self) + L"\" " + argument;
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    DWORD code = fallbackExit;
+    if (CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        const ULONGLONG deadline = GetTickCount64() + 10000;
+        for (;;) {
+            MSG m;
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline)
+                break;
+            if (MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, DWORD(deadline - now), QS_ALLINPUT) == WAIT_OBJECT_0)
+                break;
+        }
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return code;
 }
 
 DWORD FirstTrayPid()
@@ -94,6 +140,87 @@ int Fake()
     Pump(3000);
     DestroyWindow(w);
     return 0;
+}
+
+void ExerciseIconActions(TrayHost& host, HWND window)
+{
+    NOTIFYICONDATAW v0 = Data(window, false), v4 = Data(window, true);
+    Check(Shell_NotifyIconW(NIM_ADD, &v0) != FALSE, "add (protocol 0)");
+    Check(Shell_NotifyIconW(NIM_ADD, &v4) != FALSE, "add (protocol 4, GUID)");
+    v4.uVersion = NOTIFYICON_VERSION_4;
+    Check(Shell_NotifyIconW(NIM_SETVERSION, &v4) != FALSE, "set version 4");
+    Pump(200);
+    auto icons = host.Icons();
+    const HostIcon* a = Find(icons, L"Atrium probe v0");
+    const HostIcon* b = Find(icons, L"Atrium probe v4");
+    Check(a && a->image && a->version == 0 && a->callback == kCallback && a->uid == 1, "the host has the protocol 0 icon, its picture and callback");
+    Check(b && b->image && b->version == 4 && b->key.starts_with(L"guid:"), "the host has the GUID icon at protocol 4");
+
+    // A changed tip is live in the host.
+    wcscpy_s(v0.szTip, L"Atrium probe v0 changed");
+    v0.uFlags = NIF_TIP;
+    Check(Shell_NotifyIconW(NIM_MODIFY, &v0) != FALSE, "modify");
+    Pump(100);
+    icons = host.Icons();
+    a = Find(icons, L"Atrium probe v0 changed");
+    b = Find(icons, L"Atrium probe v4");
+    Check(a != nullptr, "the change is live in the host");
+
+    const POINT at{321, 654};
+    if (a) {
+        g_got.clear();
+        Check(host.Send(a->key, tray::HostAction::Left, at) == HostSendStatus::Sent, "send a click (protocol 0)");
+        Pump(150);
+        Check(g_got.size() == 3 && g_got[0].first == 1 && g_got[1].second == WM_LBUTTONDOWN && g_got[2].second == WM_LBUTTONUP,
+              "protocol 0 click: id in wParam, MOVE DOWN UP");
+    }
+    if (b) {
+        g_got.clear();
+        Check(host.Send(b->key, tray::HostAction::Right, at) == HostSendStatus::Sent, "send a right click (protocol 4)");
+        Pump(150);
+        Check(g_got.size() == 4 && LOWORD(g_got[3].second) == WM_CONTEXTMENU && HIWORD(g_got[3].second) == 2 && short(LOWORD(g_got[3].first)) == 321 &&
+                  short(HIWORD(g_got[3].first)) == 654,
+              "protocol 4 right click ends in WM_CONTEXTMENU at the pointer");
+        g_got.clear();
+        host.Send(b->key, tray::HostAction::Double, at);
+        Pump(150);
+        Check(g_got.size() == 6 && LOWORD(g_got[3].second) == NIN_SELECT && LOWORD(g_got[4].second) == WM_LBUTTONDBLCLK,
+              "protocol 4 double click: the click, NIN_SELECT, then WM_LBUTTONDBLCLK");
+        host.SetPlaces(RECT{10, 10, 50, 50});
+        // Asked from another process, as an app asks.
+        const DWORD code = RunSelfAndWait(L"--rect", 0);
+        std::printf("      (left %ld)\n", long(int(code)));
+        Check(int(code) == at.x - 16, "an app asking where its icon is gets the place of the click");
+    }
+}
+
+void ExerciseMalformedAndYield(TrayHost& host)
+{
+    // Malformed data must neither crash the host nor stop it.
+    HWND first = FindWindowW(L"Shell_TrayWnd", nullptr);
+    DWORD junk = 0x34753423;
+    COPYDATASTRUCT bad{1, sizeof(junk), &junk};
+    DWORD_PTR answer = 0;
+    SendMessageTimeoutW(first, WM_COPYDATA, 0, LPARAM(&bad), SMTO_BLOCK, 3000, &answer);
+    COPYDATASTRUCT empty{3, 0, nullptr};
+    SendMessageTimeoutW(first, WM_COPYDATA, 0, LPARAM(&empty), SMTO_BLOCK, 3000, &answer);
+    Check(host.Running() && SendMessageTimeoutW(first, WM_NULL, 0, 0, SMTO_BLOCK, 1000, &answer), "malformed data: the host still answers");
+
+    // Another program's tray host in front: left there, and back after it.
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring command = L"\"" + std::wstring(self) + L"\" --fake";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        Pump(1000);
+        Check(host.Yielded() && FirstTrayPid() == pi.dwProcessId, "another tray host in front is left there");
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        Pump(800);
+        Check(!host.Yielded() && FirstTrayPid() == GetCurrentProcessId(), "after it, the host is in front again");
+    }
 }
 
 } // namespace
@@ -140,109 +267,10 @@ int wmain(int argc, wchar_t** argv)
         abd.lParam = LPARAM(stateBefore);
         AppBarMessage(ABM_SETSTATE, abd);
         Check(SHAppBarMessage(ABM_GETSTATE, &state) == stateBefore, "setting the taskbar state reaches Explorer while the host is first");
-        {
-            wchar_t self[MAX_PATH];
-            GetModuleFileNameW(nullptr, self, MAX_PATH);
-            std::wstring command = L"\"" + std::wstring(self) + L"\" --appbar";
-            STARTUPINFOW si{sizeof(si)};
-            PROCESS_INFORMATION pi{};
-            DWORD code = 1;
-            if (CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                while (WaitForSingleObject(pi.hProcess, 10) == WAIT_TIMEOUT)
-                    Pump(10);
-                GetExitCodeProcess(pi.hProcess, &code);
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-            }
-            Check(code == 0, "app bar messages reach Explorer through the host (another process)");
-        }
+        Check(RunSelfAndWait(L"--appbar", 1) == 0, "app bar messages reach Explorer through the host (another process)");
 
-        NOTIFYICONDATAW v0 = Data(window, false), v4 = Data(window, true);
-        Check(Shell_NotifyIconW(NIM_ADD, &v0) != FALSE, "add (protocol 0)");
-        Check(Shell_NotifyIconW(NIM_ADD, &v4) != FALSE, "add (protocol 4, GUID)");
-        v4.uVersion = NOTIFYICON_VERSION_4;
-        Check(Shell_NotifyIconW(NIM_SETVERSION, &v4) != FALSE, "set version 4");
-        Pump(200);
-        auto icons = host.Icons();
-        const HostIcon* a = Find(icons, L"Atrium probe v0");
-        const HostIcon* b = Find(icons, L"Atrium probe v4");
-        Check(a && a->image && a->version == 0 && a->callback == kCallback && a->uid == 1, "the host has the protocol 0 icon, its picture and callback");
-        Check(b && b->image && b->version == 4 && b->key.starts_with(L"guid:"), "the host has the GUID icon at protocol 4");
-
-        // A changed tip is live in the host.
-        wcscpy_s(v0.szTip, L"Atrium probe v0 changed");
-        v0.uFlags = NIF_TIP;
-        Check(Shell_NotifyIconW(NIM_MODIFY, &v0) != FALSE, "modify");
-        Pump(100);
-        icons = host.Icons();
-        a = Find(icons, L"Atrium probe v0 changed");
-        b = Find(icons, L"Atrium probe v4");
-        Check(a != nullptr, "the change is live in the host");
-
-        const POINT at{321, 654};
-        if (a) {
-            g_got.clear();
-            Check(host.Send(a->key, tray::HostAction::Left, at), "send a click (protocol 0)");
-            Pump(150);
-            Check(g_got.size() == 3 && g_got[0].first == 1 && g_got[1].second == WM_LBUTTONDOWN && g_got[2].second == WM_LBUTTONUP,
-                  "protocol 0 click: id in wParam, MOVE DOWN UP");
-        }
-        if (b) {
-            g_got.clear();
-            Check(host.Send(b->key, tray::HostAction::Right, at), "send a right click (protocol 4)");
-            Pump(150);
-            Check(g_got.size() == 4 && LOWORD(g_got[3].second) == WM_CONTEXTMENU && HIWORD(g_got[3].second) == 2 && short(LOWORD(g_got[3].first)) == 321 &&
-                      short(HIWORD(g_got[3].first)) == 654,
-                  "protocol 4 right click ends in WM_CONTEXTMENU at the pointer");
-            g_got.clear();
-            host.Send(b->key, tray::HostAction::Double, at);
-            Pump(150);
-            Check(g_got.size() == 6 && LOWORD(g_got[3].second) == NIN_SELECT && LOWORD(g_got[4].second) == WM_LBUTTONDBLCLK,
-                  "protocol 4 double click: the click, NIN_SELECT, then WM_LBUTTONDBLCLK");
-            host.SetPlaces(RECT{10, 10, 50, 50});
-            // Asked from another process, as an app asks.
-            wchar_t self[MAX_PATH];
-            GetModuleFileNameW(nullptr, self, MAX_PATH);
-            std::wstring command = L"\"" + std::wstring(self) + L"\" --rect";
-            STARTUPINFOW si{sizeof(si)};
-            PROCESS_INFORMATION pi{};
-            DWORD code = 0;
-            if (CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                while (WaitForSingleObject(pi.hProcess, 10) == WAIT_TIMEOUT)
-                    Pump(10);
-                GetExitCodeProcess(pi.hProcess, &code);
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-            }
-            std::printf("      (left %ld)\n", long(int(code)));
-            Check(int(code) == at.x - 16, "an app asking where its icon is gets the place of the click");
-        }
-
-        // Malformed data must neither crash the host nor stop it.
-        HWND first = FindWindowW(L"Shell_TrayWnd", nullptr);
-        DWORD junk = 0x34753423;
-        COPYDATASTRUCT bad{1, sizeof(junk), &junk};
-        DWORD_PTR answer = 0;
-        SendMessageTimeoutW(first, WM_COPYDATA, 0, LPARAM(&bad), SMTO_BLOCK, 3000, &answer);
-        COPYDATASTRUCT empty{3, 0, nullptr};
-        SendMessageTimeoutW(first, WM_COPYDATA, 0, LPARAM(&empty), SMTO_BLOCK, 3000, &answer);
-        Check(host.Running() && SendMessageTimeoutW(first, WM_NULL, 0, 0, SMTO_BLOCK, 1000, &answer), "malformed data: the host still answers");
-
-        // Another program's tray host in front: left there, and back after it.
-        wchar_t self[MAX_PATH];
-        GetModuleFileNameW(nullptr, self, MAX_PATH);
-        std::wstring command = L"\"" + std::wstring(self) + L"\" --fake";
-        STARTUPINFOW si{sizeof(si)};
-        PROCESS_INFORMATION pi{};
-        if (CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            Pump(1000);
-            Check(host.Yielded() && FirstTrayPid() == pi.dwProcessId, "another tray host in front is left there");
-            WaitForSingleObject(pi.hProcess, 5000);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            Pump(800);
-            Check(!host.Yielded() && FirstTrayPid() == GetCurrentProcessId(), "after it, the host is in front again");
-        }
+        ExerciseIconActions(host, window);
+        ExerciseMalformedAndYield(host);
         kept = true;
     }
     // The host is gone: Explorer takes the calls, and it has had every icon all along.

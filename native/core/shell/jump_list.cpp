@@ -33,15 +33,19 @@ std::vector<BYTE> ReadFileBytes(const std::wstring& path)
 {
     std::vector<BYTE> bytes;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    if (file == INVALID_HANDLE_VALUE) {
+        if (const DWORD err = GetLastError(); err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+            Log(L"jump: CreateFileW failed (%lu)", err);
         return bytes;
+    }
     LARGE_INTEGER size{};
     if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (1 << 24)) {
         bytes.resize(size_t(size.QuadPart));
         DWORD got = 0;
-        if (!ReadFile(file, bytes.data(), DWORD(bytes.size()), &got, nullptr))
+        if (!ReadFile(file, bytes.data(), DWORD(bytes.size()), &got, nullptr)) {
+            Log(L"jump: ReadFile failed (%lu)", GetLastError());
             bytes.clear();
-        else
+        } else
             bytes.resize(got);
     }
     CloseHandle(file);
@@ -52,18 +56,27 @@ std::vector<BYTE> ReadStream(IStorage* storage, const wchar_t* name)
 {
     std::vector<BYTE> bytes;
     winrt::com_ptr<IStream> stream;
-    if (FAILED(storage->OpenStream(name, nullptr, STGM_READ | STGM_SHARE_EXCLUSIVE, 0, stream.put())) || !stream)
+    if (const HRESULT hr = storage->OpenStream(name, nullptr, STGM_READ | STGM_SHARE_EXCLUSIVE, 0, stream.put()); FAILED(hr) || !stream) {
+        if (FAILED(hr) && hr != STG_E_FILENOTFOUND)
+            Log(L"jump: OpenStream(%s) failed (0x%08X)", name, unsigned(hr));
         return bytes;
+    }
     STATSTG stat{};
-    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart <= 0 || stat.cbSize.QuadPart > (1 << 24))
+    if (const HRESULT hr = stream->Stat(&stat, STATFLAG_NONAME); FAILED(hr) || stat.cbSize.QuadPart <= 0 || stat.cbSize.QuadPart > (1 << 24)) {
+        if (FAILED(hr))
+            Log(L"jump: stream Stat(%s) failed (0x%08X)", name, unsigned(hr));
         return bytes;
+    }
     // A stream can return less than the requested size: keep reading.
     bytes.resize(size_t(stat.cbSize.QuadPart));
     size_t filled = 0;
     while (filled < bytes.size()) {
         ULONG got = 0;
-        if (FAILED(stream->Read(bytes.data() + filled, ULONG(bytes.size() - filled), &got)) || got == 0)
+        if (const HRESULT hr = stream->Read(bytes.data() + filled, ULONG(bytes.size() - filled), &got); FAILED(hr) || got == 0) {
+            if (FAILED(hr))
+                Log(L"jump: stream Read(%s) failed (0x%08X)", name, unsigned(hr));
             break;
+        }
         filled += got;
     }
     bytes.resize(filled);
@@ -182,21 +195,20 @@ bool ParseLinkStrings(const BYTE* data, size_t size, LinkStrings& out)
         } else {
             if (at + count > size)
                 return false;
-            for (uint16_t i = 0; i < count; ++i)
-                into.push_back(wchar_t(data[at + i]));
+            into.clear();
+            if (count > 0) {
+                const char* src = reinterpret_cast<const char*>(data + at);
+                if (const int need = MultiByteToWideChar(CP_ACP, 0, src, int(count), nullptr, 0); need > 0) {
+                    into.resize(size_t(need));
+                    MultiByteToWideChar(CP_ACP, 0, src, int(count), into.data(), need);
+                }
+            }
             at += count;
         }
         return true;
     };
-    if ((flags & 0x4) && !read(out.name))
-        return false;
-    if ((flags & 0x8) && !read(out.relative))
-        return false;
-    if ((flags & 0x10) && !read(out.workDir))
-        return false;
-    if ((flags & 0x20) && !read(out.args))
-        return false;
-    return true;
+    return (!(flags & 0x4) || read(out.name)) && (!(flags & 0x8) || read(out.relative)) && (!(flags & 0x10) || read(out.workDir)) &&
+           (!(flags & 0x20) || read(out.args));
 }
 
 // One entry of the DestList stream (Windows 10/11 layout, version 2 and later).
@@ -325,17 +337,22 @@ bool LoadShellLink(const BYTE* data, size_t size, JumpItem& item, bool needTitle
     if (!stream)
         return false;
     winrt::com_ptr<IPersistStream> persist;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(persist.put()))) || !persist)
-        return false;
-    if (FAILED(persist->Load(stream.get())))
-        return false;
     winrt::com_ptr<IShellLinkW> link;
-    if (FAILED(persist->QueryInterface(IID_PPV_ARGS(link.put()))) || !link)
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(persist.put()));
+    if (SUCCEEDED(hr) && persist)
+        hr = persist->Load(stream.get());
+    if (SUCCEEDED(hr))
+        hr = persist->QueryInterface(IID_PPV_ARGS(link.put()));
+    if (FAILED(hr) || !link) {
+        Log(L"jump: loading shell link failed (0x%08X)", unsigned(hr));
         return false;
+    }
     wchar_t target[1024]{};
     wchar_t args[1024]{};
-    link->GetPath(target, 1024, nullptr, SLGP_RAWPATH);
-    link->GetArguments(args, 1024);
+    if (const HRESULT pathHr = link->GetPath(target, 1024, nullptr, SLGP_RAWPATH); FAILED(pathHr))
+        Log(L"jump: ShellLink GetPath failed (0x%08X)", unsigned(pathHr));
+    if (const HRESULT argsHr = link->GetArguments(args, 1024); FAILED(argsHr))
+        Log(L"jump: ShellLink GetArguments failed (0x%08X)", unsigned(argsHr));
     item.program = target;
     item.args = args;
     LinkStrings strings;
@@ -401,11 +418,24 @@ std::wstring RecentFolder()
 {
     PWSTR path = nullptr;
     std::wstring out;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &path)) && path) {
+    if (const HRESULT hr = SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &path); SUCCEEDED(hr) && path) {
         out = path;
         CoTaskMemFree(path);
+    } else {
+        Log(L"jump: SHGetKnownFolderPath(FOLDERID_Recent) failed (0x%08X)", unsigned(hr));
     }
     return out;
+}
+
+bool ResolveShellPath(std::wstring& path)
+{
+    if (!path.starts_with(L"knownfolder:") && !path.starts_with(L"::"))
+        return true;
+    const std::wstring resolved = ShellDisplayName(path, SIGDN_DESKTOPABSOLUTEPARSING);
+    if (resolved.empty())
+        return false;
+    path = resolved;
+    return true;
 }
 
 JumpItem ItemForPath(const std::wstring& parsingName)
@@ -415,9 +445,7 @@ JumpItem ItemForPath(const std::wstring& parsingName)
     if (path.starts_with(L"knownfolder:") || path.starts_with(L"::")) {
         // A known folder or shell namespace item: the shell knows its real path and name.
         item.name = ShellDisplayName(parsingName, SIGDN_NORMALDISPLAY);
-        const std::wstring resolved = ShellDisplayName(parsingName, SIGDN_DESKTOPABSOLUTEPARSING);
-        if (!resolved.empty())
-            path = resolved;
+        ResolveShellPath(path);
     }
     if (item.name.empty())
         item.name = BaseName(path);
@@ -510,18 +538,16 @@ void BuildIndex(const std::atomic<bool>& stop)
                 break;
             const std::wstring hash = std::wstring(found.cFileName).substr(0, 16);
             winrt::com_ptr<IStorage> storage;
-            if (FAILED(StgOpenStorage((recent + L"\\AutomaticDestinations\\" + found.cFileName).c_str(), nullptr, STGM_READ | STGM_SHARE_DENY_WRITE, nullptr, 0,
-                                      storage.put())) ||
-                !storage)
+            const std::wstring fullPath = recent + L"\\AutomaticDestinations\\" + found.cFileName;
+            if (const HRESULT hr = StgOpenStorage(fullPath.c_str(), nullptr, STGM_READ | STGM_SHARE_DENY_WRITE, nullptr, 0, storage.put());
+                FAILED(hr) || !storage) {
+                Log(L"jump list: StgOpenStorage(%s) failed (0x%08X)", hash.c_str(), unsigned(hr));
                 continue;
+            }
             for (const DestEntry& entry : ParseDestList(ReadStream(storage.get(), L"DestList"))) {
                 std::wstring path = entry.real;
-                if (path.starts_with(L"knownfolder:") || path.starts_with(L"::")) {
-                    const std::wstring resolved = ShellDisplayName(path, SIGDN_DESKTOPABSOLUTEPARSING);
-                    if (resolved.empty())
-                        continue;
-                    path = resolved;
-                }
+                if (!ResolveShellPath(path))
+                    continue;
                 RecordIndexHash(byPath, FoldCase(path), hash);
             }
         } while (FindNextFileW(search, &found));
@@ -625,6 +651,87 @@ std::wstring ResolveJumpHash(const std::wstring& appId, const std::wstring& exeP
     return hash;
 }
 
+std::vector<DestEntry> LoadAutomaticEntries(const std::wstring& recent, const std::wstring& hash, std::vector<JumpItem>& outPinned)
+{
+    std::vector<DestEntry> recentEntries;
+    winrt::com_ptr<IStorage> storage;
+    const std::wstring path = recent + L"\\AutomaticDestinations\\" + hash + L".automaticDestinations-ms";
+    const HRESULT hr = StgOpenStorage(path.c_str(), nullptr, STGM_READ | STGM_SHARE_DENY_WRITE, nullptr, 0, storage.put());
+    if (FAILED(hr) || !storage) {
+        if (FAILED(hr) && hr != STG_E_FILENOTFOUND)
+            Log(L"jump: StgOpenStorage(%s) failed (0x%08X)", hash.c_str(), unsigned(hr));
+        return recentEntries;
+    }
+    std::vector<DestEntry> pinnedEntries;
+    std::vector<DestEntry> entries = ParseDestList(ReadStream(storage.get(), L"DestList"));
+    Log(L"jump: parsed %zu entries from %s", entries.size(), hash.c_str());
+    for (DestEntry& entry : entries) {
+        if (entry.path.empty() || (entry.pin <= 0 && recentEntries.size() >= 24))
+            continue;
+        if (!ResolveShellPath(entry.real)) {
+            Log(L"jump: shell name '%s' does not resolve", entry.real.c_str());
+            continue;
+        }
+        // A network item is kept without asking: an offline share answers in
+        // tens of seconds, and the entry is the system's own recent item.
+        if (!entry.real.starts_with(L"::") && !IsRemoteShare(entry.real) && GetFileAttributesW(entry.real.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            if (entry.pin > 0)
+                Log(L"jump: pinned %d dropped '%s'", entry.pin, entry.real.c_str());
+            continue; // a drive that is gone: opening it would land on Documents
+        }
+        if (entry.pin > 0)
+            Log(L"jump: pinned %d '%s' -> '%s'", entry.pin, entry.path.c_str(), entry.real.c_str());
+        (entry.pin > 0 ? pinnedEntries : recentEntries).push_back(std::move(entry));
+    }
+    std::ranges::stable_sort(pinnedEntries, [](const DestEntry& a, const DestEntry& b) { return a.pin < b.pin; });
+    for (const DestEntry& entry : pinnedEntries)
+        outPinned.push_back(ItemForPath(entry.path));
+    return recentEntries;
+}
+
+std::vector<JumpItem> BuildRecentItems(const std::vector<DestEntry>& entries, const std::wstring& exePath, size_t max)
+{
+    std::vector<JumpItem> items;
+    for (const DestEntry& entry : entries) {
+        if (items.size() >= max)
+            break;
+        JumpItem item = ItemForPath(entry.path);
+        if (!item.folder && !exePath.empty()) {
+            item.program = exePath; // the app opened it, so the app reopens it
+            item.args = L"\"" + item.target + L"\"";
+        }
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+bool LoadCustomCategories(const std::wstring& recent, const std::wstring& hash, const std::vector<DestEntry>& recentEntries, const std::wstring& exePath,
+                          std::vector<JumpCategory>& outCategories)
+{
+    bool recentCovered = false;
+    const auto bytes = ReadFileBytes(recent + L"\\CustomDestinations\\" + hash + L".customDestinations-ms");
+    std::vector<JumpCategory> named, known, tasks;
+    for (CustomCategory& category : ParseCustom(bytes)) {
+        JumpCategory out{category.title, std::move(category.items)};
+        if (category.type == 1) {
+            out.title = category.known == 1 ? L"Frequent" : L"Recent";
+            recentCovered = true;
+            // A known category is not stored in the file: its rows are the automatic list.
+            if (out.items.empty())
+                out.items = BuildRecentItems(recentEntries, exePath, 5);
+        }
+        if (out.items.empty())
+            continue;
+        if (category.type == 2 && out.title.empty())
+            out.title = L"Tasks";
+        (category.type == 2 ? tasks : category.type == 1 ? known : named).push_back(std::move(out));
+    }
+    for (auto* group : {&named, &known, &tasks})
+        for (JumpCategory& category : *group)
+            outCategories.push_back(std::move(category));
+    return recentCovered;
+}
+
 } // namespace
 
 bool IsRemotePath(const std::wstring& path) { return IsRemoteShare(path); }
@@ -656,12 +763,10 @@ void StartJumpListIndex(bool enabled)
         // A worker without a message pump must not own an STA: the UI thread's
         // shell calls would have to marshal into it and wait for a timeout.
         const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        try {
+        if (SUCCEEDED(com) || com == RPC_E_CHANGED_MODE)
             BuildIndex(runner.stop);
-        } catch (...) {
-            if (!runner.stop.load(std::memory_order_relaxed))
-                Log(L"jump list: index failed");
-        }
+        else if (!runner.stop.load(std::memory_order_relaxed))
+            Log(L"jump list: CoInitializeEx failed (0x%08X)", unsigned(com));
         if (SUCCEEDED(com))
             CoUninitialize();
         FileIndex& index = Index();
@@ -675,103 +780,17 @@ std::shared_ptr<const JumpListData> LoadJumpList(const std::wstring& appId, cons
     const std::wstring hash = ResolveJumpHash(appId, exePath);
     if (hash.empty())
         return nullptr;
-
     const std::wstring recent = RecentFolder();
     auto data = std::make_shared<JumpListData>();
-
-    // Automatic destinations: the MRU list, with the pinned entries marked.
-    std::vector<DestEntry> entries;
-    {
-        winrt::com_ptr<IStorage> storage;
-        const std::wstring path = recent + L"\\AutomaticDestinations\\" + hash + L".automaticDestinations-ms";
-        if (SUCCEEDED(StgOpenStorage(path.c_str(), nullptr, STGM_READ | STGM_SHARE_DENY_WRITE, nullptr, 0, storage.put())) && storage)
-            entries = ParseDestList(ReadStream(storage.get(), L"DestList"));
-        Log(L"jump: parsed %zu entries from %s", entries.size(), hash.c_str());
-    }
-    std::vector<DestEntry> pinnedEntries;
-    std::vector<DestEntry> otherEntries;
-    for (DestEntry& entry : entries) {
-        if (entry.path.empty())
-            continue;
-        if (entry.pin <= 0 && otherEntries.size() >= 24)
-            continue;
-        if (entry.real.starts_with(L"knownfolder:") || entry.real.starts_with(L"::")) {
-            const std::wstring resolved = ShellDisplayName(entry.real, SIGDN_DESKTOPABSOLUTEPARSING);
-            if (resolved.empty()) {
-                Log(L"jump: shell name '%s' does not resolve", entry.real.c_str());
-                continue;
-            }
-            entry.real = resolved;
-        }
-        const bool shellItem = entry.real.starts_with(L"::");
-        // A network item is kept without asking: an offline share answers in
-        // tens of seconds, and the entry is the system's own recent item.
-        if (!shellItem && !IsRemoteShare(entry.real) && GetFileAttributesW(entry.real.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            if (entry.pin > 0)
-                Log(L"jump: pinned %d dropped '%s'", entry.pin, entry.real.c_str());
-            continue; // a drive that is gone: opening it would land on Documents
-        }
-        if (entry.pin > 0)
-            Log(L"jump: pinned %d '%s' -> '%s'", entry.pin, entry.path.c_str(), entry.real.c_str());
-        (entry.pin > 0 ? pinnedEntries : otherEntries).push_back(std::move(entry));
-    }
-    std::ranges::stable_sort(pinnedEntries, [](const DestEntry& a, const DestEntry& b) { return a.pin < b.pin; });
-    for (const DestEntry& entry : pinnedEntries)
-        data->pinned.push_back(ItemForPath(entry.path));
-
-    // The automatic list's unpinned entries: what a "recent" or "frequent"
-    // category shows, and the fallback when the app has no such category.
-    const auto recentItems = [&](size_t max) {
-        std::vector<JumpItem> items;
-        for (const DestEntry& entry : otherEntries) {
-            if (items.size() >= max)
-                break;
-            JumpItem item = ItemForPath(entry.path);
-            if (!item.folder && !exePath.empty()) {
-                item.program = exePath; // the app opened it, so the app reopens it
-                item.args = L"\"" + item.target + L"\"";
-            }
-            items.push_back(std::move(item));
-        }
-        return items;
-    };
-
-    // Custom destinations: the app's own categories and tasks.
-    bool recentCovered = false;
-    {
-        const std::wstring path = recent + L"\\CustomDestinations\\" + hash + L".customDestinations-ms";
-        const auto bytes = ReadFileBytes(path);
-        std::vector<JumpCategory> named, known, tasks;
-        for (CustomCategory& category : ParseCustom(bytes)) {
-            JumpCategory out;
-            out.title = category.title;
-            out.items = std::move(category.items);
-            if (category.type == 1) {
-                out.title = category.known == 1 ? L"Frequent" : L"Recent";
-                recentCovered = true;
-                // A known category is not stored in the file: its rows are the automatic list.
-                if (out.items.empty())
-                    out.items = recentItems(5);
-            }
-            if (out.items.empty())
-                continue;
-            (category.type == 2 ? tasks : category.type == 1 ? known : named).push_back(std::move(out));
-        }
-        for (JumpCategory& category : named)
-            data->categories.push_back(std::move(category));
-        for (JumpCategory& category : known)
-            data->categories.push_back(std::move(category));
-        for (JumpCategory& category : tasks) {
-            if (category.title.empty())
-                category.title = L"Tasks";
-            data->categories.push_back(std::move(category));
-        }
-    }
+    if (recent.empty())
+        return data;
+    const std::vector<DestEntry> recentEntries = LoadAutomaticEntries(recent, hash, data->pinned);
+    const bool recentCovered = LoadCustomCategories(recent, hash, recentEntries, exePath, data->categories);
     // An app that registered categories opted out of the automatic recent list:
     // Windows then shows only what it registered (Chrome lists closed tabs and
     // tasks, not the files it was asked to open).
     if (!recentCovered && data->categories.empty())
-        data->recent = recentItems(5);
+        data->recent = BuildRecentItems(recentEntries, exePath, 5);
     return data;
 }
 

@@ -49,6 +49,7 @@ enum MenuCmd : UINT {
     CmdProperties,
 };
 constexpr int kCmdRecent = 2000;
+constexpr int kCmdExtra = 4000;
 
 struct ShellLaunchJob {
     std::wstring verb, file, args, dir;
@@ -176,6 +177,7 @@ struct AppCommandContext {
     std::optional<PinnedApp> pinnedEntry;
     std::wstring appPath;
     std::vector<JumpItem> listed;
+    std::vector<AppMenuExtra> extras;
     POINT pt{};
     MenuPlace place = MenuPlace::Above;
 };
@@ -226,8 +228,12 @@ void ExecuteAppMenuCommand(const AppCommandContext& ctx, int cmd)
         break;
     case CmdProperties: ShowShellProperties(ctx.env.host, ctx.appPath); break;
     default:
-        if (cmd >= kCmdRecent && size_t(cmd - kCmdRecent) < ctx.listed.size())
+        if (cmd >= kCmdExtra && size_t(cmd - kCmdExtra) < ctx.extras.size()) {
+            if (ctx.extras[size_t(cmd - kCmdExtra)].run)
+                ctx.extras[size_t(cmd - kCmdExtra)].run();
+        } else if (cmd >= kCmdRecent && size_t(cmd - kCmdRecent) < ctx.listed.size()) {
             LaunchJumpItem(ctx.listed[size_t(cmd - kCmdRecent)]);
+        }
         break;
     }
 }
@@ -329,7 +335,8 @@ void ShowStartContextMenu(const AppMenuEnv& env, POINT pt)
     env.menu->Open(std::move(entries), pt, BarMenuPlace(env.activeBar(), false), [host = env.host](int id) { RunQuickLink(id, host, WM_NOTICE); });
 }
 
-void ShowAppMenu(const AppMenuEnv& env, const AppMenuTarget& target, POINT pt, MenuPlace place, std::function<void(bool)> done)
+void ShowAppMenu(const AppMenuEnv& env, const AppMenuTarget& target, POINT pt, MenuPlace place, std::function<void(bool)> done,
+                 std::vector<AppMenuExtra> extras)
 {
     const ULONGLONG startedAt = GetTickCount64();
     std::optional<PinnedApp> pinnedEntry;
@@ -363,16 +370,23 @@ void ShowAppMenu(const AppMenuEnv& env, const AppMenuTarget& target, POINT pt, M
     entries.push_back({target.pinned ? Tr(L"Unpin from Atrium") : Tr(L"Pin to Atrium"), int(target.pinned ? CmdUnpin : CmdPin)});
     if (windowsEntries && !appPath.empty())
         entries.push_back({Tr(L"Properties"), CmdProperties});
+    for (size_t i = 0; i < extras.size(); ++i) {
+        if (extras[i].separatorBefore)
+            entries.push_back({});
+        entries.push_back({extras[i].label, kCmdExtra + int(i)});
+    }
     if (!target.windows.empty())
         entries.push_back({target.windows.size() > 1 ? Tr(L"Close All Windows") : Tr(L"Close Window"), CmdClose});
     entries.push_back({Tr(L"Close Program"), CmdTerminate, false, !target.canTerminate});
 
     auto picked = std::make_shared<bool>(false);
-    auto ctx = std::make_shared<AppCommandContext>(AppCommandContext{env, target, std::move(pinnedEntry), appPath, std::move(listed), pt, place});
+    auto ctx =
+        std::make_shared<AppCommandContext>(AppCommandContext{env, target, std::move(pinnedEntry), appPath, std::move(listed), std::move(extras), pt, place});
     env.menu->Open(
         std::move(entries), pt, place,
         [ctx, picked](int cmd) {
-            *picked = cmd != 0;
+            const bool keepOpen = cmd >= kCmdExtra && size_t(cmd - kCmdExtra) < ctx->extras.size() && ctx->extras[size_t(cmd - kCmdExtra)].keepOpen;
+            *picked = cmd != 0 && !keepOpen;
             ExecuteAppMenuCommand(*ctx, cmd);
         },
         [done = std::move(done), picked] {
@@ -389,13 +403,13 @@ void ShowTaskItemMenu(const AppMenuEnv& env, const std::wstring& key, POINT pt)
         ShowAppMenu(env, MenuTargetOf(*env.tasks, *it), pt, BarMenuPlace(env.activeBar(), true));
 }
 
-void ShowCatalogAppMenu(const AppMenuEnv& env, const CatalogApp& app, POINT pt, std::function<void(bool)> done)
+void ShowCatalogAppMenu(const AppMenuEnv& env, const CatalogApp& app, POINT pt, std::function<void(bool)> done, std::vector<AppMenuExtra> extras)
 {
     const std::wstring aumid = FoldCase(app.aumid), exe = FoldCase(app.target);
     const std::vector<TaskItem> all = env.tasks->Snapshot(true);
     auto it = std::ranges::find_if(all, [&](const TaskItem& t) { return (!aumid.empty() && t.key == aumid) || (!exe.empty() && t.key == exe); });
     if (it != all.end()) {
-        ShowAppMenu(env, MenuTargetOf(*env.tasks, *it), pt, MenuPlace::Below, std::move(done));
+        ShowAppMenu(env, MenuTargetOf(*env.tasks, *it), pt, MenuPlace::Below, std::move(done), std::move(extras));
         return;
     }
     AppMenuTarget t;
@@ -410,7 +424,7 @@ void ShowCatalogAppMenu(const AppMenuEnv& env, const CatalogApp& app, POINT pt, 
         if (const auto& pins = env.server->Current().pins)
             if (auto p = std::ranges::find_if(*pins, [&](const PinnedApp& q) { return PinsEqual(q, t.pin); }); p != pins->end())
                 t.pinned = true, t.pinIndex = int(p - pins->begin());
-    ShowAppMenu(env, t, pt, MenuPlace::Below, std::move(done));
+    ShowAppMenu(env, t, pt, MenuPlace::Below, std::move(done), std::move(extras));
 }
 
 void ShowOverflowAppsMenu(const AppMenuEnv& env, const std::vector<std::wstring>& keys, RECT anchor)

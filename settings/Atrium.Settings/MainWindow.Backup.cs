@@ -114,6 +114,6 @@ public sealed partial class MainWindow
         var section = new StackPanel { Spacing = 10 };
         section.Children.Add(title);
         section.Children.Add(new Border { Style = (Style)res["TileStyle"], Child = body });
-        MainSystem.Children.Add(section);
+        MainSystem.Sections.Children.Add(section);
     }
 }

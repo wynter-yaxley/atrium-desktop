@@ -46,14 +46,15 @@ public sealed partial class SourceVm : AppRowVm
     {
         _owner = owner;
         Title = Loc.T(title);
-        Note = Loc.T(note);
+        string resolvedNote = string.IsNullOrWhiteSpace(note) ? "" : Loc.T(note);
+        Note = string.IsNullOrWhiteSpace(resolvedNote) ? null : resolvedNote;
         Glyph = glyph;
         Programs = programs;
         _get = get;
         _set = set;
     }
 
-    public string Note { get; }
+    public string? Note { get; }
     public bool IsOn
     {
         get => _get(_owner.CurrentSettings);
@@ -70,7 +71,7 @@ public sealed partial class SourceVm : AppRowVm
     internal Func<BarSettings, bool>? OptionGet { get; init; }
     internal Action<BarSettings, bool>? OptionSet { get; init; }
     public string OptionTitle { get; init; } = "";
-    public string OptionNote { get; init; } = "";
+    public string? OptionNote { get; init => field = string.IsNullOrWhiteSpace(value) ? null : value; }
     public Visibility OptionVisibility => OptionGet == null ? Visibility.Collapsed : Visibility.Visible;
     public bool OptionOn
     {
@@ -421,6 +422,28 @@ public sealed partial class MainWindow
         using (var stream = bmp.PixelBuffer.AsStream()) stream.Write(img.Bgra, 0, img.Bgra.Length);
         bmp.Invalidate();
         return _rowIcons[source] = bmp;
+    }
+
+    private string _notifyCorner = "topRight";
+
+    private void OnNotifyPlacementChecked(object sender, RoutedEventArgs e)
+    {
+        bool corner = (string)((RadioButton)sender).Tag == "corner";
+        NotifyCornerRow.Visibility = corner ? Visibility.Visible : Visibility.Collapsed;
+        if (_loading) return;
+        // A corner: the one chosen last (top right at first, as before there were four).
+        CurrentSettings.NotifyPlacement = corner ? _notifyCorner : "dock";
+        _notifyEntrancePending = true;
+        Changed();
+    }
+
+    private void OnNotifyCornerChecked(object sender, RoutedEventArgs e)
+    {
+        _notifyCorner = (string)((RadioButton)sender).Tag;
+        if (_loading || CurrentSettings.NotifyPlacement == _notifyCorner) return;
+        CurrentSettings.NotifyPlacement = _notifyCorner;
+        _notifyEntrancePending = true;
+        Changed();
     }
 
     private readonly Dictionary<string, ImageSource> _rowIcons = new(StringComparer.OrdinalIgnoreCase);

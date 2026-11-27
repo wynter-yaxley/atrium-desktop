@@ -52,8 +52,12 @@ add_library(atrium_core_lib STATIC
     shell/shell_icon.cpp
     shell/task_launch.cpp
     shell/task_model.cpp
+    shell/task_model_actions.cpp
+    shell/task_model_icons.cpp
+    shell/task_model_windows.cpp
     shell/app_processes.cpp
     shell/app_catalog.cpp
+    shell/app_catalog_stamp.cpp
     shell/start_pins.cpp
     shell/start_layout.cpp
     shell/win_key.cpp
@@ -79,6 +83,7 @@ add_library(atrium_core_lib STATIC
     shell/displays.cpp
     shell/tray_host.cpp
     shell/tray_model.cpp
+    shell/tray_actions.cpp
     shell/tray_match.cpp
     shell/shell_verbs.cpp
     shell/jump_list.cpp
@@ -87,19 +92,27 @@ add_library(atrium_core_lib STATIC
     shell/wechat_open.cpp
     shell/feishu_source.cpp
     ui/surface.cpp
+    ui/surface_paint.cpp
     ui/popup_theme.cpp
     ui/canvas.cpp
     ui/start_menu.cpp
+    ui/start_menu_data.cpp
     ui/start_menu_input.cpp
+    ui/start_menu_layout.cpp
     ui/start_menu_menus.cpp
+    ui/start_menu_paint.cpp
     ui/notifications.cpp
+    ui/notification_paint.cpp
     ui/notification_popup.cpp
     ui/tray_panel.cpp
+    ui/tray_panel_popup.cpp
     ui/calendar_panel.cpp
     ui/control_center.cpp
     ui/control_center_paint.cpp
     ui/control_modules.cpp
     ui/desktop_widgets.cpp
+    ui/widget_input.cpp
+    ui/widget_storage.cpp
     ui/widget_stacking.cpp
     ui/folder_stack_popup.cpp
     ui/genie_minimize.cpp
@@ -113,9 +126,11 @@ add_library(atrium_core_lib STATIC
     ui/stage_manager.cpp
     ui/stage_drag.cpp
     ui/stage_close.cpp
+    ui/stage_layout.cpp
     ui/stage_paint.cpp
     ui/stage_restore.cpp
     ui/stage_fade.cpp
+    ui/stage_windows.cpp
     ui/window_snapshot.cpp
     shell/weather.cpp
     shell/bluetooth_batteries.cpp
@@ -124,6 +139,9 @@ add_library(atrium_core_lib STATIC
     ui/window_peek.cpp
     ui/window_preview.cpp
     ui/widget_faces.cpp
+    ui/widget_calendar_face.cpp
+    ui/widget_weather_face.cpp
+    ui/widget_network_face.cpp
     shell/notification_listener.cpp
     shell/usb_volume.cpp
     render/bar_painter.cpp
@@ -134,6 +152,7 @@ add_library(atrium_core_lib STATIC
     render/capture.cpp
     render/window_capture.cpp
     render/desktop_backdrop.cpp
+    render/desktop_wallpaper.cpp
     render/glass_renderer.cpp
     render/glass_panel.cpp
     render/panel_glass_host.cpp
@@ -152,7 +171,7 @@ target_link_libraries(atrium_core_lib PUBLIC
     dwmapi version propsys shlwapi oleaut32 uuid imm32 powrprof wlanapi windowscodecs winhttp setupapi taskschd
     iphlpapi advapi32 comctl32 icu wbemuuid secur32 winsqlite3)
 
-add_executable(atrium_core WIN32 main.cpp core.rc core.manifest)
+add_executable(atrium_core WIN32 main.cpp app_launch.cpp app_runtime.cpp app_bars.cpp app_handlers.cpp core.rc core.manifest)
 # build/win-x64/<Config>/Atrium.exe
 set_target_properties(atrium_core PROPERTIES OUTPUT_NAME "Atrium" RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # The interface face (D40) next to the exe, as in the package.

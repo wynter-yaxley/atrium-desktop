@@ -32,6 +32,13 @@ public:
     int Add(Handler handler, void* context);
     void Remove(int token);
 
+    // Watchers receive non-blocking PostMessageW(target, msg, wparam, MAKELPARAM(pt.x, pt.y))
+    // on WH_MOUSE_LL button-down events (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN).
+    // Receivers must unpack lparam with GET_X_LPARAM / GET_Y_LPARAM (signed) for negative secondary-display coordinates.
+    // WH_MOUSE_LL is installed only while at least one watcher is active.
+    int AddMouseDownWatcher(HWND target, UINT msg);
+    void RemoveMouseDownWatcher(int token);
+
     KeyboardHook(const KeyboardHook&) = delete;
     KeyboardHook& operator=(const KeyboardHook&) = delete;
 
@@ -43,15 +50,29 @@ private:
         Handler handler;
         void* context;
     };
+    struct MouseWatcher {
+        int token;
+        HWND target;
+        UINT msg;
+    };
     static LRESULT CALLBACK HookProc(int code, WPARAM wparam, LPARAM lparam);
+    static LRESULT CALLBACK MouseHookProc(int code, WPARAM wparam, LPARAM lparam);
     void Run();
+    void ActivateHookThreadLocked(bool needSync);
+    void DeactivateOrSyncHookThreadLocked();
+    void StopThreadLocked();
+    bool HasHandlers();
+    bool HasMouseWatchers();
 
     // Recursive: a handler may send keys (WinKey replays Win + a shortcut), and
     // the hook sees those on this same thread before the handler returns.
     std::recursive_mutex handlersMutex_;
-    std::mutex lifecycleMutex_; // serializes Add/Remove thread start and join; never taken in HookProc
+    std::mutex mouseWatchersMutex_;
+    std::mutex lifecycleMutex_; // serializes Add/Remove thread start and join; never taken in hook procs
     std::vector<Entry> handlers_;
+    std::vector<MouseWatcher> mouseWatchers_;
     int nextToken_ = 1;
+    int nextMouseToken_ = 1;
     std::thread thread_;
     std::atomic<DWORD> threadId_{0};
     std::mutex readyMutex_;

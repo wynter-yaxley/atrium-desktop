@@ -8,6 +8,7 @@
 #include <winrt/base.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -45,18 +46,29 @@ DWORD WindowPid(HWND h)
 
 bool IsVisibleNonIconic(HWND h) { return h && IsWindowVisible(h) && !IsIconic(h); }
 
-HWND FindVisibleWeChatMain(const std::vector<std::pair<DWORD, std::wstring>>& procs, HWND lastMainHwnd, bool& anyHung)
+std::vector<HWND> VisibleWeChatWindows(const std::vector<std::pair<DWORD, std::wstring>>& procs, const std::map<DWORD, HWND>& lastMainByPid, DWORD targetPid,
+                                       bool& anyHung)
 {
-    if (IsVisibleNonIconic(lastMainHwnd)) {
-        auto it = std::ranges::find_if(procs, [pid = WindowPid(lastMainHwnd)](const auto& p) { return p.first == pid; });
-        if (it != procs.end() && detail::ShouldReadWeChatWindow(lastMainHwnd, it->first, &anyHung))
-            return lastMainHwnd;
+    std::vector<HWND> out;
+    auto append = [&](HWND h) {
+        if (IsVisibleNonIconic(h) && std::ranges::find(out, h) == out.end())
+            out.push_back(h);
+    };
+    if (targetPid != 0) {
+        if (auto it = lastMainByPid.find(targetPid); it != lastMainByPid.end() && detail::ShouldReadWeChatWindow(it->second, targetPid, &anyHung))
+            append(it->second);
+        for (HWND h : detail::WeChatWindows(targetPid, anyHung))
+            append(h);
+        return out;
+    }
+    for (const auto& [pid, last] : lastMainByPid) {
+        if (std::ranges::any_of(procs, [pid](const auto& p) { return p.first == pid; }) && detail::ShouldReadWeChatWindow(last, pid, &anyHung))
+            append(last);
     }
     for (const auto& [pid, program] : procs)
         for (HWND h : detail::WeChatWindows(pid, anyHung))
-            if (IsVisibleNonIconic(h))
-                return h;
-    return nullptr;
+            append(h);
+    return out;
 }
 
 bool ActivateChatCell(IUIAutomationElement* e, uint32_t& loggedMask)
@@ -80,7 +92,7 @@ bool ActivateChatCell(IUIAutomationElement* e, uint32_t& loggedMask)
     return false;
 }
 
-enum class OpenAttempt { Retry, Done };
+enum class OpenAttempt { Retry, NotFound, Done };
 
 OpenAttempt TryOpenChatInWindow(IUIAutomation* uia, IUIAutomationCondition* cells, HWND target, const std::wstring& chat, uint32_t& loggedMask)
 {
@@ -105,21 +117,21 @@ OpenAttempt TryOpenChatInWindow(IUIAutomation* uia, IUIAutomationCondition* cell
             return OpenAttempt::Done;
         }
     }
-    LogOpenOnce(loggedMask, LogNotFound, L"wechat: open chat skipped (cell not in visible list)");
-    return OpenAttempt::Done;
+    return OpenAttempt::NotFound;
 }
 
 } // namespace
 
 bool MatchesWeChatCellName(const std::wstring& cellName, const std::wstring& chat) { return !chat.empty() && ParseWeChatRow(cellName).chat == chat; }
 
-void WeChatSource::OpenChat(const std::wstring& chat)
+void WeChatSource::OpenChat(const std::wstring& chat, DWORD pid)
 {
     if (chat.empty() || stop_)
         return;
     {
         std::scoped_lock lock(openMu_);
         pendingOpenChat_ = chat;
+        pendingOpenPid_ = pid;
     }
     if (wake_)
         SetEvent(wake_);
@@ -128,15 +140,19 @@ void WeChatSource::OpenChat(const std::wstring& chat)
 namespace detail {
 
 void HandlePendingWeChatOpen(IUIAutomation* uia, IUIAutomationCondition* cells, HANDLE wake, const std::atomic<bool>& stop, std::mutex& openMu,
-                             std::wstring& pendingOpenChat, std::vector<std::pair<DWORD, std::wstring>>& procs, HWND& lastMainHwnd, uint32_t& loggedMask)
+                             std::wstring& pendingOpenChat, DWORD& pendingOpenPid, std::vector<std::pair<DWORD, std::wstring>>& procs,
+                             std::map<DWORD, HWND>& lastMainByPid, uint32_t& loggedMask)
 {
     std::wstring chat;
+    DWORD targetPid = 0;
     {
         std::scoped_lock lock(openMu);
         if (pendingOpenChat.empty())
             return;
         chat = std::move(pendingOpenChat);
+        targetPid = pendingOpenPid;
         pendingOpenChat.clear();
+        pendingOpenPid = 0;
     }
     constexpr DWORD kOpenWaitMs = 1500;
     const ULONGLONG deadline = GetTickCount64() + kOpenWaitMs;
@@ -144,18 +160,29 @@ void HandlePendingWeChatOpen(IUIAutomation* uia, IUIAutomationCondition* cells, 
         if (procs.empty())
             DiscoverWeChatProcesses(procs);
         if (!procs.empty()) {
-            if (QueryWeChatBusyState(procs) == WeChatBusyState::Dialog) {
+            const WeChatBusyState busy = targetPid ? QueryWeChatBusyStateForPid(targetPid) : QueryWeChatBusyState(procs);
+            if (busy == WeChatBusyState::Dialog) {
                 LogOpenOnce(loggedMask, LogDialog, L"wechat: open chat skipped (modal dialog)");
                 return;
             }
             bool anyHung = false;
-            HWND target = FindVisibleWeChatMain(procs, lastMainHwnd, anyHung);
+            const std::vector<HWND> targets = VisibleWeChatWindows(procs, lastMainByPid, targetPid, anyHung);
             if (anyHung) {
                 LogOpenOnce(loggedMask, LogHung, L"wechat: open chat skipped (hung window)");
                 return;
             }
-            if (target && TryOpenChatInWindow(uia, cells, target, chat, loggedMask) == OpenAttempt::Done) {
-                lastMainHwnd = target;
+            bool anyNotFound = false;
+            for (HWND target : targets) {
+                const OpenAttempt attempt = TryOpenChatInWindow(uia, cells, target, chat, loggedMask);
+                if (attempt == OpenAttempt::Done) {
+                    lastMainByPid[WindowPid(target)] = target;
+                    return;
+                }
+                if (attempt == OpenAttempt::NotFound)
+                    anyNotFound = true;
+            }
+            if (anyNotFound) {
+                LogOpenOnce(loggedMask, LogNotFound, L"wechat: open chat skipped (cell not in visible list)");
                 return;
             }
         }

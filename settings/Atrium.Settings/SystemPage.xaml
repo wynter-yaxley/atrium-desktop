@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="Atrium.Settings.SystemPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Atrium.Settings">
+
+    <StackPanel x:Name="RootStack" Spacing="28">
+        <StackPanel>
+            <TextBlock Text="Language" Style="{StaticResource SectionStyle}" />
+            <Border Style="{StaticResource TileStyle}">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Interface language" Style="{StaticResource RowTitleStyle}" />
+                    <ComboBox x:Name="LanguagePicker" HorizontalAlignment="Stretch" SelectionChanged="OnLanguageChanged"
+                              AutomationProperties.Name="Interface language">
+                        <ComboBoxItem Content="Follow system" Tag="auto" />
+                        <ComboBoxItem Content="Chinese (Simplified)" Tag="zh-Hans" />
+                        <ComboBoxItem Content="English" Tag="en" />
+                    </ComboBox>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+        <StackPanel>
+            <TextBlock Text="Windows" Style="{StaticResource SectionStyle}" />
+            <StackPanel Spacing="12">
+                <local:ToggleTile x:Name="StartupSwitch" Title="Start with Windows" SwitchName="Start with Windows" Toggled="OnStartupToggled"
+                                  Note="Start Atrium when you sign in to Windows." />
+                <Border Style="{StaticResource TileStyle}">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Startup method" Style="{StaticResource RowTitleStyle}" />
+                        <ComboBox x:Name="StartupMethodPicker" HorizontalAlignment="Stretch" SelectionChanged="OnStartupMethodChanged"
+                                  AutomationProperties.Name="Startup method">
+                            <ComboBoxItem Content="Registry Run" Tag="run" />
+                            <ComboBoxItem Content="Windows Scheduled Task" Tag="task" />
+                        </ComboBox>
+                        <TextBlock Style="{StaticResource RowNoteStyle}" TextWrapping="Wrap"
+                                   Text="Registry Run is the default. Scheduled Task creates a standard-user logon task (still avoids UAC prompts), though some security tools may prompt when creating it." />
+                    </StackPanel>
+                </Border>
+                <local:ResponsiveGrid MinCellWidth="280" Gap="12" StretchLastRow="True">
+                    <local:ToggleTile x:Name="HideTaskbarSwitch" Title="Hide the system taskbar" SwitchName="Hide the system taskbar"
+                                      Toggled="OnHideTaskbarToggled"
+                                      Note="Keep only the Atrium bar. Windows' taskbar returns when this is turned off or Atrium quits; system shortcuts such as the Windows key keep working." />
+                    <local:ToggleTile x:Name="GenieSwitch" Title="Genie effect" SwitchName="Minimize with the genie effect"
+                                      Toggled="OnGenieToggled"
+                                      Note="As on macOS, a window being minimized pours into its icon on the Atrium bar." />
+                    <local:ToggleTile x:Name="PeekSwitch" Title="Peek at windows" SwitchName="Peek at windows"
+                                      Toggled="OnPeekToggled"
+                                      Note="Rest the pointer on a window's picture in the bar's preview to see that window where it is, with the other windows faded." />
+                    <local:ToggleTile x:Name="HideBannersSwitch" Title="Hide system banners" SwitchName="Hide system banners"
+                                      Toggled="OnHideBannersToggled"
+                                      Note="Turns on Windows' Do Not Disturb; notifications still appear as Atrium cards. Restored when turned off or Atrium quits." />
+                    <local:ToggleTile x:Name="WinKeySwitch" Title="Win key opens Start menu" SwitchName="Win key opens Start menu"
+                                      Toggled="OnWinKeyToggled" />
+                    <local:ToggleTile x:Name="WinNumbersSwitch" Title="Win + number opens apps" SwitchName="Win + number opens apps"
+                                      Toggled="OnWinNumbersToggled" />
+                    <local:ToggleTile x:Name="RemoteVisibleSwitch" Title="Remote control compatibility" SwitchName="Remote control compatibility"
+                                      Toggled="OnRemoteVisibleToggled" />
+                </local:ResponsiveGrid>
+            </StackPanel>
+        </StackPanel>
+    </StackPanel>
+</UserControl>

@@ -113,12 +113,28 @@ bool CheckEnergySaverPlanning()
     return ok;
 }
 
+bool CheckStatusToggles()
+{
+    bool ok = true;
+    ok &= Check(ParseAirplaneRadioState(S_OK, 1, S_OK, 0) == true, "systemRadiosEnabled=0 parses as airplane mode ON");
+    ok &= Check(ParseAirplaneRadioState(S_OK, 1, S_OK, 1) == false, "systemRadiosEnabled=1 parses as airplane mode OFF");
+    ok &= Check(!ParseAirplaneRadioState(S_OK, 0, S_OK, 0).has_value(), "unsupported radio manager returns nullopt");
+    ok &= Check(!ParseAirplaneRadioState(E_FAIL, 1, S_OK, 0).has_value(), "failed IsRMSupported returns nullopt");
+    ok &= Check(!ParseAirplaneRadioState(S_OK, 1, E_FAIL, 0).has_value(), "failed GetSystemRadioState returns nullopt");
+
+    ok &= Check(!IsQuietProfileActive(L""), "empty quiet profile is not active");
+    ok &= Check(!IsQuietProfileActive(L"Microsoft.QuietHoursProfile.Unrestricted"), "Unrestricted profile is not active");
+    ok &= Check(IsQuietProfileActive(L"Microsoft.QuietHoursProfile.AlarmsOnly"), "AlarmsOnly profile is active");
+    ok &= Check(IsQuietProfileActive(L"Microsoft.QuietHoursProfile.PriorityOnly"), "PriorityOnly profile is active");
+    return ok;
+}
+
 } // namespace
 
 // Only the record's encoding and energy-saver planning: what this PC's switches are set to is not the tests' business.
 int main()
 {
-    const bool ok = CheckNightLightEncoding() && CheckEnergySaverPlanning();
+    const bool ok = CheckNightLightEncoding() && CheckEnergySaverPlanning() && CheckStatusToggles();
     if (!ok)
         return 1;
     std::cout << "quick_toggles tests passed\n";

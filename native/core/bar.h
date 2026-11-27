@@ -77,6 +77,7 @@ public:
     bool ShownOnScreen() const { return visible_ && !slidOut_; }
     // Unread notifications, shown as a badge on the bell.
     void SetUnread(int count);
+    void SetDoNotDisturb(bool on);
     // Network, battery and volume for the status icon.
     void SetStatus(const SystemStatus& status);
     // The foreground window's input (中/a/A) in the input method entry; empty: not known.
@@ -253,7 +254,9 @@ private:
     void SetRegion(bool extended); // input region: the shape, plus the room above it while magnified
     static void CALLBACK WinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD thread, DWORD time);
     void GuardStacking(const wchar_t* why);
+    RECT BarOverlapZone() const;
     bool MonitorCoveredByApp() const;
+    bool MonitorOverlappedByApp() const;
     void UpdateCover();    // this monitor's top app is maximized or full screen, regardless of focus
     void UpdateAutoHide(); // tucks the bar away or brings it up
     void WatchPointer();   // while covered: the screen's bottom edge brings the bar up, leaving it lets it go
@@ -307,6 +310,7 @@ private:
     int appsLeft_ = 0, pitch_ = 1, plate_ = 0, shown_ = 0;
     std::vector<std::wstring> hidden_; // apps behind the overflow entry
     int unread_ = 0;
+    bool dnd_ = false;
     // The now-playing entry (SetMusic): its level feed (under lock_, read through the snapshot), whether it shows, its tooltip.
     std::shared_ptr<const MusicFeed> music_;
     bool musicShown_ = false;

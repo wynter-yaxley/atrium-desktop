@@ -28,6 +28,57 @@ bool Usable(const MIB_IF_ROW2& row)
     return row.InterfaceAndOperStatusFlags.HardwareInterface && !row.InterfaceAndOperStatusFlags.FilterInterface;
 }
 
+template<typename TrafficMap> const MIB_IF_ROW2* PickInterface(const MIB_IF_TABLE2& table, uint64_t currentLuid, const TrafficMap& before, TrafficMap& next)
+{
+    const MIB_IF_ROW2* busiest = nullptr; // carried the most bytes since the last reading
+    const MIB_IF_ROW2* biggest = nullptr; // carried the most since the machine started
+    const MIB_IF_ROW2* shown = nullptr;   // the one the widget shows now
+    uint64_t busiestBytes = 0, biggestBytes = 0;
+    for (ULONG i = 0; i < table.NumEntries; ++i) {
+        const MIB_IF_ROW2& row = table.Table[i];
+        if (!Usable(row))
+            continue;
+        next[row.InterfaceLuid.Value] = {row.InOctets, row.OutOctets};
+        uint64_t moved = 0;
+        if (const auto it = before.find(row.InterfaceLuid.Value); it != before.end() && row.InOctets >= it->second.in && row.OutOctets >= it->second.out) {
+            moved = (row.InOctets - it->second.in) + (row.OutOctets - it->second.out);
+        }
+        if (moved > busiestBytes) {
+            busiestBytes = moved;
+            busiest = &row;
+        }
+        if (row.InOctets + row.OutOctets > biggestBytes) {
+            biggestBytes = row.InOctets + row.OutOctets;
+            biggest = &row;
+        }
+        if (row.InterfaceLuid.Value == currentLuid)
+            shown = &row;
+    }
+    // The link carrying the traffic now; the one already shown while nothing moved (a widget that
+    // jumped from WLAN to a sleeping Ethernet port while idle would be noise); else the busiest ever.
+    return busiest ? busiest : shown ? shown : biggest;
+}
+
+template<typename TrafficMap> void ComputeRates(const MIB_IF_ROW2& pick, const TrafficMap& before, double dt, double& down, double& up, double& downBytes,
+                                                double& upBytes, std::vector<NetworkRate>& history)
+{
+    down = up = 0;
+    if (dt <= 0)
+        return;
+    if (const auto it = before.find(pick.InterfaceLuid.Value); it != before.end()) {
+        // A counter that went backwards is an adapter that came back, not a huge burst.
+        if (pick.InOctets >= it->second.in)
+            down = double(pick.InOctets - it->second.in) / dt;
+        if (pick.OutOctets >= it->second.out)
+            up = double(pick.OutOctets - it->second.out) / dt;
+    }
+    downBytes += down * dt;
+    upBytes += up * dt;
+    history.push_back(NetworkRate{float(down), float(up)});
+    if (history.size() > kNetworkPoints)
+        history.erase(history.begin());
+}
+
 } // namespace
 
 void NetworkMonitor::Sample()
@@ -47,54 +98,12 @@ void NetworkMonitor::Sample()
     if (!fresh)
         last_.reserve(table->NumEntries);
 
-    const MIB_IF_ROW2* busiest = nullptr; // carried the most bytes since the last reading
-    const MIB_IF_ROW2* biggest = nullptr; // carried the most since the machine started
-    const MIB_IF_ROW2* shown = nullptr;   // the one the widget shows now
-    uint64_t busiestBytes = 0, biggestBytes = 0;
-    for (ULONG i = 0; i < table->NumEntries; ++i) {
-        const MIB_IF_ROW2& row = table->Table[i];
-        if (!Usable(row))
-            continue;
-        last_[row.InterfaceLuid.Value] = Traffic{row.InOctets, row.OutOctets};
-        uint64_t moved = 0;
-        if (auto it = before.find(row.InterfaceLuid.Value); it != before.end())
-            if (row.InOctets >= it->second.in && row.OutOctets >= it->second.out)
-                moved = (row.InOctets - it->second.in) + (row.OutOctets - it->second.out);
-        if (moved > busiestBytes) {
-            busiestBytes = moved;
-            busiest = &row;
-        }
-        if (row.InOctets + row.OutOctets > biggestBytes) {
-            biggestBytes = row.InOctets + row.OutOctets;
-            biggest = &row;
-        }
-        if (row.InterfaceLuid.Value == luid_)
-            shown = &row;
-    }
-    // The link carrying the traffic now; the one already shown while nothing moved (a widget that
-    // jumped from WLAN to a sleeping Ethernet port while idle would be noise); else the busiest ever.
-    const MIB_IF_ROW2* pick = busiest ? busiest : shown ? shown : biggest;
-
-    if (pick) {
+    if (const MIB_IF_ROW2* pick = PickInterface(*table, luid_, before, last_)) {
         linked_ = true;
         luid_ = pick->InterfaceLuid.Value;
         name_ = pick->Alias[0] ? pick->Alias : pick->Description;
         linkMbps_ = LinkSpeedMbps(pick->ReceiveLinkSpeed);
-        down_ = up_ = 0;
-        if (dt > 0) {
-            if (auto it = before.find(luid_); it != before.end()) {
-                // A counter that went backwards is an adapter that came back, not a huge burst.
-                if (pick->InOctets >= it->second.in)
-                    down_ = double(pick->InOctets - it->second.in) / dt;
-                if (pick->OutOctets >= it->second.out)
-                    up_ = double(pick->OutOctets - it->second.out) / dt;
-            }
-            downBytes_ += down_ * dt;
-            upBytes_ += up_ * dt;
-            history_.push_back(NetworkRate{float(down_), float(up_)});
-            if (history_.size() > kNetworkPoints)
-                history_.erase(history_.begin());
-        }
+        ComputeRates(*pick, before, dt, down_, up_, downBytes_, upBytes_, history_);
     } else {
         linked_ = false;
         luid_ = 0;

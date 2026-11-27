@@ -1,14 +1,18 @@
 // Tray snapshots and actions; evidence contracts: docs/TRAY.md.
 #pragma once
 
+#include <windows.h>
+#include <unknwn.h>
+
 #include "icon_image.h"
 #include "pinned_app.h"
 #include "shell/tray_click.h"
 #include "shell/tray_host.h"
+#include "shell/tray_match.h"
 #include "shell/tray_pointer.h"
 #include "shell/tray_target.h"
 
-#include <windows.h>
+#include <winrt/base.h>
 
 #include <condition_variable>
 #include <deque>
@@ -16,9 +20,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+struct IUIAutomation;
 
 namespace atrium {
 
@@ -44,13 +51,49 @@ struct TrayIcon {
     bool flashing = false;   // its icon flashes (hosted): a message waiting
     size_t order = SIZE_MAX; // place in Windows' own order of the tray icons (UIOrderList), if known
     int exeOrdinal = -1;     // position among icons of the same program
+    std::optional<tray::TargetKey> explorerTarget; // strict 1-to-1 Explorer binding for hosted fallback
     tray::TargetKey Target() const { return {shell, runtimeId, recordId, exe, tip}; }
+    tray::TargetKey ActionTarget() const { return explorerTarget.value_or(Target()); }
 };
+
+namespace tray_detail {
+struct Found {
+    winrt::com_ptr<IUnknown> element;
+    HWND host = nullptr;    // the XAML button's top-level window: the taskbar or the overflow popup
+    HWND toolbar = nullptr; // a button of the classic tray's toolbar (Windows 10): clicked by messages to it
+    std::wstring tip;
+    bool promoted = false;
+    int index = 0;
+    RECT bounds{};
+    std::wstring recordId;
+    tray::Method method = tray::Method::Unknown;
+    std::vector<int> runtimeId;
+};
+struct Record {
+    std::wstring id, exe, tip;
+    std::vector<BYTE> png;
+    bool promoted = false, hasUid = false;
+    UINT uid = 0;
+    GUID guid{};
+    size_t order = SIZE_MAX;
+};
+struct ReadDiagnostics {
+    size_t records = 0, live = 0, aliases = 0, shared = 0, unknown = 0;
+};
+bool WaitStep(HANDLE stopEvent, DWORD ms);
+tray::ShellSession ReadShellSession();
+std::vector<Found> FindButtons(IUIAutomation* uia, bool& available);
+std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& records, bool& ordered, const std::vector<PinnedApp>& apps = {},
+                              ReadDiagnostics* diagnostics = nullptr);
+HWND OverflowWindow();
+bool ShowOverflow(IUIAutomation* uia, HANDLE stopEvent = nullptr);
+} // namespace tray_detail
 
 class TrayModel {
 public:
     // Posts msg: 0=list changed, 1=observed app response, 2=verified native popup,
-    // 3=needs user intervention, 4=accepted/unconfirmed (quiet), 5=explicit popup opened.
+    // 3=needs user intervention, 4=accepted/unconfirmed (quiet), 5=explicit popup opened,
+    // 6=yield tray panel topmost Z-order before physical pointer right-click fallback.
     // No HRESULT is treated as an application acknowledgement.
     TrayModel(HWND notify, UINT msg, std::function<std::vector<PinnedApp>()> appNames = {});
     ~TrayModel();
@@ -78,7 +121,7 @@ public:
     // True while the physical pointer right-click fallback is moving the cursor.
     static bool SyntheticPointerInFlight() { return tray::g_pointerInFlight; }
     // Opens an existing background session; false when the app is not in the tray/running.
-    bool OpenExisting(const std::wstring& exe);
+    bool OpenExisting(const std::wstring& exe, DWORD preferredPid = 0);
     // The tray host (setting `trayHost`): the apps' icons as they send them, clicked with
     // the shell's own messages. Icons only Explorer's tray has stay in the list. UI thread.
     void SetHosting(bool on);
@@ -99,7 +142,16 @@ public:
     void Hover(const TrayIcon* icon, RECT cell = {});
     void SetHostPlaces(RECT anchor); // the panel's place on screen, for apps that ask where their icon is
     // The programs whose tray icon flashes now (hosted icons only): a message waiting.
-    std::vector<std::wstring> Flashing() const;
+    std::vector<std::wstring> Flashing() const
+    {
+        std::lock_guard g(mutex_);
+        return host_ && !host_->Yielded() ? host_->Flashing() : std::vector<std::wstring>{};
+    }
+    std::vector<FlashingTrayIcon> FlashingIcons() const
+    {
+        std::lock_guard g(mutex_);
+        return host_ && !host_->Yielded() ? host_->FlashingIcons() : std::vector<FlashingTrayIcon>{};
+    }
 
     // First line of a tooltip, for display.
     static std::wstring Title(const std::wstring& tip);
@@ -110,21 +162,26 @@ private:
         TrayIcon icon;
         tray::Action action = tray::Action::Left;
         bool systemTray = false;
+        bool allowProgramWake = false;
     };
     struct WorkerState;
     void Worker();
     bool DequeueWorkerJob(WorkerState& ws, Job& job);
-    void RunClickJob(WorkerState& ws, const Job& job, const tray::ShellSession& session, ULONGLONG findStart);
+    void RunClickJob(IUIAutomation* uia, const Job& job, const tray::ShellSession& session, ULONGLONG findStart);
     void RunRefreshJob(WorkerState& ws, const tray::ShellSession& session, ULONGLONG findStart);
-    bool ClickHosted(const TrayIcon& icon, tray::HostAction action, RECT cell = {});
+    void RebuildSnapshot(bool forceNotify);
+    bool ClickHosted(const TrayIcon& icon, tray::HostAction action, RECT cell = {}, bool allowProgramWake = false);
     void EnqueueUrgent(Job job);
     HWND notify_;
     UINT msg_;
     std::function<std::vector<PinnedApp>()> appNames_;
+    HANDLE stopEvent_ = nullptr;
     mutable std::mutex mutex_;
+    std::mutex snapshotBuildMutex_;
     std::condition_variable cv_;
     std::deque<Job> jobs_;
     std::vector<TrayIcon> icons_;
+    std::shared_ptr<const std::vector<TrayIcon>> snapshot_;
     bool loaded_ = false, available_ = false, stop_ = false;
     std::thread thread_;
     std::unique_ptr<TrayHost> host_;

@@ -16,6 +16,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
+#include <unordered_map>
+#include <utility>
 
 namespace json = winrt::Windows::Data::Json;
 
@@ -26,67 +28,143 @@ namespace {
 constexpr auto kEvery = std::chrono::minutes(30);
 constexpr auto kRetry = std::chrono::minutes(3);
 
-// A GET over WinHTTP; direct: not through the system's proxy. The body, empty on failure.
-std::string Get(const std::wstring& url, bool direct, const std::atomic_bool& quit)
+std::wstring Wide(const std::string& s)
 {
-    if (quit.load())
-        return {};
-    URL_COMPONENTS u{sizeof(u)};
-    wchar_t host[256] = {}, path[2048] = {};
-    u.lpszHostName = host;
-    u.dwHostNameLength = 256;
-    u.lpszUrlPath = path;
-    u.dwUrlPathLength = 2048;
-    wchar_t extra[2048] = {};
-    u.lpszExtraInfo = extra;
-    u.dwExtraInfoLength = 2048;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &u))
-        return {};
-    std::string body;
-    HINTERNET session =
-        WinHttpOpen(L"Atrium", direct ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session)
-        return {};
-    WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
-    HINTERNET connect = WinHttpConnect(session, host, u.nPort, 0);
-    std::wstring target = std::wstring(path) + extra;
-    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                                     u.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) :
-                                  nullptr;
-    DWORD status = 0, size = sizeof(status);
-    if (request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-        WinHttpReceiveResponse(request, nullptr) &&
-        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
-                            WINHTTP_NO_HEADER_INDEX) &&
-        status == 200) {
-        for (;;) {
-            if (quit.load())
-                break;
-            DWORD n = 0;
-            if (!WinHttpQueryDataAvailable(request, &n) || n == 0)
-                break;
-            std::string chunk(n, '\0');
-            DWORD read = 0;
-            if (!WinHttpReadData(request, chunk.data(), n, &read) || read == 0)
-                break;
-            body.append(chunk.data(), read);
-            if (body.size() > 4 * 1024 * 1024)
-                break;
-        }
-    }
-    if (request)
-        WinHttpCloseHandle(request);
-    if (connect)
-        WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
-    return quit.load() ? std::string{} : body;
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    std::wstring w(size_t(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
+    return w;
 }
 
-// Directly first; then through the system's proxy (a network that only reaches out through it).
-std::string GetAny(const std::wstring& url, const std::atomic_bool& quit)
+bool TryParseJson(const std::string& text, json::JsonObject& out) { return !text.empty() && json::JsonObject::TryParse(Wide(text), out) && out; }
+
+std::wstring JsonString(const json::JsonObject& o, const wchar_t* key, const wchar_t* fallback = L"")
 {
-    std::string body = Get(url, true, quit);
-    return !body.empty() || quit.load() ? body : Get(url, false, quit);
+    if (!o.HasKey(key))
+        return fallback;
+    const auto v = o.GetNamedValue(key);
+    return v.ValueType() == json::JsonValueType::String ? std::wstring(v.GetString()) : std::wstring(fallback);
+}
+
+double JsonNumber(const json::JsonObject& o, const wchar_t* key, double fallback = 0)
+{
+    if (!o.HasKey(key))
+        return fallback;
+    const auto v = o.GetNamedValue(key);
+    return v.ValueType() == json::JsonValueType::Number ? v.GetNumber() : fallback;
+}
+
+bool JsonBool(const json::JsonObject& o, const wchar_t* key, bool fallback = false)
+{
+    if (!o.HasKey(key))
+        return fallback;
+    const auto v = o.GetNamedValue(key);
+    return v.ValueType() == json::JsonValueType::Boolean ? v.GetBoolean() : fallback;
+}
+
+bool NamedArr(const json::JsonObject& o, const wchar_t* k, json::JsonArray& out)
+{
+    return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Array ? (out = o.GetNamedArray(k), true) : false;
+}
+
+struct AsyncHttpContext {
+    HANDLE stepEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE closedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<bool> failed{false};
+    std::atomic<DWORD> bytesAvailable{0};
+    std::atomic<DWORD> bytesRead{0};
+    std::string readBuf;
+
+    AsyncHttpContext() = default;
+    AsyncHttpContext(const AsyncHttpContext&) = delete;
+    AsyncHttpContext& operator=(const AsyncHttpContext&) = delete;
+    ~AsyncHttpContext()
+    {
+        if (stepEvent)
+            CloseHandle(stepEvent);
+        if (closedEvent)
+            CloseHandle(closedEvent);
+    }
+};
+
+std::mutex g_httpContextLock;
+std::unordered_map<void*, std::shared_ptr<AsyncHttpContext>> g_httpContexts;
+
+std::shared_ptr<AsyncHttpContext> LookupHttpContext(DWORD_PTR contextKey)
+{
+    std::lock_guard g(g_httpContextLock);
+    const auto it = g_httpContexts.find(reinterpret_cast<void*>(contextKey));
+    return it != g_httpContexts.end() ? it->second : nullptr;
+}
+
+void CALLBACK WeatherHttpCallback(HINTERNET, DWORD_PTR dwContext, DWORD status, LPVOID statusInfo, DWORD statusLen)
+{
+    const std::shared_ptr<AsyncHttpContext> ctx = LookupHttpContext(dwContext);
+    if (!ctx)
+        return;
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
+        SetEvent(ctx->closedEvent);
+        std::lock_guard g(g_httpContextLock);
+        g_httpContexts.erase(reinterpret_cast<void*>(dwContext));
+        return;
+    }
+    if (status == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR) {
+        ctx->failed.store(true, std::memory_order_release);
+        SetEvent(ctx->stepEvent);
+        return;
+    }
+    if (status == WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE && statusInfo && statusLen >= sizeof(DWORD))
+        ctx->bytesAvailable.store(*static_cast<const DWORD*>(statusInfo), std::memory_order_release);
+    else if (status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE)
+        ctx->bytesRead.store(statusLen, std::memory_order_release);
+    if (status == WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE || status == WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE ||
+        status == WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE || status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE)
+        SetEvent(ctx->stepEvent);
+}
+
+bool WaitAsyncStep(const AsyncHttpContext& ctx, HANDLE quitEvent)
+{
+    if (!ctx.stepEvent || !quitEvent)
+        return false;
+    HANDLE handles[2] = {ctx.stepEvent, quitEvent};
+    return WaitForMultipleObjects(2, handles, FALSE, 8000) == WAIT_OBJECT_0 && !ctx.failed.load(std::memory_order_acquire);
+}
+
+std::string ReadAsyncResponse(HINTERNET request, AsyncHttpContext& ctx, HANDLE quitEvent)
+{
+    const auto rawCtx = reinterpret_cast<DWORD_PTR>(&ctx);
+    ResetEvent(ctx.stepEvent);
+    if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, rawCtx) || !WaitAsyncStep(ctx, quitEvent))
+        return {};
+    ResetEvent(ctx.stepEvent);
+    if (!WinHttpReceiveResponse(request, nullptr) || !WaitAsyncStep(ctx, quitEvent))
+        return {};
+    DWORD status = 0, size = sizeof(status);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                             WINHTTP_NO_HEADER_INDEX) ||
+        status != 200)
+        return {};
+    std::string body;
+    for (;;) {
+        ctx.bytesAvailable.store(0, std::memory_order_release);
+        ResetEvent(ctx.stepEvent);
+        if (!WinHttpQueryDataAvailable(request, nullptr) || !WaitAsyncStep(ctx, quitEvent))
+            return {};
+        const DWORD n = ctx.bytesAvailable.load(std::memory_order_acquire);
+        if (n == 0)
+            return body;
+        ctx.readBuf.resize(n);
+        ctx.bytesRead.store(0, std::memory_order_release);
+        ResetEvent(ctx.stepEvent);
+        if (!WinHttpReadData(request, ctx.readBuf.data(), n, nullptr) || !WaitAsyncStep(ctx, quitEvent))
+            return {};
+        const DWORD got = ctx.bytesRead.load(std::memory_order_acquire);
+        if (got == 0)
+            return body;
+        body.append(ctx.readBuf.data(), got);
+        if (body.size() > 4 * 1024 * 1024)
+            return body;
+    }
 }
 
 } // namespace
@@ -95,6 +173,17 @@ std::string GetAny(const std::wstring& url, const std::atomic_bool& quit)
 bool IsValidWeatherCoords(double lat, double lon) { return std::isfinite(lat) && std::isfinite(lon) && std::fabs(lat) <= 90 && std::fabs(lon) <= 180; }
 
 struct WeatherSource::State : std::enable_shared_from_this<WeatherSource::State> {
+    State() : quitEvent_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+    State(const State&) = delete;
+    State& operator=(const State&) = delete;
+    ~State()
+    {
+        if (quitEvent_)
+            CloseHandle(quitEvent_);
+    }
+
+    std::string Get(const std::wstring& url, bool direct);
+    std::string GetAny(const std::wstring& url);
     std::wstring PlaceName(double lat, double lon, bool english);
     bool Locate(double& lat, double& lon, std::wstring& city, bool english);
     bool LocateByIp(double& lat, double& lon, std::wstring& city, bool english, bool located);
@@ -104,16 +193,89 @@ struct WeatherSource::State : std::enable_shared_from_this<WeatherSource::State>
 private:
     friend class WeatherSource;
     std::mutex lock_;
-    std::condition_variable wake_, doneCv_;
+    std::condition_variable wake_;
     HWND notify_ = nullptr;
     UINT message_ = 0;
-    bool active_ = false, dirty_ = true, done_ = false, detached_ = false, lastEnglish_ = false;
+    bool active_ = false, dirty_ = true, lastEnglish_ = false;
     std::atomic_bool quit_{false};
+    HANDLE quitEvent_ = nullptr;
     std::wstring cachePath_, lastName_;
     Weather latest_;
     double lastLat_ = 1000, lastLon_ = 1000;
     Fetcher fetcher_;
 };
+
+// A GET over async WinHTTP (single-owner handle close on worker thread); direct: not through the system's proxy.
+std::string WeatherSource::State::Get(const std::wstring& url, bool direct)
+{
+    if (quit_.load() || !quitEvent_)
+        return {};
+    URL_COMPONENTS u{sizeof(u)};
+    wchar_t host[256] = {}, path[2048] = {}, extra[2048] = {};
+    u.lpszHostName = host;
+    u.dwHostNameLength = 256;
+    u.lpszUrlPath = path;
+    u.dwUrlPathLength = 2048;
+    u.lpszExtraInfo = extra;
+    u.dwExtraInfoLength = 2048;
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &u))
+        return {};
+    const HINTERNET session = WinHttpOpen(L"Atrium", direct ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                                          WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
+    if (!session)
+        return {};
+    WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
+    const HINTERNET connect = WinHttpConnect(session, host, u.nPort, 0);
+    const std::wstring target = std::wstring(path) + extra;
+    const HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                           u.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) :
+                                        nullptr;
+    auto ctx = std::make_shared<AsyncHttpContext>();
+    struct HandleGuard {
+        HINTERNET session = nullptr, connect = nullptr, request = nullptr;
+        std::shared_ptr<AsyncHttpContext> ctx;
+        bool registered = false;
+        HandleGuard(HINTERNET s, HINTERNET c, HINTERNET r, std::shared_ptr<AsyncHttpContext> cx) : session(s), connect(c), request(r), ctx(std::move(cx)) {}
+        ~HandleGuard()
+        {
+            if (request)
+                WinHttpCloseHandle(request);
+            if (registered && ctx && ctx->closedEvent)
+                WaitForSingleObject(ctx->closedEvent, 250);
+            if (connect)
+                WinHttpCloseHandle(connect);
+            if (session)
+                WinHttpCloseHandle(session);
+        }
+        HandleGuard(const HandleGuard&) = delete;
+        HandleGuard& operator=(const HandleGuard&) = delete;
+    } guard{session, connect, request, ctx};
+
+    if (!request || !ctx->stepEvent || !ctx->closedEvent)
+        return {};
+    {
+        std::lock_guard g(g_httpContextLock);
+        g_httpContexts.emplace(ctx.get(), ctx);
+    }
+    auto rawCtx = reinterpret_cast<DWORD_PTR>(ctx.get());
+    if (!WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &rawCtx, sizeof(rawCtx)) ||
+        WinHttpSetStatusCallback(request, WeatherHttpCallback, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES, 0) ==
+            WINHTTP_INVALID_STATUS_CALLBACK) {
+        std::lock_guard g(g_httpContextLock);
+        g_httpContexts.erase(ctx.get());
+        return {};
+    }
+    guard.registered = true;
+    const std::string body = ReadAsyncResponse(request, *ctx, quitEvent_);
+    return quit_.load() ? std::string{} : body;
+}
+
+// Directly first; then through the system's proxy (a network that only reaches out through it).
+std::string WeatherSource::State::GetAny(const std::wstring& url)
+{
+    std::string body = Get(url, true);
+    return !body.empty() || quit_.load() ? body : Get(url, false);
+}
 
 // A place's name for coordinates (BigDataCloud's free reverse geocoding, no account): the city,
 // else the locality; "南京市" is shown as "南京", as the network's place is. Asked again only once the
@@ -125,15 +287,15 @@ std::wstring WeatherSource::State::PlaceName(double lat, double lon, bool englis
     wchar_t url[256];
     swprintf_s(url, L"https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=%.4f&longitude=%.4f&localityLanguage=%s", lat, lon,
                english ? L"en" : L"zh");
-    std::string body = GetAny(url, quit_);
+    std::string body = GetAny(url);
     if (quit_.load())
         return {};
     json::JsonObject o{nullptr};
-    if (!json::JsonObject::TryParse(winrt::to_hstring(body), o))
+    if (!TryParseJson(body, o))
         return {};
-    std::wstring name(o.GetNamedString(L"city", L""));
+    std::wstring name = JsonString(o, L"city");
     if (name.empty())
-        name = std::wstring(o.GetNamedString(L"locality", L""));
+        name = JsonString(o, L"locality");
     if (!english && name.size() > 2 && name.back() == L'市')
         name.pop_back();
     if (!name.empty()) {
@@ -166,10 +328,6 @@ bool WeatherSource::State::Locate(double& lat, double& lon, std::wstring& city, 
             lat = at.Latitude;
             lon = at.Longitude;
             located = true;
-            city = PlaceName(lat, lon, english);
-            if (quit_.load())
-                return false;
-            Log(L"weather: located by Windows (%s)", city.c_str());
         } else if (!quit_.load()) {
             Log(L"weather: Windows' location is off for desktop apps; using the network's place");
         }
@@ -179,6 +337,12 @@ bool WeatherSource::State::Locate(double& lat, double& lon, std::wstring& city, 
     }
     if (quit_.load())
         return false;
+    if (located) {
+        city = PlaceName(lat, lon, english);
+        if (quit_.load())
+            return false;
+        Log(L"weather: located by Windows (%s)", city.c_str());
+    }
     if (located && !city.empty())
         return true;
     return LocateByIp(lat, lon, city, english, located);
@@ -190,16 +354,16 @@ bool ParseWeatherLocationJson(const std::string& body, int serviceIndex, double&
                                                 {L"success", nullptr, L"city", L"latitude", L"longitude"},
                                                 {nullptr, nullptr, L"city", L"latitude", L"longitude"}};
     json::JsonObject o{nullptr};
-    if (serviceIndex < 0 || serviceIndex >= 3 || body.empty() || !json::JsonObject::TryParse(winrt::to_hstring(body), o))
+    if (serviceIndex < 0 || serviceIndex >= 3 || !TryParseJson(body, o))
         return false;
     const auto* f = kF[serviceIndex];
-    if (f[0] && !(f[1] ? o.GetNamedString(f[0], L"") == f[1] : o.GetNamedBoolean(f[0], false)))
+    if (f[0] && !(f[1] ? JsonString(o, f[0]) == f[1] : JsonBool(o, f[0])))
         return false;
     if (!o.HasKey(f[3]) || !o.HasKey(f[4]) || o.GetNamedValue(f[3]).ValueType() != json::JsonValueType::Number ||
         o.GetNamedValue(f[4]).ValueType() != json::JsonValueType::Number)
         return false;
     const double pLat = o.GetNamedNumber(f[3], 0), pLon = o.GetNamedNumber(f[4], 0);
-    return IsValidWeatherCoords(pLat, pLon) ? (city = std::wstring(o.GetNamedString(f[2], L"")), lat = pLat, lon = pLon, true) : false;
+    return IsValidWeatherCoords(pLat, pLon) ? (city = JsonString(o, f[2]), lat = pLat, lon = pLon, true) : false;
 }
 
 bool WeatherSource::State::LocateByIp(double& lat, double& lon, std::wstring& city, bool english, bool located)
@@ -221,7 +385,7 @@ bool WeatherSource::State::LocateByIp(double& lat, double& lon, std::wstring& ci
         for (const Service& s : services) {
             if (quit_.load())
                 return false;
-            std::string body = Get(s.url, direct, quit_);
+            std::string body = Get(s.url, direct);
             if (quit_.load())
                 return false;
             double pLat = 0, pLon = 0;
@@ -239,16 +403,6 @@ bool WeatherSource::State::LocateByIp(double& lat, double& lon, std::wstring& ci
 }
 
 namespace {
-
-std::wstring Wide(const std::string& s)
-{
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
-    std::wstring w(size_t(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
-    return w;
-}
-
-bool Parse(const std::string& text, json::JsonObject& out) { return !text.empty() && json::JsonObject::TryParse(Wide(text), out); }
 
 // "2026-11-09T14:00" -> minutes since 2000 (only compared with each other), hour and minute.
 int64_t Minutes(const std::wstring& t, int* hour = nullptr, int* minute = nullptr, int* weekday = nullptr)
@@ -313,30 +467,44 @@ json::JsonObject ToJson(const Weather& w)
 
 bool FromJson(const json::JsonObject& o, Weather& w)
 {
-    try {
-        w.city = std::wstring(o.GetNamedString(L"city", L""));
-        w.temp = float(o.GetNamedNumber(L"temp", 0));
-        w.hi = float(o.GetNamedNumber(L"hi", 0));
-        w.lo = float(o.GetNamedNumber(L"lo", 0));
-        w.code = int(o.GetNamedNumber(L"code", 0));
-        w.day = o.GetNamedBoolean(L"day", true);
-        w.lat = o.GetNamedNumber(L"lat", 0);
-        w.lon = o.GetNamedNumber(L"lon", 0);
-        w.placed = o.HasKey(L"lat") && o.HasKey(L"lon") && IsValidWeatherCoords(w.lat, w.lon);
-        for (const auto& v : o.GetNamedArray(L"hours", json::JsonArray())) {
-            auto x = v.GetObject();
-            w.hours.push_back({std::wstring(x.GetNamedString(L"label", L"")), int(x.GetNamedNumber(L"code", 0)), x.GetNamedBoolean(L"day", true),
-                               float(x.GetNamedNumber(L"temp", 0)), int(x.GetNamedNumber(L"event", 0))});
+    w = Weather{};
+    if (!o)
+        return false;
+    w.city = JsonString(o, L"city");
+    w.temp = float(JsonNumber(o, L"temp"));
+    w.hi = float(JsonNumber(o, L"hi"));
+    w.lo = float(JsonNumber(o, L"lo"));
+    w.code = int(JsonNumber(o, L"code"));
+    w.day = JsonBool(o, L"day", true);
+    w.lat = JsonNumber(o, L"lat");
+    w.lon = JsonNumber(o, L"lon");
+    w.placed = o.HasKey(L"lat") && o.HasKey(L"lon") && o.GetNamedValue(L"lat").ValueType() == json::JsonValueType::Number &&
+               o.GetNamedValue(L"lon").ValueType() == json::JsonValueType::Number && IsValidWeatherCoords(w.lat, w.lon);
+    json::JsonArray hours{nullptr}, days{nullptr};
+    if (NamedArr(o, L"hours", hours)) {
+        for (const auto& v : hours) {
+            if (v.ValueType() != json::JsonValueType::Object) {
+                w = Weather{};
+                return false;
+            }
+            const auto x = v.GetObject();
+            w.hours.push_back(
+                {JsonString(x, L"label"), int(JsonNumber(x, L"code")), JsonBool(x, L"day", true), float(JsonNumber(x, L"temp")), int(JsonNumber(x, L"event"))});
         }
-        for (const auto& v : o.GetNamedArray(L"days", json::JsonArray())) {
-            auto x = v.GetObject();
-            w.days.push_back({std::wstring(x.GetNamedString(L"label", L"")), int(x.GetNamedNumber(L"code", 0)), float(x.GetNamedNumber(L"lo", 0)),
-                              float(x.GetNamedNumber(L"hi", 0))});
-        }
-        w.ok = !w.hours.empty() && !w.days.empty();
-    } catch (...) {
-        w = Weather{};
     }
+    if (NamedArr(o, L"days", days)) {
+        for (const auto& v : days) {
+            if (v.ValueType() != json::JsonValueType::Object) {
+                w = Weather{};
+                return false;
+            }
+            const auto x = v.GetObject();
+            w.days.push_back({JsonString(x, L"label"), int(JsonNumber(x, L"code")), float(JsonNumber(x, L"lo")), float(JsonNumber(x, L"hi"))});
+        }
+    }
+    w.ok = !w.hours.empty() && !w.days.empty();
+    if (!w.ok)
+        w = Weather{};
     return w.ok;
 }
 
@@ -410,18 +578,16 @@ WeatherSource::WeatherSource(HWND notify, UINT message, Fetcher fetcher) : state
 
 WeatherSource::~WeatherSource()
 {
-    bool joined = false;
     {
-        std::unique_lock g(state_->lock_);
+        std::lock_guard g(state_->lock_);
         state_->quit_.store(true);
         state_->notify_ = nullptr;
-        state_->wake_.notify_all();
-        joined = state_->doneCv_.wait_for(g, std::chrono::milliseconds(250), [&] { return state_->done_; });
-        if (!joined)
-            state_->detached_ = true;
     }
+    if (state_->quitEvent_)
+        SetEvent(state_->quitEvent_);
+    state_->wake_.notify_all();
     if (thread_.joinable())
-        joined ? thread_.join() : thread_.detach();
+        thread_.join();
 }
 
 void WeatherSource::SetActive(bool on)
@@ -470,18 +636,13 @@ void WeatherSource::State::Run()
             english = LanguageIsEnglish();
         }
         bool ok = false;
-        try {
-            if (Weather w; fetcher_) {
-                if (ok = fetcher_(quit_, w); ok && !quit_) {
-                    std::lock_guard g(lock_);
-                    latest_ = std::move(w);
-                }
-            } else {
-                ok = Fetch(english);
+        if (Weather w; fetcher_) {
+            if (ok = fetcher_(quit_, w); ok && !quit_) {
+                std::lock_guard g(lock_);
+                latest_ = std::move(w);
             }
-        } catch (...) {
-            if (!quit_)
-                Log(L"weather: fetch failed");
+        } else {
+            ok = Fetch(english);
         }
         if (quit_)
             break;
@@ -494,15 +655,7 @@ void WeatherSource::State::Run()
         if (notify)
             PostMessageW(notify, message_, 0, 0);
     }
-    bool detached;
-    {
-        std::lock_guard g(lock_);
-        detached = detached_;
-        done_ = true;
-    }
-    if (!detached)
-        winrt::uninit_apartment();
-    doneCv_.notify_all();
+    winrt::uninit_apartment();
 }
 
 namespace {
@@ -510,10 +663,6 @@ struct HourItem {
     int64_t at;
     WeatherHour hour;
 };
-bool NamedArr(const json::JsonObject& o, const wchar_t* k, json::JsonArray& out)
-{
-    return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Array ? (out = o.GetNamedArray(k), true) : false;
-}
 void AddSunEvents(const json::JsonObject& daily, int64_t now, std::vector<HourItem>& items)
 {
     if (items.empty())
@@ -524,6 +673,8 @@ void AddSunEvents(const json::JsonObject& daily, int64_t now, std::vector<HourIt
         if (!NamedArr(daily, key, list))
             continue;
         for (uint32_t i = 0; i < list.Size(); ++i) {
+            if (list.GetAt(i).ValueType() != json::JsonValueType::String)
+                continue;
             int h = 0, m = 0;
             int64_t at = Minutes(std::wstring(list.GetStringAt(i)), &h, &m);
             if (at <= now || at >= last)
@@ -550,14 +701,14 @@ bool ParseWeatherForecastJson(const std::string& body, double lat, double lon, c
     auto obj = [&](const wchar_t* k, json::JsonObject& x) {
         return o.HasKey(k) && o.GetNamedValue(k).ValueType() == json::JsonValueType::Object ? (x = o.GetNamedObject(k), true) : false;
     };
-    if (!Parse(body, o) || !obj(L"current", cur) || !obj(L"hourly", hr) || !obj(L"daily", dy) || !NamedArr(hr, L"time", tm) ||
+    if (!TryParseJson(body, o) || !obj(L"current", cur) || !obj(L"hourly", hr) || !obj(L"daily", dy) || !NamedArr(hr, L"time", tm) ||
         !NamedArr(hr, L"temperature_2m", tp) || !NamedArr(hr, L"weather_code", cd) || !NamedArr(hr, L"is_day", ds) || !NamedArr(dy, L"time", dt) ||
         !NamedArr(dy, L"weather_code", dc) || !NamedArr(dy, L"temperature_2m_max", hi) || !NamedArr(dy, L"temperature_2m_min", lo))
         return false;
     Weather w;
-    w.city = city, w.lat = lat, w.lon = lon, w.placed = IsValidWeatherCoords(lat, lon), w.temp = float(cur.GetNamedNumber(L"temperature_2m", 0)),
-    w.code = int(cur.GetNamedNumber(L"weather_code", 0)), w.day = cur.GetNamedNumber(L"is_day", 1) != 0;
-    const int64_t now = Minutes(std::wstring(cur.GetNamedString(L"time", L"")));
+    w.city = city, w.lat = lat, w.lon = lon, w.placed = IsValidWeatherCoords(lat, lon), w.temp = float(JsonNumber(cur, L"temperature_2m")),
+    w.code = int(JsonNumber(cur, L"weather_code")), w.day = JsonNumber(cur, L"is_day", 1) != 0;
+    const int64_t now = Minutes(JsonString(cur, L"time"));
     std::vector<HourItem> items;
     auto isNum = [](const json::JsonArray& a, uint32_t i) { return a.GetAt(i).ValueType() == json::JsonValueType::Number; };
     for (uint32_t i = 0, nh = std::min({tm.Size(), tp.Size(), cd.Size(), ds.Size()}); i < nh && items.size() < 6; ++i) {
@@ -609,7 +760,7 @@ bool WeatherSource::State::Fetch(bool english)
                L"&current=temperature_2m,weather_code,is_day&hourly=temperature_2m,weather_code,is_day"
                L"&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
                lat, lon);
-    std::string forecast = GetAny(url, quit_);
+    std::string forecast = GetAny(url);
     if (quit_.load())
         return false;
     Weather w;

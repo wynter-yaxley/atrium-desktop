@@ -4,15 +4,18 @@
 
 #include <cmath>
 #include <iostream>
-#include <stdexcept>
 
 using namespace atrium;
 
 namespace {
+bool g_failed = false;
+
 void Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (!condition) {
+        std::cerr << message << '\n';
+        g_failed = true;
+    }
 }
 
 BarScene Scene(float scale = 1)
@@ -139,16 +142,10 @@ void CheckDragging()
 
 int main()
 {
-    bool passed = true;
-    for (auto check : {CheckSmallLeave, CheckMoveBeforeTick, CheckIndependentChannels, CheckOrdinaryHover, CheckEarlyOnly, CheckDragging}) {
-        try {
-            check();
-        } catch (const std::exception& error) {
-            std::cerr << error.what() << '\n';
-            passed = false;
-        }
-    }
-    if (!passed)
+    for (auto check : {CheckSmallLeave, CheckMoveBeforeTick, CheckIndependentChannels, CheckOrdinaryHover, CheckEarlyOnly, CheckDragging})
+        check();
+    if (g_failed)
         return 1;
     std::cout << "Four-DIP departure, real wave geometry, independent channels and ordinary hover checks passed.\n";
+    return 0;
 }

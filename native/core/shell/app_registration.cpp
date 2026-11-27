@@ -12,25 +12,17 @@
 
 namespace atrium {
 
-bool IsRegisteredApplication(const std::wstring& directory)
+namespace {
+
+std::wstring ReadRegString(HKEY key, const wchar_t* name)
 {
-    wchar_t value[32768]{};
+    wchar_t value[1024]{};
     DWORD bytes = sizeof(value);
-    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Atrium", L"InstallLocation", RRF_RT_REG_SZ, nullptr,
-                        value, &bytes) == ERROR_SUCCESS &&
-           _wcsicmp(value, directory.c_str()) == 0;
+    return key && RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, value, &bytes) == ERROR_SUCCESS ? std::wstring(value) : std::wstring();
 }
 
-void RegisterApplication(const std::wstring& directory)
+std::wstring SyncUninstallRegistry(const std::wstring& directory, const std::wstring& exe)
 {
-    if (IsDevelopmentBuild())
-        return;
-    const std::wstring exe = directory + L"\\Atrium.exe";
-    const std::wstring uninstall = directory + L"\\Uninstall.ps1";
-    if (GetFileAttributesW(uninstall.c_str()) == INVALID_FILE_ATTRIBUTES ||
-        GetFileAttributesW((directory + L"\\Settings\\Atrium.Settings.exe").c_str()) == INVALID_FILE_ATTRIBUTES)
-        return; // a native-only development build is not an installed app
-
     constexpr auto kRegistration = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Atrium";
     const std::pair<const wchar_t*, std::wstring> fields[] = {
         {L"DisplayName", L"Atrium"},
@@ -40,17 +32,12 @@ void RegisterApplication(const std::wstring& directory)
         {L"UninstallString", L"\"" + exe + L"\" --uninstall"},
         {L"URLInfoAbout", L"https://github.com/wynter-yaxley/atrium-desktop"},
     };
-    auto read = [](HKEY key, const wchar_t* name) {
-        wchar_t value[1024]{};
-        DWORD bytes = sizeof(value);
-        return key && RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, value, &bytes) == ERROR_SUCCESS ? std::wstring(value) : std::wstring();
-    };
     HKEY key = nullptr;
     bool changed = RegOpenKeyExW(HKEY_CURRENT_USER, kRegistration, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS;
-    std::wstring previousDirectory = read(key, L"InstallLocation");
+    std::wstring previousDirectory = ReadRegString(key, L"InstallLocation");
     if (key) {
         for (const auto& [name, value] : fields)
-            changed |= read(key, name) != value;
+            changed |= ReadRegString(key, name) != value;
         for (const wchar_t* name : {L"NoModify", L"NoRepair"}) {
             DWORD value = 0, bytes = sizeof(value);
             changed |= RegGetValueW(key, nullptr, name, RRF_RT_REG_DWORD, nullptr, &value, &bytes) != ERROR_SUCCESS || value != 1;
@@ -60,23 +47,41 @@ void RegisterApplication(const std::wstring& directory)
         RegCloseKey(key);
         key = nullptr;
     }
-    if (changed) {
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegistration, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
-            bool ok = true;
-            for (const auto& [name, value] : fields)
-                ok &= RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()), DWORD((value.size() + 1) * sizeof(wchar_t))) ==
-                      ERROR_SUCCESS;
-            RegDeleteValueW(key, L"DisplayVersion");
-            const DWORD one = 1;
-            for (const wchar_t* name : {L"NoModify", L"NoRepair"})
-                ok &= RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one), sizeof(one)) == ERROR_SUCCESS;
-            RegCloseKey(key);
-            Log(ok ? L"app: registered Atrium in Installed apps (%s)" : L"app: could not write all application information (%s)", directory.c_str());
-        } else {
-            Log(L"app: could not register Atrium in Installed apps");
-        }
+    if (!changed)
+        return previousDirectory;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegistration, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        bool ok = true;
+        for (const auto& [name, value] : fields)
+            ok &= RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()), DWORD((value.size() + 1) * sizeof(wchar_t))) ==
+                  ERROR_SUCCESS;
+        RegDeleteValueW(key, L"DisplayVersion");
+        const DWORD one = 1;
+        for (const wchar_t* name : {L"NoModify", L"NoRepair"})
+            ok &= RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one), sizeof(one)) == ERROR_SUCCESS;
+        RegCloseKey(key);
+        Log(ok ? L"app: registered Atrium in Installed apps (%s)" : L"app: could not write all application information (%s)", directory.c_str());
+    } else {
+        Log(L"app: could not register Atrium in Installed apps");
     }
+    return previousDirectory;
+}
 
+void MigrateLegacyShortcut(IShellLinkW& link, const std::wstring& legacy, const std::wstring& directory, const std::wstring& exe)
+{
+    // Migrate the old shortcut only when it belongs to this same distribution.
+    winrt::com_ptr<IPersistFile> file;
+    if (FAILED(link.QueryInterface(IID_PPV_ARGS(file.put()))) || FAILED(file->Load(legacy.c_str(), STGM_READ)))
+        return;
+    wchar_t target[MAX_PATH]{};
+    link.GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH);
+    if (_wcsicmp(target, (directory + L"\\Atrium.Core.exe").c_str()) == 0 || _wcsicmp(target, exe.c_str()) == 0) {
+        if (DeleteFileW(legacy.c_str()))
+            SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW, legacy.c_str(), nullptr);
+    }
+}
+
+void SyncStartMenuShortcut(const std::wstring& directory, const std::wstring& exe, const std::wstring& previousDirectory)
+{
     PWSTR programs = nullptr;
     HRESULT hr = SHGetKnownFolderPath(FOLDERID_Programs, KF_FLAG_DEFAULT, nullptr, &programs);
     std::wstring shortcut = programs ? std::wstring(programs) + L"\\Atrium.lnk" : L"";
@@ -124,16 +129,32 @@ void RegisterApplication(const std::wstring& directory)
         return;
     }
     SHChangeNotify(existing ? SHCNE_UPDATEITEM : SHCNE_CREATE, SHCNF_PATHW, shortcut.c_str(), nullptr);
+    MigrateLegacyShortcut(*link, legacy, directory, exe);
+}
 
-    // Migrate the old shortcut only when it belongs to this same distribution.
-    if (SUCCEEDED(link.as<IPersistFile>()->Load(legacy.c_str(), STGM_READ))) {
-        wchar_t target[MAX_PATH]{};
-        link->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH);
-        if (_wcsicmp(target, (directory + L"\\Atrium.Core.exe").c_str()) == 0 || _wcsicmp(target, exe.c_str()) == 0) {
-            if (DeleteFileW(legacy.c_str()))
-                SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW, legacy.c_str(), nullptr);
-        }
-    }
+} // namespace
+
+bool IsRegisteredApplication(const std::wstring& directory)
+{
+    wchar_t value[32768]{};
+    DWORD bytes = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Atrium", L"InstallLocation", RRF_RT_REG_SZ, nullptr,
+                        value, &bytes) == ERROR_SUCCESS &&
+           _wcsicmp(value, directory.c_str()) == 0;
+}
+
+void RegisterApplication(const std::wstring& directory)
+{
+    if (IsDevelopmentBuild())
+        return;
+    const std::wstring exe = directory + L"\\Atrium.exe";
+    const std::wstring uninstall = directory + L"\\Uninstall.ps1";
+    if (GetFileAttributesW(uninstall.c_str()) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW((directory + L"\\Settings\\Atrium.Settings.exe").c_str()) == INVALID_FILE_ATTRIBUTES)
+        return; // a native-only development build is not an installed app
+
+    const std::wstring previousDirectory = SyncUninstallRegistry(directory, exe);
+    SyncStartMenuShortcut(directory, exe, previousDirectory);
 }
 
 } // namespace atrium

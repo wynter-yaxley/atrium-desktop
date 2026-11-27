@@ -8,6 +8,7 @@
 
 #include "localization.h"
 #include "log.h"
+#include "shell/quick_toggles.h"
 #include "shell/wifi.h"
 #include "../posted.h"
 
@@ -36,25 +37,40 @@ namespace {
 winrt::com_ptr<IAudioEndpointVolume> DefaultVolume(std::wstring* name = nullptr, std::wstring* id = nullptr)
 {
     winrt::com_ptr<IMMDeviceEnumerator> devices;
-    winrt::com_ptr<IMMDevice> device;
-    winrt::com_ptr<IAudioEndpointVolume> volume;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(devices.put()))) ||
-        FAILED(devices->GetDefaultAudioEndpoint(eRender, eConsole, device.put())) ||
-        FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, nullptr, volume.put_void())))
+    if (const HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(devices.put())); FAILED(hr) || !devices) {
+        Log(L"status: CoCreateInstance(MMDeviceEnumerator) failed (0x%08X)", unsigned(hr));
         return nullptr;
+    }
+    winrt::com_ptr<IMMDevice> device;
+    if (const HRESULT hr = devices->GetDefaultAudioEndpoint(eRender, eConsole, device.put()); FAILED(hr) || !device) {
+        Log(L"status: GetDefaultAudioEndpoint failed (0x%08X)", unsigned(hr));
+        return nullptr;
+    }
+    winrt::com_ptr<IAudioEndpointVolume> volume;
+    if (const HRESULT hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, nullptr, volume.put_void()); FAILED(hr) || !volume) {
+        Log(L"status: Activate(IAudioEndpointVolume) failed (0x%08X)", unsigned(hr));
+        return nullptr;
+    }
     if (id) {
         LPWSTR rawId = nullptr;
-        if (SUCCEEDED(device->GetId(&rawId)) && rawId)
+        if (const HRESULT hr = device->GetId(&rawId); SUCCEEDED(hr) && rawId) {
             *id = rawId;
-        CoTaskMemFree(rawId);
+            CoTaskMemFree(rawId);
+        } else {
+            Log(L"status: default audio GetId failed (0x%08X)", unsigned(hr));
+        }
     }
     winrt::com_ptr<IPropertyStore> props;
-    if (name && SUCCEEDED(device->OpenPropertyStore(STGM_READ, props.put()))) {
-        PROPVARIANT v;
-        PropVariantInit(&v);
-        if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
-            *name = v.pwszVal;
-        PropVariantClear(&v);
+    if (name) {
+        if (const HRESULT hr = device->OpenPropertyStore(STGM_READ, props.put()); SUCCEEDED(hr) && props) {
+            PROPVARIANT v;
+            PropVariantInit(&v);
+            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
+                *name = v.pwszVal;
+            PropVariantClear(&v);
+        } else {
+            Log(L"status: audio OpenPropertyStore failed (0x%08X)", unsigned(hr));
+        }
     }
     return volume;
 }
@@ -99,14 +115,18 @@ std::unordered_map<uint64_t, uint64_t> DefaultRouteMetrics()
 {
     std::unordered_map<uint64_t, uint64_t> best;
     std::vector<std::tuple<uint64_t, ADDRESS_FAMILY, ULONG>> ifm;
-    if (PMIB_IPINTERFACE_TABLE t = nullptr; GetIpInterfaceTable(AF_UNSPEC, &t) == NO_ERROR && t) {
-        for (ULONG i = 0; i < t->NumEntries; ++i)
-            ifm.emplace_back(t->Table[i].InterfaceLuid.Value, t->Table[i].Family, t->Table[i].Metric);
-        FreeMibTable(t);
+    PMIB_IPINTERFACE_TABLE ifTable = nullptr;
+    if (const DWORD err = GetIpInterfaceTable(AF_UNSPEC, &ifTable); err == NO_ERROR && ifTable) {
+        for (ULONG i = 0; i < ifTable->NumEntries; ++i)
+            ifm.emplace_back(ifTable->Table[i].InterfaceLuid.Value, ifTable->Table[i].Family, ifTable->Table[i].Metric);
+        FreeMibTable(ifTable);
+    } else if (err != NO_ERROR) {
+        Log(L"status: GetIpInterfaceTable failed (%lu)", err);
     }
-    if (PMIB_IPFORWARD_TABLE2 t = nullptr; GetIpForwardTable2(AF_UNSPEC, &t) == NO_ERROR && t) {
-        for (ULONG i = 0; i < t->NumEntries; ++i) {
-            const MIB_IPFORWARD_ROW2& r = t->Table[i];
+    PMIB_IPFORWARD_TABLE2 fwdTable = nullptr;
+    if (const DWORD err = GetIpForwardTable2(AF_UNSPEC, &fwdTable); err == NO_ERROR && fwdTable) {
+        for (ULONG i = 0; i < fwdTable->NumEntries; ++i) {
+            const MIB_IPFORWARD_ROW2& r = fwdTable->Table[i];
             if (r.DestinationPrefix.PrefixLength != 0)
                 continue;
             const uint64_t luid = r.InterfaceLuid.Value;
@@ -116,7 +136,9 @@ std::unordered_map<uint64_t, uint64_t> DefaultRouteMetrics()
             if (auto [bit, ins] = best.emplace(luid, eff); !ins && eff < bit->second)
                 bit->second = eff;
         }
-        FreeMibTable(t);
+        FreeMibTable(fwdTable);
+    } else if (err != NO_ERROR) {
+        Log(L"status: GetIpForwardTable2 failed (%lu)", err);
     }
     return best;
 }
@@ -130,13 +152,19 @@ struct NlmAdapter {
 void ReadNlm(bool needGlobalNet, bool& online, bool& connected, std::wstring& globalNet, std::vector<NlmAdapter>& byAdapter)
 {
     winrt::com_ptr<INetworkListManager> nlm;
-    if (FAILED(CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(nlm.put()))))
+    if (const HRESULT hr = CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(nlm.put())); FAILED(hr) || !nlm) {
+        Log(L"status: CoCreateInstance(NetworkListManager) failed (0x%08X)", unsigned(hr));
         return;
-    if (NLM_CONNECTIVITY c{}; SUCCEEDED(nlm->GetConnectivity(&c))) {
+    }
+    NLM_CONNECTIVITY c{};
+    if (const HRESULT hr = nlm->GetConnectivity(&c); SUCCEEDED(hr)) {
         online = (c & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0;
         connected = c != NLM_CONNECTIVITY_DISCONNECTED;
+    } else {
+        Log(L"status: NLM GetConnectivity failed (0x%08X)", unsigned(hr));
     }
-    if (winrt::com_ptr<IEnumNetworkConnections> conns; SUCCEEDED(nlm->GetNetworkConnections(conns.put())))
+    winrt::com_ptr<IEnumNetworkConnections> conns;
+    if (const HRESULT hr = nlm->GetNetworkConnections(conns.put()); SUCCEEDED(hr) && conns) {
         for (winrt::com_ptr<INetworkConnection> conn; conns->Next(1, conn.put(), nullptr) == S_OK; conn = nullptr) {
             VARIANT_BOOL ok = VARIANT_FALSE;
             GUID gid{};
@@ -154,29 +182,43 @@ void ReadNlm(bool needGlobalNet, bool& online, bool& connected, std::wstring& gl
             } else if (it->name.empty() && !n.empty())
                 it->name = std::move(n);
         }
-    if (winrt::com_ptr<IEnumNetworks> nets; needGlobalNet && SUCCEEDED(nlm->GetNetworks(NLM_ENUM_NETWORK_CONNECTED, nets.put())))
-        for (winrt::com_ptr<INetwork> net; nets->Next(1, net.put(), nullptr) == S_OK; net = nullptr) {
-            NLM_CONNECTIVITY nc{};
-            net->GetConnectivity(&nc);
-            std::wstring n = NetName(net.get());
-            if (nc & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) {
-                globalNet = std::move(n);
-                return;
+    } else {
+        Log(L"status: NLM GetNetworkConnections failed (0x%08X)", unsigned(hr));
+    }
+    if (needGlobalNet) {
+        winrt::com_ptr<IEnumNetworks> nets;
+        if (const HRESULT hr = nlm->GetNetworks(NLM_ENUM_NETWORK_CONNECTED, nets.put()); SUCCEEDED(hr) && nets) {
+            for (winrt::com_ptr<INetwork> net; nets->Next(1, net.put(), nullptr) == S_OK; net = nullptr) {
+                NLM_CONNECTIVITY nc{};
+                net->GetConnectivity(&nc);
+                std::wstring n = NetName(net.get());
+                if (nc & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) {
+                    globalNet = std::move(n);
+                    return;
+                }
+                globalNet = globalNet.empty() ? std::move(n) : globalNet;
             }
-            globalNet = globalNet.empty() ? std::move(n) : globalNet;
+        } else {
+            Log(L"status: NLM GetNetworks failed (0x%08X)", unsigned(hr));
         }
+    }
 }
 
 void QueryNetwork(SystemStatus& s)
 {
     std::vector<GUID> guids;
-    if (PMIB_IF_TABLE2 t = nullptr; GetIfTable2(&t) == NO_ERROR && t) {
-        for (ULONG i = 0; i < t->NumEntries; ++i)
-            if (auto k = UsableKind(t->Table[i])) {
-                s.links.push_back({*k, t->Table[i].InterfaceLuid.Value, t->Table[i].Alias[0] ? t->Table[i].Alias : t->Table[i].Description});
-                guids.push_back(t->Table[i].InterfaceGuid);
+    PMIB_IF_TABLE2 ifTable = nullptr;
+    if (const DWORD err = GetIfTable2(&ifTable); err == NO_ERROR && ifTable) {
+        for (ULONG i = 0; i < ifTable->NumEntries; ++i) {
+            const MIB_IF_ROW2& row = ifTable->Table[i];
+            if (auto k = UsableKind(row)) {
+                s.links.push_back({*k, row.InterfaceLuid.Value, row.Alias[0] ? row.Alias : row.Description});
+                guids.push_back(row.InterfaceGuid);
             }
-        FreeMibTable(t);
+        }
+        FreeMibTable(ifTable);
+    } else if (err != NO_ERROR) {
+        Log(L"status: GetIfTable2 failed (%lu)", err);
     }
     bool online = false, connected = false;
     std::wstring globalNet;
@@ -242,7 +284,8 @@ void DeriveNetworkStatus(SystemStatus& s, bool globalOnline, bool globalConnecte
 void SystemStatusReader::UnwatchVolume()
 {
     if (watched_ && callback_)
-        watched_->UnregisterControlChangeNotify(callback_.get());
+        if (const HRESULT hr = watched_->UnregisterControlChangeNotify(callback_.get()); FAILED(hr))
+            Log(L"status: UnregisterControlChangeNotify failed (0x%08X)", unsigned(hr));
     watched_ = nullptr;
     watchedEndpointId_.clear();
 }
@@ -261,9 +304,11 @@ void SystemStatusReader::WatchVolume()
     UnwatchVolume();
     if (!callback_)
         callback_ = winrt::make<VolumeCallback>(notify_, volumeMessage_);
-    if (SUCCEEDED(volume->RegisterControlChangeNotify(callback_.get()))) {
+    if (const HRESULT hr = volume->RegisterControlChangeNotify(callback_.get()); SUCCEEDED(hr)) {
         watched_ = std::move(volume);
         watchedEndpointId_ = std::move(endpointId);
+    } else {
+        Log(L"status: RegisterControlChangeNotify failed (0x%08X)", unsigned(hr));
     }
 }
 
@@ -290,7 +335,11 @@ void SystemStatusReader::Refresh() { SetEvent(wake_); }
 void SystemStatusReader::Run()
 {
     SetThreadDescription(GetCurrentThread(), L"Atrium system status");
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) {
+        Log(L"status: CoInitializeEx failed (0x%08X)", unsigned(com));
+        return;
+    }
     HANDLE events[] = {quit_, wake_};
     while (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
         auto status = std::make_unique<SystemStatus>(QuerySystemStatus());
@@ -301,7 +350,8 @@ void SystemStatusReader::Run()
     }
     UnwatchVolume();
     callback_ = nullptr;
-    winrt::uninit_apartment();
+    if (SUCCEEDED(com))
+        CoUninitialize();
 }
 
 SystemStatus QuerySystemStatus()
@@ -314,22 +364,27 @@ SystemStatus QuerySystemStatus()
         s.batteryPercent = s.battery ? ps.BatteryLifePercent : -1;
         s.charging = ps.ACLineStatus == 1;
         s.batteryMinutes = s.battery && !s.charging && ps.BatteryLifeTime != DWORD(-1) ? int(ps.BatteryLifeTime / 60) : -1;
+    } else {
+        Log(L"status: GetSystemPowerStatus failed (%lu)", GetLastError());
     }
-    try {
-        QueryNetwork(s);
-        // Read interactive volume last: a slower network query must not
-        // deliver a volume value captured before the user's latest input.
-        if (auto v = DefaultVolume(&s.audioDevice)) {
-            float level = 0;
-            BOOL mute = FALSE;
-            v->GetMasterVolumeLevelScalar(&level);
-            v->GetMute(&mute);
+    s.airplane = ReadAirplaneModeFast();
+    QueryNetwork(s);
+    // Read interactive volume last: a slower network query must not
+    // deliver a volume value captured before the user's latest input.
+    if (auto v = DefaultVolume(&s.audioDevice)) {
+        float level = 0;
+        BOOL mute = FALSE;
+        const HRESULT levelHr = v->GetMasterVolumeLevelScalar(&level);
+        const HRESULT muteHr = v->GetMute(&mute);
+        if (FAILED(levelHr))
+            Log(L"status: GetMasterVolumeLevelScalar failed (0x%08X)", unsigned(levelHr));
+        if (FAILED(muteHr))
+            Log(L"status: GetMute failed (0x%08X)", unsigned(muteHr));
+        if (SUCCEEDED(levelHr)) {
             s.audio = true;
-            s.volume = int(std::lround(level * 100));
-            s.muted = mute != FALSE;
+            s.volume = int(std::lround(std::clamp(level, 0.f, 1.f) * 100));
+            s.muted = SUCCEEDED(muteHr) && mute != FALSE;
         }
-    } catch (...) {
-        Log(L"status: query failed");
     }
     return s;
 }
@@ -340,30 +395,46 @@ int AdjustVolume(int delta)
     if (!v)
         return -1;
     float level = 0;
-    v->GetMasterVolumeLevelScalar(&level);
+    if (const HRESULT hr = v->GetMasterVolumeLevelScalar(&level); FAILED(hr)) {
+        Log(L"status: GetMasterVolumeLevelScalar failed (0x%08X)", unsigned(hr));
+        return -1;
+    }
     level = std::clamp(level + float(delta) / 100.f, 0.f, 1.f);
-    v->SetMasterVolumeLevelScalar(level, nullptr);
+    if (const HRESULT hr = v->SetMasterVolumeLevelScalar(level, nullptr); FAILED(hr)) {
+        Log(L"status: SetMasterVolumeLevelScalar failed (0x%08X)", unsigned(hr));
+        return -1;
+    }
     if (delta > 0)
-        v->SetMute(FALSE, nullptr);
+        if (const HRESULT hr = v->SetMute(FALSE, nullptr); FAILED(hr))
+            Log(L"status: SetMute failed (0x%08X)", unsigned(hr));
     return int(std::lround(level * 100));
 }
 
 void SetVolume(int percent)
 {
     if (auto v = DefaultVolume()) {
-        v->SetMasterVolumeLevelScalar(float(std::clamp(percent, 0, 100)) / 100.f, nullptr);
+        if (const HRESULT hr = v->SetMasterVolumeLevelScalar(float(std::clamp(percent, 0, 100)) / 100.f, nullptr); FAILED(hr))
+            Log(L"status: SetMasterVolumeLevelScalar failed (0x%08X)", unsigned(hr));
         if (percent > 0)
-            v->SetMute(FALSE, nullptr);
+            if (const HRESULT hr = v->SetMute(FALSE, nullptr); FAILED(hr))
+                Log(L"status: SetMute failed (0x%08X)", unsigned(hr));
     }
 }
 
 bool ToggleMute()
 {
     auto v = DefaultVolume();
-    BOOL mute = FALSE;
-    if (!v || FAILED(v->GetMute(&mute)))
+    if (!v)
         return false;
-    v->SetMute(!mute, nullptr);
+    BOOL mute = FALSE;
+    if (const HRESULT hr = v->GetMute(&mute); FAILED(hr)) {
+        Log(L"status: GetMute failed (0x%08X)", unsigned(hr));
+        return false;
+    }
+    if (const HRESULT hr = v->SetMute(!mute, nullptr); FAILED(hr)) {
+        Log(L"status: SetMute failed (0x%08X)", unsigned(hr));
+        return false;
+    }
     return true;
 }
 

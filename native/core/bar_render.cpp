@@ -92,19 +92,37 @@ bool ScreenLitAbove(BarEdge edge, RECT bar)
     return lit;
 }
 
-void FreezeBackdrop(const Gpu& gpu, winrt::com_ptr<ID3D11Texture2D>& frozen, winrt::com_ptr<ID3D11Texture2D>& frame)
+bool FreezeBackdrop(const Gpu& gpu, winrt::com_ptr<ID3D11Texture2D>& frozen, winrt::com_ptr<ID3D11Texture2D>& frame)
 {
     if (!frame)
-        return;
+        return true;
     if (!frozen) {
         D3D11_TEXTURE2D_DESC d{};
         frame->GetDesc(&d);
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         d.MiscFlags = 0;
-        winrt::check_hresult(gpu.device->CreateTexture2D(&d, nullptr, frozen.put()));
+        const HRESULT hr = gpu.device->CreateTexture2D(&d, nullptr, frozen.put());
+        if (FAILED(hr)) {
+            Log(L"render: freeze backdrop failed (0x%08X); retrying", static_cast<unsigned>(hr));
+            return false;
+        }
         gpu.context->CopyResource(frozen.get(), frame.get());
     }
     frame = frozen;
+    return true;
+}
+
+bool IsDeviceRemovedHr(HRESULT hr) { return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG; }
+
+bool DeviceLost(const Gpu& gpu, const wchar_t* where)
+{
+    if (!gpu.device)
+        return true;
+    const HRESULT reason = gpu.device->GetDeviceRemovedReason();
+    if (SUCCEEDED(reason))
+        return false;
+    Log(L"render: device lost (%s, 0x%08X); retrying", where, static_cast<unsigned>(reason));
+    return true;
 }
 
 void LogRenderMinuteStats(RenderMinuteStats& stats, unsigned keepFrameCopies)
@@ -236,12 +254,20 @@ struct BarRender {
                 capture = DuplicationCapture::Create(gpu, snap.hmonitor, why, elsewhere);
                 if (capture || !DuplicationCapture::Temporary(why))
                     break;
+                if (DeviceLost(gpu, L"select capture")) {
+                    stop = Bar::SessionEnd::Retry;
+                    return nullptr;
+                }
                 if (tries == 0)
                     Log(L"render: desktop duplication unavailable for now (0x%08X), trying again every second", static_cast<unsigned>(why));
                 if (WaitForSingleObject(bar.quit_, 1000) != WAIT_TIMEOUT) {
                     stop = Bar::SessionEnd::Exit;
                     return nullptr;
                 }
+            }
+            if (!capture && (IsDeviceRemovedHr(why) || DeviceLost(gpu, L"duplication init"))) {
+                stop = Bar::SessionEnd::Retry;
+                return nullptr;
             }
             if (!capture && elsewhere)
                 PreferPowerSavingGpu();
@@ -276,6 +302,10 @@ struct BarRender {
                 stop = Bar::SessionEnd::Switch;
                 return true;
             }
+            if (IsDeviceRemovedHr(why) || DeviceLost(gpu, L"duplication probe")) {
+                stop = Bar::SessionEnd::Retry;
+                return true;
+            }
             if (elsewhere) {
                 bar.capturePolicy_.OnDuplicationUnavailable(tickMs, CapturePolicy::DuplicationFailure::Elsewhere, monitorId, captureGeneration);
             }
@@ -300,7 +330,7 @@ struct BarRender {
             // Desktop Duplication keeps coming back black: try Windows.Graphics.Capture
             // before the wallpaper, so a capture that is black for any reason cannot
             // hide every window behind the wallpaper for minutes.
-            Log(L"render: the capture stays black over a lit screen; Windows.Graphics.Capture until the displays change");
+            Log(L"render: the capture stays black over a lit screen; Windows.Graphics.Capture for now (retrying duplication with backoff)");
             break;
         case CapturePolicy::BlackAction::FallbackToWallpaper:
             Log(L"render: the capture stays black over a lit screen; the wallpaper for thirty seconds");
@@ -320,8 +350,12 @@ struct BarRender {
         missedFrame |= frame != nullptr;
         winrt::com_ptr<ID3D11Texture2D> hidden;
         hidden.copy_from(frame);
-        if (freeze) // the popups show in screenshots: they must not sample themselves
-            FreezeBackdrop(gpu, frozen, hidden);
+        if (freeze && !FreezeBackdrop(gpu, frozen, hidden)) {
+            if (needScreen)
+                capture.Release();
+            stop = Bar::SessionEnd::Retry;
+            return false;
+        }
         const bool copiedBackup = !freeze && panelHost.KeepFrame(frame, panelHost.HasScreenPanelOnCaptureMonitor(snap.panels));
         const double p0 = ElapsedMs(t0);
         const PanelGlassHost::RenderResult pr =
@@ -341,12 +375,16 @@ struct BarRender {
             stop = ToSessionEnd(pr.status);
             return false;
         }
+        if (DeviceLost(gpu, L"hidden")) {
+            stop = Bar::SessionEnd::Retry;
+            return false;
+        }
         animating = barOwed = pendingBackdropDirty = owedBody = owedMusic = wasGlass = wasBody = wasMusic = false;
         return true;
     }
 
     winrt::com_ptr<ID3D11Texture2D> AcquireBarBackdrop(const Gpu& gpu, const GlassRenderer& renderer, BackdropSource& capture, PanelGlassHost& panelHost,
-                                                       ID3D11Texture2D* frame)
+                                                       ID3D11Texture2D* frame, bool& deviceLost)
     {
         // Backdrop source: the newest capture frame, or in --debug-capturable
         // mode a private copy of the first one (later frames contain the glass).
@@ -354,8 +392,10 @@ struct BarRender {
         if (frame) {
             source.copy_from(frame);
             ++stats.frames;
-            if (freeze)
-                FreezeBackdrop(gpu, frozen, source);
+            if (freeze && !FreezeBackdrop(gpu, frozen, source)) {
+                deviceLost = true;
+                return nullptr;
+            }
         } else if (frozen && snap.generation != drawnGeneration) {
             source = frozen; // size-dependent textures were recreated
         } else if (missedFrame || !renderer.HasBackdrop() || !EqualRect(&backdropAt, &snap.window)) {
@@ -486,8 +526,10 @@ struct BarRender {
                 panelHost.ReleaseBackupFrame();
         }
         ID3D11Texture2D* frame = needPrimaryScreen ? capture.Acquire() : nullptr;
-        if (capture.Lost()) {
-            stop = Bar::SessionEnd::Retry; // a new source (display mode change, secure desktop)
+        if (capture.Lost() || DeviceLost(gpu, L"acquire")) {
+            if (frame && needPrimaryScreen)
+                capture.Release();
+            stop = Bar::SessionEnd::Retry; // a new source (display mode change, secure desktop, WDDM reset)
             return false;
         }
         if (ProbeCaptureRecovery(gpu, needPrimaryScreen, capture.KeepsOwnWindowsOut(), GetTickCount64(), stop))
@@ -495,7 +537,14 @@ struct BarRender {
         if (!snap.visible)
             return RenderHiddenSessionStep(gpu, renderer, capture, panelHost, frame, needPrimaryScreen, t0, stop);
         renderer.Resize(snap.window.right - snap.window.left, snap.window.bottom - snap.window.top);
-        winrt::com_ptr<ID3D11Texture2D> source = AcquireBarBackdrop(gpu, renderer, capture, panelHost, frame);
+        bool freezeLost = false;
+        winrt::com_ptr<ID3D11Texture2D> source = AcquireBarBackdrop(gpu, renderer, capture, panelHost, frame, freezeLost);
+        if (freezeLost) {
+            if (needPrimaryScreen)
+                capture.Release();
+            stop = Bar::SessionEnd::Retry;
+            return false;
+        }
         const bool hadBackdrop = source != nullptr;
         const bool forceGlass = !renderer.HasPresented() || drawnGeneration == 0 || missedFrame || !EqualRect(&backdropAt, &snap.window);
         if (source) {

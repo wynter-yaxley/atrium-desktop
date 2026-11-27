@@ -287,7 +287,7 @@ Bar::LayoutMetrics Bar::ComputeLayoutMetrics(const RelayoutTarget& target)
     m.winH = m.barH + m.insetTop + m.inset;
     const int margin = Px(st.margin, s);
     // "Always shown": the bar keeps its strip of the screen as an app bar.
-    m.reserve = visible_ && st.bar && st.autoHide == L"never" && st.barReserve ? margin + m.barH : 0;
+    m.reserve = visible_ && st.bar && st.autoHide == L"never" && st.barReserve ? BarReservePx(m.barH, margin) : 0;
     const int ownReserve = appBar_ && appBarMonitor_ == target.mon && appBarEdge_ == target.edge ? appBarReserved_ : 0;
     m.win = PlaceBarWindow({target.edge, target.mi.rcMonitor, target.mi.rcWork, m.winW, m.winH, m.barH, margin, m.insetTop, st.hideTaskbar, ownReserve});
     return m;
@@ -382,7 +382,7 @@ void Bar::BuildLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m)
         return left;
     };
     std::array<RightEntry, 8> right{{{kDesktopKey, m.deskW, L"", m.showDesktop},
-                                     {kNotifyKey, m.plate, L"\uEA8F", m.showNotifications},
+                                     {kNotifyKey, m.plate, dnd_ ? L"\uE7ED" : L"\uEA8F", m.showNotifications},
                                      {kClockKey, m.clockW, L"", m.clockW != 0},
                                      {kMusicKey, m.plate, L"", m.showMusic},
                                      {kStatusKey, m.statusW, L"", m.showStatus},
@@ -472,6 +472,10 @@ void Bar::ApplyLayout(const RelayoutTarget& target, const LayoutMetrics& m)
     SetRegion(regionExtended_);
     UpdateTooltips();
     Publish();
+    if (settings_.barDodge && settings_.autoHide != L"always" && !coverPending_ && input_) {
+        coverPending_ = true;
+        SetTimer(input_, kCoverTimer, kCoverMs, nullptr);
+    }
     if (target.monitorChanged)
         onMonitorChanged();
     onItemsChanged();

@@ -4,6 +4,8 @@
 #include "shell/shell_icon.h"
 #include "ui/launchpad_page_ids.h"
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -24,6 +26,92 @@ atrium::IconImage MakeSolidImage(int side, size_t byteOverride = 0)
 {
     const size_t bytes = byteOverride ? byteOverride : size_t(side) * size_t(side) * 4;
     return atrium::IconImage::FromBgra(side, side, std::vector<uint8_t>(bytes, 0x7F));
+}
+
+uint8_t PixelAlpha(const atrium::IconImage& img, int x, int y) { return img.Data()[(size_t(y) * size_t(img.width) + size_t(x)) * 4 + 3]; }
+
+bool IsPremultipliedBgra(const atrium::IconImage& img)
+{
+    const size_t total = size_t(img.width) * size_t(img.height);
+    const uint8_t* p = img.Data();
+    for (size_t i = 0; i < total; ++i) {
+        const uint8_t a = p[i * 4 + 3];
+        if (p[i * 4 + 0] > a || p[i * 4 + 1] > a || p[i * 4 + 2] > a)
+            return false;
+    }
+    return true;
+}
+
+void CheckSquircleMask()
+{
+    using namespace atrium;
+    constexpr int kSide = 64;
+
+    // 1. Opaque full-bleed square -> masked, rounded corners, preserved center, premultiplied, idempotent.
+    std::vector<uint8_t> solid(size_t(kSide) * kSide * 4);
+    for (size_t i = 0; i < size_t(kSide) * kSide; ++i) {
+        solid[i * 4 + 0] = 100;
+        solid[i * 4 + 1] = 150;
+        solid[i * 4 + 2] = 200;
+        solid[i * 4 + 3] = 255;
+    }
+    const IconImage fullBleed = IconImage::FromBgra(kSide, kSide, solid);
+    Check(IsFullBleedSquareIcon(fullBleed), "#135: opaque square icon detected as full-bleed");
+    const IconImage masked = ApplySquircleMaskIfFullBleed(fullBleed);
+    Check(PixelAlpha(masked, 0, 0) == 0 && PixelAlpha(masked, kSide - 1, 0) == 0 && PixelAlpha(masked, 0, kSide - 1) == 0 &&
+              PixelAlpha(masked, kSide - 1, kSide - 1) == 0,
+          "#135: squircle mask rounds all four corners");
+    const size_t center = (size_t(kSide / 2) * kSide + size_t(kSide / 2)) * 4;
+    Check(masked.Data()[center + 0] == 100 && masked.Data()[center + 1] == 150 && masked.Data()[center + 2] == 200 && masked.Data()[center + 3] == 255,
+          "#135: squircle mask preserves center pixel");
+    Check(IsPremultipliedBgra(masked), "#135: masked image preserves premultiplied BGRA invariant");
+    Check(!IsFullBleedSquareIcon(masked), "#135: masked image is no longer full-bleed");
+    const IconImage maskedTwice = ApplySquircleMaskIfFullBleed(masked);
+    Check(maskedTwice.Bytes() == masked.Bytes(), "#135: ApplySquircleMaskIfFullBleed is idempotent");
+
+    // 2. Non-square image stays byte-identical.
+    const IconImage nonSquare = IconImage::FromBgra(kSide, kSide / 2, std::vector<uint8_t>(size_t(kSide) * (kSide / 2) * 4, 255));
+    Check(!IsFullBleedSquareIcon(nonSquare) && ApplySquircleMaskIfFullBleed(nonSquare).Bytes() == nonSquare.Bytes(), "#135: non-square bitmap left untouched");
+
+    // 3. Circular icon stays byte-identical.
+    std::vector<uint8_t> circlePx(size_t(kSide) * kSide * 4, 0);
+    const float mid = (kSide - 1) * 0.5f;
+    for (int y = 0; y < kSide; ++y) {
+        for (int x = 0; x < kSide; ++x) {
+            const float dx = float(x) - mid, dy = float(y) - mid;
+            if (dx * dx + dy * dy <= 24.f * 24.f) {
+                const size_t idx = (size_t(y) * kSide + size_t(x)) * 4;
+                circlePx[idx + 0] = circlePx[idx + 1] = circlePx[idx + 2] = circlePx[idx + 3] = 255;
+            }
+        }
+    }
+    const IconImage circle = IconImage::FromBgra(kSide, kSide, circlePx);
+    Check(!IsFullBleedSquareIcon(circle) && ApplySquircleMaskIfFullBleed(circle).Bytes() == circle.Bytes(), "#135: circular bitmap left untouched");
+
+    // 4. Transparent-border icon stays byte-identical.
+    std::vector<uint8_t> borderedPx = solid;
+    for (int i = 0; i < kSide; ++i) {
+        borderedPx[size_t(i) * 4 + 3] = 0;
+        borderedPx[(size_t(kSide - 1) * kSide + size_t(i)) * 4 + 3] = 0;
+        borderedPx[(size_t(i) * kSide) * 4 + 3] = 0;
+        borderedPx[(size_t(i) * kSide + size_t(kSide - 1)) * 4 + 3] = 0;
+    }
+    const IconImage bordered = IconImage::FromBgra(kSide, kSide, borderedPx);
+    Check(!IsFullBleedSquareIcon(bordered) && ApplySquircleMaskIfFullBleed(bordered).Bytes() == bordered.Bytes(),
+          "#135: transparent-border bitmap left untouched");
+
+    // 5. X-shaped icon (opaque corners, transparent mid-edges) stays byte-identical.
+    std::vector<uint8_t> xPx(size_t(kSide) * kSide * 4, 0);
+    for (int y = 0; y < kSide; ++y) {
+        for (int x = 0; x < kSide; ++x) {
+            if (std::abs(x - y) <= 4 || std::abs((kSide - 1 - x) - y) <= 4) {
+                const size_t idx = (size_t(y) * kSide + size_t(x)) * 4;
+                xPx[idx + 0] = xPx[idx + 1] = xPx[idx + 2] = xPx[idx + 3] = 255;
+            }
+        }
+    }
+    const IconImage xShape = IconImage::FromBgra(kSide, kSide, xPx);
+    Check(!IsFullBleedSquareIcon(xShape) && ApplySquircleMaskIfFullBleed(xShape).Bytes() == xShape.Bytes(), "#135: X-shaped bitmap left untouched");
 }
 
 } // namespace
@@ -99,6 +187,8 @@ int main()
     const std::vector<std::wstring> pageIds = ExpandLaunchpadPageIds(shown, sys, 0, 10, L"#system");
     Check(pageIds.size() == 11 && pageIds[0] == L"a" && pageIds[1] == L"sys0" && pageIds[9] == L"sys8" && pageIds[10] == L"b",
           "ExpandLaunchpadPageIds expands #system into its first 9 apps");
+
+    CheckSquircleMask();
 
     return g_failures ? 1 : 0;
 }

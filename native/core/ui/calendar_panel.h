@@ -59,6 +59,11 @@ private:
     };
     void Paint(Canvas& c);
     void PaintMonth(Canvas& c, const Theme& t, D2D1_RECT_F card);
+    void PaintNavButton(Canvas& c, const Theme& t, const std::wstring& id, D2D1_RECT_F b, const std::wstring& glyph, const std::wstring& label);
+    void PaintMonthHeader(Canvas& c, const Theme& t, D2D1_RECT_F card, const SYSTEMTIME& now);
+    void PaintDayCell(Canvas& c, const Theme& t, const SYSTEMTIME& now, size_t index, D2D1_RECT_F cell);
+    void PaintMonthGrid(Canvas& c, const Theme& t, D2D1_RECT_F card, const SYSTEMTIME& now);
+    void PaintMonthFooter(Canvas& c, const Theme& t, D2D1_RECT_F card);
     void PaintCapsule(Canvas& c, const Theme& t, D2D1_RECT_F cap);
     bool Message(UINT m, WPARAM w, LPARAM l, LRESULT& result);
     std::wstring HitAt(POINT pt) const;

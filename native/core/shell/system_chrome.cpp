@@ -1,6 +1,7 @@
 #include "shell/system_chrome.h"
 #include "shell/taskbar_visibility.h"
 
+#include "bar_edge.h"
 #include "log.h"
 #include "shell/shell_taskbar.h"
 #include "settings.h"
@@ -13,6 +14,7 @@
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <thread>
@@ -109,6 +111,68 @@ void ShowTaskbars()
         ShowWindowAsync(w, SW_SHOWNA);
     for (HWND w = nullptr; (w = FindWindowExW(nullptr, w, L"Shell_SecondaryTrayWnd", nullptr)) != nullptr;)
         ShowWindowAsync(w, SW_SHOWNA);
+}
+
+bool TaskbarHoldsExactWorkEdge(HWND w, RECT* workOut = nullptr)
+{
+    RECT tb{};
+    MONITORINFO mi{sizeof(mi)};
+    const HMONITOR mon = MonitorFromWindow(w, MONITOR_DEFAULTTONULL);
+    if (!mon || !GetMonitorInfoW(mon, &mi) || !GetWindowRect(w, &tb))
+        return false;
+    if (workOut)
+        *workOut = mi.rcWork;
+    return WorkHoldsTaskbarEdge(tb, mi.rcMonitor, mi.rcWork);
+}
+
+std::vector<TaskbarWorkSnapshot> SnapshotTaskbarWork(bool requireDockedEdge)
+{
+    std::vector<TaskbarWorkSnapshot> out;
+    for (HWND w : Taskbars()) {
+        RECT tb{};
+        MONITORINFO mi{sizeof(mi)};
+        const HMONITOR mon = MonitorFromWindow(w, MONITOR_DEFAULTTONULL);
+        if (mon && GetMonitorInfoW(mon, &mi) && GetWindowRect(w, &tb))
+            if (auto snap = MakeTaskbarSnapshot(mon, tb, mi.rcMonitor, mi.rcWork, requireDockedEdge))
+                out.push_back(*snap);
+    }
+    return out;
+}
+
+template<class Done> void WaitTaskbarStep(int attempts, int stepMs, const Done& done)
+{
+    for (int i = 0; i < attempts && !g_taskbarVisibility.stopping && !done(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
+}
+
+void WaitWorkAreaSync(const std::vector<TaskbarWorkSnapshot>& before, bool release)
+{
+    const HWND shell = ShellTaskbar();
+    if (before.empty() || !ShellResponsive(shell, 200))
+        return;
+    WaitTaskbarStep(24, 15, [&] {
+        return (release && !g_taskbarVisibility.ShouldHide()) || !ShellResponsive(shell, 150) || std::ranges::all_of(before, [&](const TaskbarWorkSnapshot& s) {
+                   MONITORINFO mi{sizeof(mi)};
+                   return !GetMonitorInfoW(s.monitor, &mi) || WorkAreaSnapshotSynced(s, mi.rcWork, release);
+               });
+    });
+}
+
+bool SetAutoHideSynced(bool on, bool wait)
+{
+    const auto before = wait ? SnapshotTaskbarWork(on) : std::vector<TaskbarWorkSnapshot>{};
+    const bool ok = SetAutoHide(on);
+    if (ok && wait)
+        WaitWorkAreaSync(before, on);
+    return ok;
+}
+
+void WaitTaskbarsVisible(bool visible)
+{
+    WaitTaskbarStep(20, 10, [&] {
+        return (!visible && !g_taskbarVisibility.ShouldHide()) ||
+               std::ranges::none_of(Taskbars(), [&](HWND w) { return (IsWindowVisible(w) != FALSE) != visible && WindowResponsive(w, 150); });
+    });
 }
 
 // AutoPlay's "a drive was inserted" toast is one of the system notifications
@@ -497,27 +561,25 @@ void SystemChrome::SetTaskbarHidden(bool hidden)
 {
     if (hidden && exiting_)
         return;
+    if (!hidden)
+        resyncedWork_.clear();
     if (!hidden || !g_taskbarVisibility.hidden.load())
         reshowGuard_.Reset();
     TaskbarChromeState state{g_taskbarVisibility.hidden.load(), autoHideOurs_.load()};
-    ChromeRecord bannerRecord;
-    bannerRecord.quiet = quietOurs_;
-    bannerRecord.quietRestore = quietBefore_;
-    bannerRecord.autoPlayBanner = autoPlayBannerOurs_;
+    ChromeRecord bannerRecord{.quiet = quietOurs_, .quietRestore = quietBefore_, .autoPlayBanner = autoPlayBannerOurs_};
     TaskbarChromeOps ops{
         .queryAutoHide = QueryAutoHide,
-        .setAutoHide = [](bool on) { return SetAutoHide(on); },
+        .setAutoHide = [this](bool on) { return SetAutoHideSynced(on, on || !exiting_); },
         .hasShellTaskbar = [] { return ShellTaskbar() != nullptr; },
-        .hideTaskbars = HideTaskbars,
-        .showTaskbars = ShowTaskbars,
+        .hideTaskbars = [this] { HideTaskbars(), ResyncStuckWorkArea(); },
+        .showTaskbars = [this] { ShowTaskbars(), (!exiting_ ? WaitTaskbarsVisible(true) : void()); },
         .watch = [this] { Watch(); },
         .stopWatch =
             [this] {
                 StopRefit(false);
                 if (hook_)
                     UnhookWinEvent(hook_);
-                hook_ = nullptr;
-                hookedPid_ = 0;
+                hook_ = nullptr, hookedPid_ = 0;
             },
         .scheduleRefit = [this] { ScheduleRefit(); },
         .setHidden = [](bool on) { g_taskbarVisibility.hidden = on; },
@@ -532,9 +594,7 @@ void SystemChrome::SetBannersHidden(bool hidden)
     if (hidden && exiting_)
         return;
     BannerChromeState state{bannersHidden_, quietReady_, quietOurs_, quietBefore_, autoPlayBannerOurs_, autoPlayBannerReady_};
-    ChromeRecord taskbarRecord;
-    taskbarRecord.taskbarHidden = g_taskbarVisibility.hidden.load();
-    taskbarRecord.autoHide = autoHideOurs_.load();
+    ChromeRecord taskbarRecord{.taskbarHidden = g_taskbarVisibility.hidden.load(), .autoHide = autoHideOurs_.load()};
     BannerChromeOps ops{
         .quietProfile = QuietProfile,
         .setQuietProfile = SetQuietProfile,
@@ -564,7 +624,7 @@ void SystemChrome::Enforce()
             intended.autoHide = true;
             if (!SaveRecord(intended)) {
                 Log(L"chrome: could not save recovery record; taskbar auto-hide not re-applied");
-            } else if (SetAutoHide(true)) {
+            } else if (SetAutoHideSynced(true, true)) {
                 autoHideOurs_ = true;
                 Log(L"chrome: the taskbar was no longer auto-hide; set again");
                 ScheduleRefit();
@@ -575,6 +635,7 @@ void SystemChrome::Enforce()
             }
         }
         HideTaskbars();
+        ResyncStuckWorkArea();
         Watch(); // Explorer may have been restarted
     }
     if (quietReady_) {
@@ -616,13 +677,43 @@ void SystemChrome::HideTaskbars()
 {
     if (!g_taskbarVisibility.ShouldHide())
         return;
+    WaitTaskbarStep(16, 15, [] {
+        return !g_taskbarVisibility.ShouldHide() ||
+               std::ranges::none_of(Taskbars(), [](HWND w) { return IsWindowVisible(w) && WindowResponsive(w, 150) && TaskbarHoldsExactWorkEdge(w); });
+    });
     for (HWND w : Taskbars())
         if (g_taskbarVisibility.ShouldHide() && IsWindowVisible(w))
             ShowWindowAsync(w, SW_HIDE);
-    // A concurrent reveal or exit can have restored the taskbar while a
-    // cross-thread ShowWindowAsync was in flight. Restoration must win that race.
+    if (g_taskbarVisibility.ShouldHide())
+        WaitTaskbarsVisible(false);
+    // A concurrent reveal or exit can restore the taskbar mid-flight; restoration wins.
     if (!g_taskbarVisibility.ShouldHide())
         ShowTaskbars();
+}
+
+void SystemChrome::ResyncStuckWorkArea()
+{
+    if (exiting_ || !g_taskbarVisibility.ShouldHide())
+        return;
+    std::erase_if(resyncedWork_, [](const auto& kv) { return !IsWindow(kv.first); });
+    bool needResync = false;
+    for (HWND w : Taskbars()) {
+        RECT work{};
+        if (!WindowResponsive(w, 150) || !TaskbarHoldsExactWorkEdge(w, &work))
+            continue;
+        if (const auto it = resyncedWork_.find(w); it == resyncedWork_.end() || !EqualRect(&it->second, &work)) {
+            resyncedWork_[w] = work;
+            needResync = true;
+        }
+    }
+    if (!needResync)
+        return;
+    if (const auto before = SnapshotTaskbarWork(true); SetAutoHide(false)) {
+        if (!SetAutoHide(true))
+            SetAutoHide(true);
+        WaitWorkAreaSync(before, true), ScheduleRefit(), HideTaskbars();
+        Log(L"chrome: resynced taskbar work area");
+    }
 }
 
 void SystemChrome::Watch()
@@ -701,13 +792,7 @@ void SystemChrome::RefitWorker()
 
 ChromeRecord SystemChrome::CurrentRecord() const
 {
-    return {
-        .taskbarHidden = g_taskbarVisibility.hidden.load(),
-        .autoHide = autoHideOurs_.load(),
-        .quiet = quietOurs_,
-        .quietRestore = quietBefore_,
-        .autoPlayBanner = autoPlayBannerOurs_,
-    };
+    return {g_taskbarVisibility.hidden.load(), autoHideOurs_.load(), quietOurs_, quietBefore_, autoPlayBannerOurs_};
 }
 
 bool SystemChrome::SaveRecord(const ChromeRecord& record) const { return SaveChromeRecord(StatePath(), record); }

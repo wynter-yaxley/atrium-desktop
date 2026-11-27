@@ -10,6 +10,14 @@
     {
       "tag": "zh-Hans",
       "name": "简体中文"
+    },
+    {
+      "tag": "ru",
+      "name": "Русский"
+    },
+    {
+      "tag": "tr",
+      "name": "Türkçe"
     }
   ]
 }

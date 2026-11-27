@@ -32,7 +32,7 @@ bool WithdrawNotice(Notice& existing, const Notice& withdrawal)
     if (existing.source != withdrawal.source)
         return false;
     if (!withdrawal.externalId)
-        return existing.title == withdrawal.title;
+        return existing.title == withdrawal.title && (!withdrawal.pid || !existing.pid || existing.pid == withdrawal.pid);
     if (!HasExternalId(existing, withdrawal.externalId))
         return false;
     std::erase(existing.externalIds, withdrawal.externalId);
@@ -50,6 +50,15 @@ void Notifications::ApplyAlways(bool notifyAlways)
     ArmPopupTimer();
     if (changed && popup_.surface && popup_.surface->Visible())
         Layout(Mode::Popup);
+}
+
+void Notifications::SetDoNotDisturb(bool on)
+{
+    if (dnd_ == on)
+        return;
+    dnd_ = on;
+    if (dnd_)
+        HidePopup(L"dnd");
 }
 
 void Notifications::ArmPopupTimer()

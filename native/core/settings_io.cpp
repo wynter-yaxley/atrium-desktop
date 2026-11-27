@@ -507,7 +507,7 @@ bool SaveSettingsTo(const std::wstring& path, const Settings& s, std::wstring* e
         existing = Settings{};
     }
 
-    const bool startupChanged = existing.startOnLogin != s.startOnLogin;
+    const bool startupChanged = existing.startOnLogin != s.startOnLogin || (s.startOnLogin && existing.startupMode != s.startupMode);
     if (!WriteTextFile(path, s.ToJson())) {
         const DWORD code = GetLastError();
         const std::wstring reason = FormatSystemError(code);

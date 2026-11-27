@@ -375,6 +375,53 @@ $ratcheted = [ordered]@{
     'commented-code' = @('^\s*//\s*([A-Za-z_][\w:]*(?:(?:\.|->)[A-Za-z_]\w*)*\s*(?:\([^;]*\)|[+\-*/]?=[^=][^;]*);|return\b[^;]*;|[{}])\s*$',
         'delete it; git keeps history')
 }
+$tryStartRx = [regex]::new($ratcheted['try'][0], [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+$catchStartRx = [regex]::new('\G\s*(catch\s*\()', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+$winRtCatchRx = [regex]::new('^catch\s*\(\s*(?:const\s+)?(?:winrt::)?hresult_error(?:\s*[&*]|\s+\w+|\s*\))',
+    [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+
+function Find-BalancedClose([string]$text, [int]$openIdx, [char]$open, [char]$close) {
+    $depth = 0
+    for ($i = $openIdx; $i -lt $text.Length; $i++) {
+        $ch = $text[$i]
+        if ($ch -eq $open) { $depth++ }
+        elseif ($ch -eq $close) { $depth--; if ($depth -eq 0) { return $i } }
+    }
+    -1
+}
+
+function Count-NonWinRtTry([string[]]$codeLines) {
+    $text = $codeLines -join "`n"
+    $tryMatches = $tryStartRx.Matches($text)
+    if (-not $tryMatches.Count) { return 0 }
+    $count = 0
+    foreach ($m in $tryMatches) {
+        $pos = Find-BalancedClose $text ($m.Index + $m.Length - 1) '{' '}'
+        if ($pos -lt 0) { $count++; continue }
+        $pos++
+        $catchCount = 0
+        $allWinRt = $true
+        while ($true) {
+            $cm = $catchStartRx.Match($text, $pos)
+            if (-not $cm.Success) { break }
+            $catchStart = $cm.Groups[1].Index
+            $parenClose = Find-BalancedClose $text ($catchStart + $cm.Groups[1].Length - 1) '(' ')'
+            if ($parenClose -lt 0) { $allWinRt = $false; break }
+            if (-not $winRtCatchRx.IsMatch($text.Substring($catchStart, $parenClose - $catchStart + 1))) {
+                $allWinRt = $false
+            }
+            $catchCount++
+            $pos = $parenClose + 1
+            while ($pos -lt $text.Length -and [char]::IsWhiteSpace($text[$pos])) { $pos++ }
+            if ($pos -ge $text.Length -or $text[$pos] -ne '{') { $allWinRt = $false; break }
+            $bodyClose = Find-BalancedClose $text $pos '{' '}'
+            if ($bodyClose -lt 0) { $allWinRt = $false; break }
+            $pos = $bodyClose + 1
+        }
+        if ($catchCount -eq 0 -or -not $allWinRt) { $count++ }
+    }
+    $count
+}
 $headerEdges = @{}
 foreach ($rel in $native) { if ($rel -match '^native/core/.*\.h$') { $headerEdges[$rel.Substring(12)] = [System.Collections.Generic.List[string]]::new() } }
 
@@ -485,8 +532,12 @@ foreach ($rel in $native) {
     $key = $rel.Substring(7)
     foreach ($rule in $ratcheted.Keys) {
         if ($rule -eq 'detach' -and -not $coreRel) { continue }
-        $targetLines = if ($rule -eq 'commented-code') { $lines } else { $codeLines }
-        $n = @($targetLines | Where-Object { $_ -cmatch $ratcheted[$rule][0] }).Count
+        $n = if ($rule -eq 'try') {
+            Count-NonWinRtTry $codeLines
+        } else {
+            $targetLines = if ($rule -eq 'commented-code') { $lines } else { $codeLines }
+            @($targetLines | Where-Object { $_ -cmatch $ratcheted[$rule][0] }).Count
+        }
         if ($n) { $counts["$key|$rule"] = $n }
     }
     if ($lines.Count -gt $fileLines) { $counts["$key|file-lines"] = $lines.Count }

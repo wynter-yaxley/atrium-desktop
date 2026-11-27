@@ -40,6 +40,46 @@ bool TileHasApp(const std::vector<StartTile>& tiles, const std::wstring& id)
     return false;
 }
 
+void AppendAppContextEntries(std::vector<MenuEntry>& entries, const CatalogApp& app, bool onStart, bool inFolder, bool hidden)
+{
+    entries.push_back({Tr(L"Open"), kOpen});
+    if (!AppCatalog::FileLocation(app).empty()) {
+        entries.push_back({Tr(L"Run as administrator"), kAdmin});
+        entries.push_back({Tr(L"Open File Location"), kLocation});
+    }
+    entries.push_back({});
+    entries.push_back({Tr(L"Pin to taskbar"), kPinBar});
+    if (!onStart) {
+        entries.push_back({Tr(L"Pin to Start"), kPinStart});
+    } else {
+        entries.push_back({Tr(L"Rename"), kRename});
+        if (inFolder)
+            entries.push_back({Tr(L"Remove from folder"), kOutOfFolder});
+        entries.push_back({Tr(L"Remove from Start"), kRemove});
+    }
+    entries.push_back(hidden ? MenuEntry{Tr(L"Unhide"), kUnhide} : MenuEntry{Tr(L"Hide"), kHide});
+}
+
+void AppendMenuSizeEntries(std::vector<MenuEntry>& entries, int grid, int room, int iconSize, bool hasHidden, bool custom)
+{
+    const wchar_t* const kNames[] = {Tr(L"Small"), Tr(L"Medium"), Tr(L"Large"), Tr(L"Huge")};
+    entries.push_back({Tr(L"Menu size"), 0, false, true, true});
+    for (int g = 0; g <= room; ++g)
+        entries.push_back({kNames[g], kSize + g, g == grid});
+    entries.push_back({});
+    entries.push_back({Tr(L"Icon size"), 0, false, true, true});
+    for (int icon = 0; icon < StartLayout::kSizes; ++icon)
+        entries.push_back({kNames[icon], kIcon + icon, icon == iconSize});
+    if (hasHidden) {
+        entries.push_back({});
+        entries.push_back({Tr(L"Show hidden apps"), kShowHidden});
+    }
+    if (custom) {
+        entries.push_back({});
+        entries.push_back({Tr(L"Restore Windows Start pins"), kReset});
+    }
+}
+
 void MergeWindowsFolder(std::vector<StartTile>& tiles, const CatalogFolder& f, bool win10Both, const std::vector<std::wstring>& hidden, size_t& apps,
                         size_t& newFolders)
 {
@@ -154,43 +194,12 @@ std::vector<MenuEntry> StartMenu::BuildContextEntries(const std::wstring& id, Ca
         else
             app = rows[i].app, isApp = true;
     }
-    if (isApp) {
-        entries.push_back({Tr(L"Open"), kOpen});
-        if (!AppCatalog::FileLocation(app).empty()) {
-            entries.push_back({Tr(L"Run as administrator"), kAdmin});
-            entries.push_back({Tr(L"Open File Location"), kLocation});
-        }
-        entries.push_back({});
-        entries.push_back({Tr(L"Pin to taskbar"), kPinBar});
-        if (!OnStart(app.id)) {
-            entries.push_back({Tr(L"Pin to Start"), kPinStart});
-        } else {
-            entries.push_back({Tr(L"Rename"), kRename});
-            if (inFolder)
-                entries.push_back({Tr(L"Remove from folder"), kOutOfFolder});
-            entries.push_back({Tr(L"Remove from Start"), kRemove});
-        }
-        entries.push_back(Hidden(app.id) ? MenuEntry{Tr(L"Unhide"), kUnhide} : MenuEntry{Tr(L"Hide"), kHide});
-    } else if (!folderKey.empty()) {
+    if (isApp)
+        AppendAppContextEntries(entries, app, OnStart(app.id), inFolder, Hidden(app.id));
+    else if (!folderKey.empty())
         entries = {{Tr(L"Open"), kOpen}, {Tr(L"Rename"), kRename}, {}, {Tr(L"Ungroup folder"), kUngroup}, {Tr(L"Remove from Start"), kRemoveFolder}};
-    } else if (id.empty() && !Listing() && folder_ < 0) {
-        const wchar_t* const kNames[] = {Tr(L"Small"), Tr(L"Medium"), Tr(L"Large"), Tr(L"Huge")};
-        entries.push_back({Tr(L"Menu size"), 0, false, true, true});
-        for (int grid = 0; grid <= room_; ++grid)
-            entries.push_back({kNames[grid], kSize + grid, grid == grid_});
-        entries.push_back({});
-        entries.push_back({Tr(L"Icon size"), 0, false, true, true});
-        for (int icon = 0; icon < StartLayout::kSizes; ++icon)
-            entries.push_back({kNames[icon], kIcon + icon, icon == layout_.icon});
-        if (!layout_.hidden.empty()) {
-            entries.push_back({});
-            entries.push_back({Tr(L"Show hidden apps"), kShowHidden});
-        }
-        if (layout_.custom) {
-            entries.push_back({});
-            entries.push_back({Tr(L"Restore Windows Start pins"), kReset});
-        }
-    }
+    else if (id.empty() && !Listing() && folder_ < 0)
+        AppendMenuSizeEntries(entries, grid_, room_, layout_.icon, !layout_.hidden.empty(), layout_.custom);
     return entries;
 }
 
@@ -370,7 +379,7 @@ void StartMenu::FinishNaming(bool keep)
     surface_.Invalidate();
 }
 
-void StartMenu::PaintHoverTip(Canvas& c, const Theme& t)
+void StartMenu::PaintHoverTip(Canvas& c, const Theme& /*t*/)
 {
     if (tipText_.empty() || drag_.on || menuOpen_)
         return;
@@ -381,9 +390,19 @@ void StartMenu::PaintHoverTip(Canvas& c, const Theme& t)
     const float left = std::clamp((tipRect_.left + tipRect_.right - capW) / 2.f, b.left + 8.f, b.right - 8.f - capW);
     const float top = std::clamp(tipRect_.top - 2.f, b.top + 8.f, b.bottom - 8.f - capH);
     const D2D1_RECT_F cap = D2D1::RectF(left, top, left + capW, top + capH);
-    c.Fill(cap, capH / 2.f, t.card);
-    c.Stroke(cap, capH / 2.f, t.border, 1.f);
-    c.Text(tipText_, D2D1::RectF(cap.left + 10.f, cap.top, cap.right - 10.f, cap.bottom), sz, t.text, DWRITE_FONT_WEIGHT_NORMAL, 1);
+    const bool lightTip = c.DarkAt(cap) >= 0.5f;
+    const D2D1_COLOR_F back = lightTip ? D2D1::ColorF(0xF7F7FA, 0.97f) : D2D1::ColorF(0x1D1E23, 0.97f);
+    const D2D1_COLOR_F edge = lightTip ? D2D1::ColorF(0x000000, 0.14f) : D2D1::ColorF(0xFFFFFF, 0.22f);
+    const D2D1_COLOR_F shadow = D2D1::ColorF(0x000000, lightTip ? 0.14f : 0.36f);
+    const D2D1_COLOR_F ink = lightTip ? D2D1::ColorF(0x111317, 0.98f) : D2D1::ColorF(0xFFFFFF, 0.98f);
+    const float r = capH / 2.f;
+    c.Fill(D2D1::RectF(cap.left, cap.top + 1.5f, cap.right, cap.bottom + 2.5f), r, shadow);
+    c.Fill(cap, r, back);
+    c.Stroke(cap, r, edge, 1.f);
+    const bool halo = c.halo;
+    c.halo = false;
+    c.Text(tipText_, D2D1::RectF(cap.left + 10.f, cap.top, cap.right - 10.f, cap.bottom), sz, ink, DWRITE_FONT_WEIGHT_NORMAL, 1);
+    c.halo = halo;
 }
 
 bool StartMenu::DismissPowerCard()

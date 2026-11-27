@@ -1,4 +1,6 @@
+#include "shell/launchpad_order.h"
 #include "ui/launchpad_model.h"
+#include "ui/launchpad_page_ids.h"
 
 #include <cmath>
 #include <iostream>
@@ -137,6 +139,70 @@ void TestTileMutations()
     Check(!RemoveFromFolder(tiles, 0, 0), "cannot remove from non-folder tile");
 }
 
+void TestExpandLaunchpadPageIds()
+{
+    const std::vector<CatalogApp> shown{
+        {.name = L"Chrome", .id = L"Chrome"},
+        {.name = L"Microsoft apps", .id = L"#microsoft"},
+        {.name = L"System apps", .id = L"#system"},
+    };
+    const std::vector<CatalogApp> microsoft{
+        {.name = L"Edge", .id = L"MSEdge"},
+        {.name = L"Notepad", .id = L"Notepad"},
+    };
+    const std::vector<CatalogApp> system{
+        {.name = L"Taskmgr", .id = L"Taskmgr"},
+    };
+    const auto ids = ExpandLaunchpadPageIds(shown, system, 0, 10, L"#system", microsoft, L"#microsoft");
+    Check(ids.size() == 4 && ids[0] == L"Chrome" && ids[1] == L"MSEdge" && ids[2] == L"Notepad" && ids[3] == L"Taskmgr",
+          "ExpandLaunchpadPageIds expands both #microsoft and #system folders");
+    const std::vector<CatalogApp> custom{
+        {.name = L"A1", .id = L"App1"},
+        {.name = L"A2", .id = L"App2"},
+    };
+    const std::vector<CatalogApp> shownWithCustom{
+        {.name = L"Tools", .id = L"folder:1"},
+        {.name = L"Microsoft apps", .id = L"#microsoft"},
+    };
+    const auto expanded = ExpandLaunchpadPageIds(shownWithCustom, 0, 10, [&](std::wstring_view id) -> const std::vector<CatalogApp>* {
+        if (id == L"folder:1")
+            return &custom;
+        if (id == L"#microsoft")
+            return &microsoft;
+        return nullptr;
+    });
+    Check(expanded.size() == 4 && expanded[0] == L"App1" && expanded[1] == L"App2" && expanded[2] == L"MSEdge",
+          "ExpandLaunchpadPageIds expands custom folder:<n> entries");
+}
+
+void TestLaunchpadLayoutJson()
+{
+    LaunchpadLayout legacy;
+    Check(ParseLaunchpadLayoutJson(LR"({"order":["A","B","#system"]})", legacy), "parses legacy order-only launchpad.json");
+    Check(legacy.order.size() == 3 && legacy.folders.empty() && legacy.hidden.empty(), "legacy json leaves folders and hidden empty");
+
+    LaunchpadLayout l;
+    l.order = {L"folder:1", L"App3", L"AppHidden", L"App3"};
+    l.folders = {
+        {L"folder:1", L"Work", {L"App1", L"App2", L"AppHidden", L"folder:2", L"App1"}},
+        {L"folder:2", L"DupOnly", {L"App2"}},
+    };
+    l.hidden = {L"AppHidden", L"", L"AppHidden"};
+    l.Clamp();
+    Check(l.hidden.size() == 1 && l.hidden[0] == L"AppHidden", "Clamp deduplicates and strips empty hidden entries");
+    Check(l.folders.size() == 1 && l.folders[0].apps.size() == 2 && l.folders[0].apps[0] == L"App1" && l.folders[0].apps[1] == L"App2",
+          "Clamp strips hidden/invalid/duplicate apps across folders and drops emptied folders");
+    Check(l.order.size() == 2 && l.order[0] == L"folder:1" && l.order[1] == L"App3", "Clamp strips hidden and duplicate root order entries");
+    Check(l.NewFolderId() == L"folder:2", "NewFolderId increments beyond highest existing folder id");
+
+    const std::wstring json = SerializeLaunchpadLayoutJson(l);
+    LaunchpadLayout parsed;
+    Check(ParseLaunchpadLayoutJson(json, parsed), "serialized LaunchpadLayout parses cleanly");
+    Check(parsed.order == l.order && parsed.hidden == l.hidden && parsed.folders.size() == 1 && parsed.folders[0].id == L"folder:1" &&
+              parsed.folders[0].name == L"Work" && parsed.folders[0].apps == l.folders[0].apps,
+          "LaunchpadLayout survives JSON round trip");
+}
+
 } // namespace
 
 int main()
@@ -146,6 +212,8 @@ int main()
     TestMoveSelection();
     TestSettlePageDrag();
     TestTileMutations();
+    TestExpandLaunchpadPageIds();
+    TestLaunchpadLayoutJson();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed\n";

@@ -98,32 +98,71 @@ bool CheckEscalationAndRecovery()
         return false;
     }
 
-    if (!Require(policy.ChooseInitialSource(false, 4201) == CapturePolicy::InitialSource::MonitorCapture, "next session starts on MonitorCapture") ||
-        !Require(!policy.ShouldProbeDuplication(true, false, false, 1, 100000), "same display generation never probes Desktop Duplication again") ||
-        !Require(!policy.ShouldProbeDuplication(true, false, false, 2, 34200), "new display generation still respects 30 s retry backoff") ||
-        !Require(policy.ShouldProbeDuplication(true, false, false, 2, 34201), "new display generation probes once 30 s elapses")) {
+    if (!Require(policy.ChooseInitialSource(false, 4201) == CapturePolicy::InitialSource::MonitorCapture, "next session starts on MonitorCapture"))
         return false;
+
+    // Same display generation retries Desktop Duplication with capped exponential backoff: 2s -> 4s -> 8s -> ... -> 120s.
+    uint64_t t = 4201;
+    const uint64_t blackSteps[] = {2000, 4000, 8000, 16000, 32000, 64000, 120000, 120000};
+    for (uint64_t step : blackSteps) {
+        if (!Require(!policy.ShouldProbeDuplication(true, false, false, 1, t + step - 1),
+                     "same generation does not probe before black retry backoff elapses") ||
+            !Require(policy.ShouldProbeDuplication(true, false, false, 1, t + step), "same generation probes once black retry backoff elapses")) {
+            return false;
+        }
+        t += step;
     }
 
     // Two black-over-lit strikes on MonitorCapture escalate to 30 s wallpaper blackout.
-    if (!Require(policy.OnBlackOverLitScreen(2, 35000) == CapturePolicy::BlackAction::RestartCapture, "first MonitorCapture black strike restarts capture") ||
-        !Require(policy.OnBlackOverLitScreen(2, 37000) == CapturePolicy::BlackAction::FallbackToWallpaper,
+    if (!Require(policy.OnBlackOverLitScreen(1, t + 1000) == CapturePolicy::BlackAction::RestartCapture,
+                 "first MonitorCapture black strike restarts capture") ||
+        !Require(policy.OnBlackOverLitScreen(1, t + 3000) == CapturePolicy::BlackAction::FallbackToWallpaper,
                  "second MonitorCapture black strike falls back to wallpaper for 30 s") ||
-        !Require(policy.ChooseInitialSource(false, 37000) == CapturePolicy::InitialSource::Wallpaper, "blackout session selects wallpaper") ||
-        !Require(!policy.ShouldExitBlackoutWallpaper(true, 66999), "wallpaper blackout holds until 30 s") ||
-        !Require(policy.ShouldExitBlackoutWallpaper(true, 67000), "wallpaper blackout exits at 30 s") ||
-        !Require(policy.ChooseInitialSource(false, 67000) == CapturePolicy::InitialSource::MonitorCapture,
-                 "post-wallpaper session returns to MonitorCapture") ||
-        !Require(policy.ShouldProbeDuplication(true, false, false, 2, 67000), "MonitorCapture can probe Desktop Duplication on the new display generation")) {
+        !Require(policy.ChooseInitialSource(false, t + 3000) == CapturePolicy::InitialSource::Wallpaper, "blackout session selects wallpaper") ||
+        !Require(!policy.ShouldExitBlackoutWallpaper(true, t + 32999), "wallpaper blackout holds until 30 s") ||
+        !Require(policy.ShouldExitBlackoutWallpaper(true, t + 33000), "wallpaper blackout exits at 30 s") ||
+        !Require(policy.ChooseInitialSource(false, t + 33000) == CapturePolicy::InitialSource::MonitorCapture,
+                 "post-wallpaper session returns to MonitorCapture")) {
+        return false;
+    }
+
+    // Recovery followed by > kBlackWindowMs lit frames resets black retry backoff back to 2 s.
+    policy.OnDuplicationRecovered();
+    const uint64_t litStart = t + 34000;
+    if (!Require(!policy.PollBlackBackdrop(true, 0.5f, litStart), "starts lit recovery window") ||
+        !Require(!policy.PollBlackBackdrop(true, 0.5f, litStart + CapturePolicy::kBlackWindowMs),
+                 "exactly kBlackWindowMs lit does not reset black retry backoff") ||
+        !Require(!policy.PollBlackBackdrop(true, 0.5f, litStart + CapturePolicy::kBlackWindowMs + 1), "beyond kBlackWindowMs lit resets black retry backoff")) {
+        return false;
+    }
+    const uint64_t reblackAt = litStart + CapturePolicy::kBlackWindowMs + 2000;
+    if (!Require(policy.OnBlackOverLitScreen(1, reblackAt) == CapturePolicy::BlackAction::RestartCapture, "first strike after lit recovery restarts capture") ||
+        !Require(policy.OnBlackOverLitScreen(1, reblackAt + 1000) == CapturePolicy::BlackAction::SwitchToMonitorCapture,
+                 "second strike switches back to MonitorCapture") ||
+        !Require(!policy.ShouldProbeDuplication(true, false, false, 1, reblackAt + 2999), "reset black backoff waits 2 s") ||
+        !Require(policy.ShouldProbeDuplication(true, false, false, 1, reblackAt + 3000), "reset black backoff probes at 2 s")) {
+        return false;
+    }
+
+    // Display generation change clears black escalation and resets black retry backoff to 2 s.
+    policy.BeginSession(0, 2);
+    const uint64_t gen2At = reblackAt + 5000;
+    if (!Require(policy.ChooseInitialSource(false, gen2At) == CapturePolicy::InitialSource::Duplication,
+                 "generation change restores Duplication as initial source") ||
+        !Require(policy.OnBlackOverLitScreen(2, gen2At) == CapturePolicy::BlackAction::RestartCapture, "first black strike on generation 2 restarts capture") ||
+        !Require(policy.OnBlackOverLitScreen(2, gen2At + 1000) == CapturePolicy::BlackAction::SwitchToMonitorCapture,
+                 "second black strike on generation 2 switches to MonitorCapture") ||
+        !Require(!policy.ShouldProbeDuplication(true, false, false, 2, gen2At + 2999), "generation 2 starts at 2 s black backoff") ||
+        !Require(policy.ShouldProbeDuplication(true, false, false, 2, gen2At + 3000), "generation 2 probes at 2 s")) {
         return false;
     }
 
     policy.OnDuplicationRecovered();
-    policy.OnDuplicationUnavailable(68000);
-    return Require(policy.ChooseInitialSource(false, 68000) == CapturePolicy::InitialSource::MonitorCapture,
+    policy.OnDuplicationUnavailable(gen2At + 5000);
+    return Require(policy.ChooseInitialSource(false, gen2At + 5000) == CapturePolicy::InitialSource::MonitorCapture,
                    "recovered policy can still fall back cleanly on subsequent unavailability") &&
-           Require(policy.ShouldProbeDuplication(true, false, false, 2, 98000),
-                   "recovery cleared prior black generation so temporary unavailability can retry on generation 2");
+           Require(policy.ShouldProbeDuplication(true, false, false, 2, gen2At + 35000),
+                   "recovery cleared prior black escalation so temporary unavailability retries after 30 s on generation 2");
 }
 
 bool CheckElsewhereSuppressionAndSwitch()

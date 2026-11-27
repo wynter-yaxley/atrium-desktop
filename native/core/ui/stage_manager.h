@@ -26,6 +26,7 @@
 #include "ui/stage_merge.h"
 #include "ui/stage_scroll.h"
 #include "ui/stage_open.h"
+#include "ui/stage_watch.h"
 #include "stage_excluded.h"
 #include "ui/surface.h"
 #include "ui/window_snapshot.h"
@@ -93,6 +94,7 @@ public:
     void RestoreAll();
     void SignalSnapshotStop() { snapshots_.SignalStop(); }
     bool WaitSnapshotStop(DWORD timeoutMs) const { return snapshots_.WaitStop(timeoutMs); }
+    static std::wstring WindowKey(const std::wstring& app, HWND h);
 
 private:
     struct Parked {
@@ -152,18 +154,21 @@ private:
         D2D1_POINT_2F closeAt{-1e6f, -1e6f}; // its close button, content DIP, as last painted
     };
 
-    static constexpr UINT_PTR kRaiseTimer = 0x5C03, kHideTimer = 0x5C04, kFlightTimer = 0x5C05;
-    static constexpr UINT kRaiseMs = 220;
-    static constexpr ULONGLONG kPendingMs = 1200;
+    static constexpr UINT_PTR kWatchTimer = 0x5C01, kDownTimer = 0x5C02, kRaiseTimer = 0x5C03, kHideTimer = 0x5C04, kFlightTimer = 0x5C05;
+    static constexpr UINT kWatchActiveMs = 30, kWatchIdleMs = 250, kDownMs = 700, kRaiseMs = 220;
+    static constexpr ULONGLONG kPendingMs = 1200, kFreshMs = 4000, kSettleMs = 2000;
     static constexpr double kFlightMs = 400;
-    static constexpr float kBoxW = 172, kBoxH = 112, kTilt = 22;
-    static constexpr int kLargeOld = 1440;
-    static constexpr size_t kLargeKept = 4;
+    static constexpr float kBoxW = 172, kBoxH = 112, kTilt = 22, kPictureScale = 1.25f, kPictureRadius = 8, kIcon = 34;
+    static constexpr int kLargeOld = 1440, kLargeMax = 4096;
+    static constexpr size_t kLargeKept = 4, kStack = 3;
 
     static bool Transient(HWND h);
     static void SetTransitions(HWND h, bool on);
+    static bool OnMonitor(HWND h, HMONITOR m) { return MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == m; }
     static std::wstring AppKeyOf(const std::wstring& key);
     static bool HasKey(const Set& set, const std::wstring& key);
+    static void CollectEntryIconKeys(const std::vector<std::wstring>& keys, int iconPx, size_t maxIcons, std::unordered_set<std::wstring>& out);
+    static int NearestWindowDepth(const std::unordered_map<HWND, int>& depth, const std::unordered_map<HWND, Parked>& parked, const Set& set);
     void SyncMoveHook();
     // A window being dragged (stage_drag.cpp): which group it is over, and what happens where it lands.
     void BeginDrag(HWND window);
@@ -176,7 +181,12 @@ private:
     int CloseAt(POINT pt) const;
     bool CloseInput(UINT m, POINT pt);
     void CloseEntry(int index);
+    void BuildTaskItems(const std::vector<TaskItem>& items, HWND root);
+    void UpdateIconVersions(const std::vector<TaskItem>& items);
+    void ReleaseExcludedUpWindows();
     void Stage(const Set& keys, bool add, HWND front, bool activate, const std::unordered_map<HWND, Pose>* fly = nullptr);
+    void ParkReplacedWindows(const Set& keys, std::vector<Set>& left, std::vector<Set>& others);
+    void RemoveKeysFromRecent(const Set& keys);
     void Park(HWND window, const std::wstring& key);
     void Unpark(const Set& keys, HWND front, bool activate, const std::unordered_map<HWND, Pose>* fly = nullptr, bool moveBeside = true);
     void Pick(const Set& keys, bool add, HWND front = nullptr);
@@ -188,8 +198,12 @@ private:
     void PutDown(HWND window, bool fly); // minimizes a window put away, once; its picture flies to the strip
     Set SetOf(const std::wstring& key) const; // the set in the strip `key` belongs to, or just it
     void Prune();
+    void PruneSurfaceCaches();
+    void RecordActiveIconKeys();
+    bool IsHigherIntegrity(HWND window, const std::wstring& appKey);
     void ReleaseUp();          // the stage's windows get their own minimize animation back
     bool AdoptMinimized();     // the stage's apps whose windows were all minimized go to the strip
+    bool CollectAdoptedForTask(const TaskItem& t, ULONGLONG now, std::unordered_map<HWND, RECT>& up, std::vector<HWND>& flyIn);
     bool NeedsAdopt(ULONGLONG now) const;
     void UnparkDirect(HWND h, bool showQuietly, ULONGLONG now);
     void KeepPicture();        // a picture of the window in front, ready for when it is minimized
@@ -217,38 +231,7 @@ private:
         actionCv_.notify_one();
     }
     static void ShowQuietly(HWND h);
-    void ActionWorker()
-    {
-        for (;;) {
-            Action a;
-            {
-                std::unique_lock lk(actionLock_);
-                actionCv_.wait(lk, [this] { return actionStop_ || !actions_.empty(); });
-                if (actionStop_)
-                    return;
-                a = actions_.front();
-                actions_.pop_front();
-            }
-            if (!IsWindow(a.window))
-                continue;
-            if (a.kind != Action::Kind::MoveBeside) {
-                a.kind == Action::Kind::Activate ? TaskModel::ActivateWindowDirect(a.window) : ShowQuietly(a.window);
-                continue;
-            }
-            WINDOWPLACEMENT wp{sizeof(wp)};
-            if (!IsIconic(a.window) || !IsWindowEnabled(a.window) || IsZoomed(a.window) || !GetWindowPlacement(a.window, &wp) ||
-                (wp.flags & WPF_RESTORETOMAXIMIZED))
-                continue;
-            RECT frame = IsRectEmpty(&a.frame) ? wp.rcNormalPosition : a.frame, to = frame;
-            if (!StageBesideRect(to, a.zone, a.workArea, a.onRight))
-                continue;
-            wp.rcNormalPosition.left += to.left - frame.left;
-            wp.rcNormalPosition.right += to.right - frame.right;
-            wp.showCmd = SW_SHOWMINNOACTIVE;
-            wp.flags = 0;
-            SetWindowPlacement(a.window, &wp);
-        }
-    }
+    void ActionWorker();
     void Save();
     std::vector<HWND> ParkedInOrder() const; // put away first, first
     void Load();
@@ -271,9 +254,13 @@ private:
     float Reveal(int index, double nowMs) const; // how far a card is out of the screen's edge, 0..1
     void UpdateRegion(bool moving);              // clicks around the cards reach what is under them
     void Watch();                                // the strip's timer: is it covered, does the pointer ask for it
+    void UpdateAutoHidePeek(POINT p, bool dragging, ULONGLONG now);
+    bool WatchActive(ULONGLONG now) const;
+    void SyncWatchTimer(ULONGLONG now);
     bool Covered();                              // a window on the stage is where the strip goes
     RECT Zone() const;                           // where the strip goes, to the screen's edge, px
     RECT WorkArea() const;
+    MONITORINFO MonitorInfo() const;
     D2D1_RECT_F Box(const Entry& e) const { return StageBoxRect(size_.width, e.y, onRight_); } // the windows' room, content DIP
     int EntryAt(POINT pt) const;
     std::shared_ptr<const WindowPicture> PictureOf(HWND window, const std::wstring& app, std::wstring& cacheKey);
@@ -286,7 +273,6 @@ private:
     {
         return std::ranges::any_of(flights_, [window](const Flight& f) { return f.window == window; });
     }
-    static constexpr ULONGLONG kSettleMs = 2000;
     bool FlyingFromStrip(HWND window) const
     {
         return std::ranges::any_of(flights_, [window](const Flight& f) { return f.window == window && !f.toStrip; });
@@ -339,14 +325,20 @@ private:
     std::unordered_map<HWND, Parked> parked_;
     std::unordered_map<HWND, Picture> pictures_;
     std::unordered_map<std::wstring, Placeholder> placeholders_; // by app
+    std::unordered_set<std::wstring> issuedWindowKeys_;
+    std::unordered_set<std::wstring> issuedPlaceholderApps_;
+    std::unordered_set<std::wstring> issuedIconKeys_;
+    std::unordered_map<std::wstring, uint64_t> iconVersions_;
     bool shrinkAfterFlight_ = false;
     unsigned pictureGen_ = 0;
+    UINT watchMs_ = 0;
     uint64_t seq_ = 0;
     Set pending_;                      // picked in the strip, not in front yet
     ULONGLONG pendingUntil_ = 0;
     StageOpenIntent openIntent_;
     std::vector<HWND> excludedWindows_; // windows of excluded apps: never staged, still covering the strip
     std::vector<std::wstring> excluded_ = DefaultStageExcluded();
+    std::unordered_set<HWND> higherIntegrityLogged_;
 
     std::vector<Entry> entries_;
     std::vector<Entry> leaving_;       // cards fading out (picked, or their windows gone)
@@ -365,8 +357,7 @@ private:
     double revealStart_ = 0;
     bool peek_ = false;                // shown over the stage because the pointer asked
     ULONGLONG edgeSince_ = 0, leftAt_ = 0;
-    bool onDesktop_ = false;           // the desktop was in front at the last look
-    ULONGLONG desktopSince_ = 0;       // since when the desktop has been in front (0: it is not)
+    StageDesktopStowState desktopStow_{};
     bool covered_ = false;
     ULONGLONG coveredAt_ = 0;
     std::mutex actionLock_;

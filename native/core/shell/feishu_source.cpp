@@ -127,6 +127,86 @@ std::vector<std::wstring> Texts(IUIAutomation* uia, IUIAutomationCondition* text
     return out;
 }
 
+winrt::com_ptr<IUIAutomation> CreateFeishuUia(const std::atomic<bool>& stop, HANDLE wake, winrt::com_ptr<IUIAutomationCondition>& text,
+                                              winrt::com_ptr<IUIAutomationCacheRequest>& cache)
+{
+    return CreateUia(stop, wake, L"feishu", [&](IUIAutomation* u) {
+        text = nullptr;
+        VARIANT v{};
+        v.vt = VT_I4;
+        v.lVal = UIA_TextControlTypeId;
+        HRESULT hr = u->CreatePropertyCondition(UIA_ControlTypePropertyId, v, text.put());
+        if (FAILED(hr))
+            return hr;
+        return CreateRawCache(u, {UIA_NamePropertyId}, cache);
+    });
+}
+
+std::vector<std::pair<HWND, DWORD>> RefreshFeishuPopups(std::map<DWORD, std::wstring>& procs, UiaWindowWake& windows, ULONGLONG& listed, bool& running,
+                                                        ULONGLONG tick)
+{
+    bool unknown = false;
+    auto popups = Popups(procs, unknown);
+    if (!listed || tick - listed >= kProcessesMs || (unknown && tick - listed >= kUnknownMs)) {
+        procs = FeishuProcesses();
+        windows.SetProcesses(procs);
+        listed = tick;
+        popups = Popups(procs, unknown);
+        if (procs.empty() != !running) {
+            running = !procs.empty();
+            Log(L"feishu: %s", running ? L"watching Feishu's message popups" : L"Feishu is not running");
+        }
+    }
+    return popups;
+}
+
+void PostFeishuPopup(HWND notify, UINT msg, const std::wstring& appId, const std::vector<std::wstring>& texts)
+{
+    auto n = std::make_unique<Notice>();
+    n->source = L"feishu";
+    n->app = Tr(L"Feishu");
+    n->appId = appId;
+    n->title = texts[0];
+    for (size_t i = 1; i < texts.size(); ++i)
+        n->body += (n->body.empty() ? L"" : L" ") + texts[i];
+    if (!n->appId.empty())
+        n->action = L"app:" + n->appId;
+    if (PostOwned(notify, msg, 0, std::move(n)))
+        Log(L"feishu: new message popup");
+}
+
+bool ProcessFeishuPopups(IUIAutomation* uia, IUIAutomationCondition* text, IUIAutomationCacheRequest* cache, UiaWatch& watch,
+                         const std::map<DWORD, std::wstring>& procs, const std::vector<std::pair<HWND, DWORD>>& popups, std::map<HWND, std::wstring>& seen,
+                         bool& baseline, HWND notify, UINT msg)
+{
+    bool loading = false;
+    std::map<HWND, std::wstring> now;
+    for (const auto& [h, pid] : popups) {
+        auto old = seen.find(h);
+        const bool firstRead = !watch.Contains(h);
+        std::vector<std::wstring> t = Texts(uia, text, cache, h, watch);
+        if (t.empty()) {
+            // Keep startup popups in the baseline even before their text loads.
+            if (!baseline || old != seen.end())
+                now[h] = old != seen.end() ? old->second : std::wstring();
+            loading = loading || firstRead; // one settling pass; later changes wake through UIA
+            continue;
+        }
+        std::wstring key;
+        for (const auto& s : t)
+            key += s + L"\n";
+        now[h] = key;
+        if (!baseline || (old != seen.end() && (old->second.empty() || old->second == key)))
+            continue;
+        const auto appIt = procs.find(pid);
+        const std::wstring appId = appIt != procs.end() ? appIt->second : std::wstring();
+        PostFeishuPopup(notify, msg, appId, t);
+    }
+    seen = std::move(now);
+    baseline = true; // popups on screen when Atrium started are not new
+    return loading;
+}
+
 } // namespace
 
 FeishuSource::FeishuSource(HWND notify, UINT msg) : notify_(notify), msg_(msg), wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr))
@@ -147,19 +227,11 @@ void FeishuSource::Run()
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     winrt::com_ptr<IUIAutomationCondition> text;
     winrt::com_ptr<IUIAutomationCacheRequest> cache;
-    winrt::com_ptr<IUIAutomation> uia = CreateUia(stop_, wake_, L"feishu", [&](IUIAutomation* u) {
-        text = nullptr;
-        VARIANT v{};
-        v.vt = VT_I4;
-        v.lVal = UIA_TextControlTypeId;
-        HRESULT hr = u->CreatePropertyCondition(UIA_ControlTypePropertyId, v, text.put());
-        if (FAILED(hr))
-            return hr;
-        return CreateRawCache(u, {UIA_NamePropertyId}, cache);
-    });
+    winrt::com_ptr<IUIAutomation> uia = CreateFeishuUia(stop_, wake_, text, cache);
     // Popups already handled, by window and text (a popup may be reused for the next message).
     std::map<HWND, std::wstring> seen;
-    bool baseline = false, running = false;
+    bool baseline = false;
+    bool running = false;
     // Listing every process is the costly part of a pass: done every few seconds, not every pass.
     std::map<DWORD, std::wstring> procs;
     ULONGLONG listed = 0;
@@ -167,57 +239,9 @@ void FeishuSource::Run()
         UiaWatch watch(uia.get(), wake_);
         UiaWindowWake windows(wake_, L"Chrome_WidgetWin_1");
         while (!stop_ && uia && text) {
-            bool loading = false;
-            try {
-                watch.Prune();
-                ULONGLONG tick = GetTickCount64();
-                bool unknown = false;
-                auto popups = Popups(procs, unknown);
-                if (!listed || tick - listed >= kProcessesMs || (unknown && tick - listed >= kUnknownMs)) {
-                    procs = FeishuProcesses();
-                    windows.SetProcesses(procs);
-                    listed = tick;
-                    popups = Popups(procs, unknown);
-                    if (procs.empty() != !running) {
-                        running = !procs.empty();
-                        Log(L"feishu: %s", running ? L"watching Feishu's message popups" : L"Feishu is not running");
-                    }
-                }
-                std::map<HWND, std::wstring> now;
-                for (const auto& [h, pid] : popups) {
-                    auto old = seen.find(h);
-                    const bool firstRead = !watch.Contains(h);
-                    std::vector<std::wstring> t = Texts(uia.get(), text.get(), cache.get(), h, watch);
-                    if (t.empty()) {
-                        // Keep startup popups in the baseline even before their text loads.
-                        if (!baseline || old != seen.end())
-                            now[h] = old != seen.end() ? old->second : L"";
-                        loading = loading || firstRead; // one settling pass; later changes wake through UIA
-                        continue; // still loading: read again next time
-                    }
-                    std::wstring key;
-                    for (const auto& s : t)
-                        key += s + L"\n";
-                    now[h] = key;
-                    if (!baseline || (old != seen.end() && (old->second.empty() || old->second == key)))
-                        continue;
-                    auto n = std::make_unique<Notice>();
-                    n->source = L"feishu";
-                    n->app = Tr(L"Feishu");
-                    n->appId = procs.at(pid);
-                    n->title = t[0];
-                    for (size_t i = 1; i < t.size(); ++i)
-                        n->body += (n->body.empty() ? L"" : L" ") + t[i];
-                    if (!n->appId.empty())
-                        n->action = L"app:" + n->appId;
-                    if (PostOwned(notify_, msg_, 0, std::move(n)))
-                        Log(L"feishu: new message popup");
-                }
-                seen = std::move(now);
-                baseline = true; // popups on screen when Atrium started are not new
-            } catch (...) {
-                Log(L"feishu: reading failed");
-            }
+            watch.Prune();
+            const auto popups = RefreshFeishuPopups(procs, windows, listed, running, GetTickCount64());
+            const bool loading = ProcessFeishuPopups(uia.get(), text.get(), cache.get(), watch, procs, popups, seen, baseline, notify_, msg_);
             if (!stop_)
                 WaitForUiaWake(wake_, loading ? 200 : kReconcileMs);
         }

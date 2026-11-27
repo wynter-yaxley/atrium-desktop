@@ -10,13 +10,20 @@ public sealed partial class MainWindow
 
     private void InitDisplays()
     {
-        DisplayDelay.Configure(Loc.T("Cross-display dwell time"), 100, 2000, 50, "ms");
-        DisplayDelay.UserValueChanged += value =>
+        MainDisplays.DelayTile.Configure(Loc.T("Cross-display dwell time"), 100, 2000, 50, "ms");
+        MainDisplays.DelayTile.UserValueChanged += value =>
         {
             if (_loading) return;
             CurrentSettings.DockDisplayDelay = value;
             Changed();
         };
+        MainDisplays.RefreshClicked += OnRefreshDisplays;
+        MainDisplays.SystemDisplaysClicked += OnSystemDisplays;
+        MainDisplays.DisplayModeChecked += OnDisplayModeChecked;
+        MainDisplays.DockDisplayChanged += OnDockDisplayChanged;
+        MainDisplays.DesktopDisplayChanged += OnDesktopDisplayChanged;
+        MainDisplays.TaskbarAppsChanged += OnTaskbarAppsChanged;
+        MainDisplays.TaskbarRightPrimaryOnlyToggled += OnTaskbarRightPrimaryOnlyToggled;
         RefreshDisplays();
     }
 
@@ -25,8 +32,8 @@ public sealed partial class MainWindow
         bool loading = _loading;
         _loading = true;
         _displays = DesktopDisplay.Read();
-        ConnectedDisplayList.ItemsSource = _displays;
-        DisplaySummary.Text = Loc.F("{0} display(s) connected", _displays.Count);
+        MainDisplays.ConnectedList.ItemsSource = _displays;
+        MainDisplays.SummaryText.Text = Loc.F("{0} display(s) connected", _displays.Count);
         var choices = new List<DesktopDisplay> { new("", Loc.T("Follow the system primary display"), "", true) };
         choices.AddRange(_displays);
         // Keep an unplugged selection visible; reconnection restores it without resaving.
@@ -36,14 +43,14 @@ public sealed partial class MainWindow
                 choices.Add(new(id, Loc.T("Disconnected display (using the primary until it returns)"), "", false));
         }
 
-        DockDisplayPicker.ItemsSource = choices;
-        DesktopDisplayPicker.ItemsSource = choices;
-        DockDisplayPicker.SelectedItem = choices.First(d => d.Id == CurrentSettings.DockDisplay);
-        DesktopDisplayPicker.SelectedItem = choices.First(d => d.Id == CurrentSettings.DesktopDisplay);
-        DisplayFallback.Text = new[] { CurrentSettings.DockDisplayMode == "fixed" ? CurrentSettings.DockDisplay : "", CurrentSettings.DesktopDisplay }
+        MainDisplays.DockPicker.ItemsSource = choices;
+        MainDisplays.DesktopPicker.ItemsSource = choices;
+        MainDisplays.DockPicker.SelectedItem = choices.First(d => d.Id == CurrentSettings.DockDisplay);
+        MainDisplays.DesktopPicker.SelectedItem = choices.First(d => d.Id == CurrentSettings.DesktopDisplay);
+        MainDisplays.FallbackText.Text = new[] { CurrentSettings.DockDisplayMode == "fixed" ? CurrentSettings.DockDisplay : "", CurrentSettings.DesktopDisplay }
             .Any(id => id.Length > 0 && !_displays.Any(d => d.Id == id))
             ? Loc.T("The chosen display is disconnected; the primary is used and the choice returns when it reconnects.") : "";
-        DisplayFallback.Visibility = DisplayFallback.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        MainDisplays.FallbackText.Visibility = MainDisplays.FallbackText.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         _loading = loading;
     }
 
@@ -51,23 +58,23 @@ public sealed partial class MainWindow
     {
         var mode = CurrentSettings.DockDisplayMode switch
         {
-            "follow" => DockDisplayFollow,
-            "fixed" => DockDisplayFixed,
-            "all" => DockDisplayAll,
-            _ => DockDisplayPrimary,
+            "primary" => MainDisplays.PrimaryRadio,
+            "fixed" => MainDisplays.FixedRadio,
+            "all" => MainDisplays.AllRadio,
+            _ => MainDisplays.FollowRadio,
         };
         mode.IsChecked = true;
-        DisplayDelay.SetValue(CurrentSettings.DockDisplayDelay);
-        TaskbarAppsPicker.SelectedIndex = CurrentSettings.TaskbarApps switch { "primaryAndWindow" => 1, "window" => 2, _ => 0 };
-        TaskbarRightPrimaryOnlySwitch.IsOn = CurrentSettings.TaskbarRightPrimaryOnly;
+        MainDisplays.DelayTile.SetValue(CurrentSettings.DockDisplayDelay);
+        MainDisplays.AppsPicker.SelectedIndex = CurrentSettings.TaskbarApps switch { "primaryAndWindow" => 1, "window" => 2, _ => 0 };
+        MainDisplays.RightPrimaryOnlyTile.IsOn = CurrentSettings.TaskbarRightPrimaryOnly;
         UpdateDisplayControls();
         RefreshDisplays();
     }
 
     private void UpdateDisplayControls()
     {
-        DockDisplayPicker.IsEnabled = CurrentSettings.DockDisplayMode == "fixed";
-        DisplayDelay.IsEnabled = CurrentSettings.DockDisplayMode == "follow";
+        MainDisplays.DockPicker.IsEnabled = CurrentSettings.DockDisplayMode == "fixed";
+        MainDisplays.DelayTile.IsEnabled = CurrentSettings.DockDisplayMode == "follow";
     }
 
     private void OnDisplayModeChecked(object sender, RoutedEventArgs e)
@@ -95,15 +102,15 @@ public sealed partial class MainWindow
 
     private void OnTaskbarAppsChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_loading || TaskbarAppsPicker.SelectedIndex < 0) return;
-        CurrentSettings.TaskbarApps = TaskbarAppsPicker.SelectedIndex switch { 1 => "primaryAndWindow", 2 => "window", _ => "all" };
+        if (_loading || MainDisplays.AppsPicker.SelectedIndex < 0) return;
+        CurrentSettings.TaskbarApps = MainDisplays.AppsPicker.SelectedIndex switch { 1 => "primaryAndWindow", 2 => "window", _ => "all" };
         Changed();
     }
 
     private void OnTaskbarRightPrimaryOnlyToggled(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
-        CurrentSettings.TaskbarRightPrimaryOnly = TaskbarRightPrimaryOnlySwitch.IsOn;
+        CurrentSettings.TaskbarRightPrimaryOnly = MainDisplays.RightPrimaryOnlyTile.IsOn;
         Changed();
     }
 

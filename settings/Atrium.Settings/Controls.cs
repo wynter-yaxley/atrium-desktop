@@ -120,7 +120,11 @@ public sealed partial class ToggleTile : UserControl
     }
 
     public string Title { get => _title.Text; set => _title.Text = value; }
-    public string Note { get => ToolTipService.GetToolTip(Switch)?.ToString() ?? ""; set => ToolTipService.SetToolTip(Switch, value); }
+    public string Note
+    {
+        get => ToolTipService.GetToolTip(Switch)?.ToString() ?? "";
+        set => ToolTipService.SetToolTip(Switch, string.IsNullOrWhiteSpace(value) ? null : value);
+    }
     // The switch's name for UI Automation (and screen readers).
     public string SwitchName { get => AutomationProperties.GetName(Switch); set => AutomationProperties.SetName(Switch, value); }
     public bool IsOn { get => Switch.IsOn; set => Switch.IsOn = value; }

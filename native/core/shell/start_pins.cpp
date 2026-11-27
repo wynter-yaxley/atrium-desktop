@@ -20,9 +20,31 @@ namespace atrium {
 namespace {
 
 constexpr const wchar_t* kSystemFolders[] = {
-    L"accessibility", L"accessories", L"administrative tools", L"maintenance", L"startup", L"system tools", L"windows powershell", L"windows tools",
+    L"accessibility",
+    L"accessories",
+    L"administrative tools",
+    L"maintenance",
+    L"system tools",
+    L"windows accessibility",
+    L"windows accessories",
+    L"windows administrative tools",
+    L"windows ease of access",
+    L"windows powershell",
+    L"windows system",
+    L"windows tools",
+    L"windows 附件",
+    L"windows 管理工具",
+    L"windows 轻松使用",
+    L"windows 系统",
+    L"windows 工具",
+    L"管理工具",
+    L"系统工具",
+    L"附件",
+    L"辅助功能",
+    L"轻松使用",
+    L"维护",
 };
-constexpr const wchar_t* kToolFolders[] = {L"microsoft office tools", L"windows kits"};
+constexpr const wchar_t* kToolFolders[] = {L"microsoft office tools", L"microsoft office 工具", L"windows kits"};
 
 std::wstring Fold(const std::wstring& s)
 {
@@ -468,8 +490,10 @@ void CollectStartLinks(const std::wstring& dir, std::vector<std::pair<std::wstri
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (depth + 1 < 8 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
                 subdirs.push_back(dir + L"\\" + name);
-        } else if (name.size() > 4 && Fold(name.substr(name.size() - 4)) == L".lnk") {
-            links.emplace_back(L"desktopAppLink", dir + L"\\" + name);
+        } else {
+            const std::wstring folded = Fold(name);
+            if ((name.size() > 4 && folded.ends_with(L".lnk")) || (name.size() > 10 && folded.ends_with(L".appref-ms")))
+                links.emplace_back(L"desktopAppLink", dir + L"\\" + name);
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -487,6 +511,8 @@ bool IsToolStartFolder(const std::wstring& foldedName)
     return std::ranges::any_of(kToolFolders, [&](const wchar_t* s) { return foldedName == s; });
 }
 
+bool IsStartupStartFolder(const std::wstring& foldedName) { return foldedName == L"startup" || foldedName == L"启动"; }
+
 bool NotAnAppShortcut(const CatalogApp& app)
 {
     const std::wstring name = Fold(app.name);
@@ -494,7 +520,10 @@ bool NotAnAppShortcut(const CatalogApp& app)
     if (name.find(L"uninstall") != std::wstring::npos || name.find(L"卸载") != std::wstring::npos || name.find(L"解除安装") != std::wstring::npos ||
         target.starts_with(L"unins"))
         return true;
-    return !target.empty() && !target.ends_with(L".exe");
+    if (target.empty())
+        return false;
+    constexpr const wchar_t* kLaunchExts[] = {L".exe", L".bat", L".cmd", L".com", L".jar", L".appref-ms"};
+    return std::ranges::none_of(kLaunchExts, [&](const wchar_t* ext) { return target.ends_with(ext); });
 }
 
 std::vector<CatalogFolder> ReadStartMenuFolders(const std::vector<CatalogApp>& apps)

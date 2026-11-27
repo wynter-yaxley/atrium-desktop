@@ -9,7 +9,6 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <stdexcept>
 #include <vector>
 
 using namespace atrium;
@@ -18,10 +17,15 @@ namespace fs = std::filesystem;
 namespace {
 using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
 
-void Require(bool condition, const char* message)
+bool g_failed = false;
+
+bool Require(bool condition, const char* message)
 {
-    if (!condition)
-        throw std::runtime_error(message);
+    if (condition)
+        return true;
+    std::cerr << "FAIL: " << message << '\n';
+    g_failed = true;
+    return false;
 }
 
 Handle Spawn(const fs::path& exe, const std::vector<std::wstring>& arguments)
@@ -32,8 +36,9 @@ Handle Spawn(const fs::path& exe, const std::vector<std::wstring>& arguments)
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    Require(CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != FALSE,
-            "start isolated probe process");
+    if (!Require(CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != FALSE,
+                 "start isolated probe process"))
+        return Handle(nullptr, CloseHandle);
     CloseHandle(process.hThread);
     return Handle(process.hProcess, CloseHandle);
 }
@@ -41,7 +46,8 @@ Handle Spawn(const fs::path& exe, const std::vector<std::wstring>& arguments)
 Handle FindProcess(const fs::path& exe)
 {
     Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0), CloseHandle);
-    Require(snapshot.get() != INVALID_HANDLE_VALUE, "snapshot probe processes");
+    if (!Require(snapshot.get() != INVALID_HANDLE_VALUE, "snapshot probe processes"))
+        return Handle(nullptr, CloseHandle);
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     for (BOOL more = Process32FirstW(snapshot.get(), &entry); more; more = Process32NextW(snapshot.get(), &entry)) {
@@ -63,7 +69,8 @@ struct Fixture {
     Fixture()
     {
         wchar_t temporary[MAX_PATH]{};
-        Require(GetTempPathW(ARRAYSIZE(temporary), temporary) != 0, "read temporary directory");
+        if (!Require(GetTempPathW(ARRAYSIZE(temporary), temporary) != 0, "read temporary directory"))
+            return;
         root = fs::path(temporary) / (L"Atrium-process-tests-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
         fs::create_directory(root);
     }
@@ -84,6 +91,8 @@ struct Fixture {
     {
         // Cleanup only disposable probe copies, even if a check failed halfway through.
         for (auto& process : children) {
+            if (!process)
+                continue;
             TerminateProcess(process.get(), ERROR_PROCESS_ABORTED);
             WaitForSingleObject(process.get(), 5000);
         }
@@ -98,7 +107,8 @@ struct Fixture {
             fs::remove(copy, ignored);
             fs::remove(copy.parent_path(), ignored);
         }
-        fs::remove(root, ignored);
+        if (!root.empty())
+            fs::remove(root, ignored);
     }
 };
 
@@ -108,19 +118,25 @@ void CheckSharedFolders()
         PWSTR raw = nullptr;
         const HRESULT hr = SHGetKnownFolderPath(id, 0, nullptr, &raw);
         const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> guard(raw, CoTaskMemFree);
-        Require(SUCCEEDED(hr) && raw != nullptr, "query known folder path");
+        if (!Require(SUCCEEDED(hr) && raw != nullptr, "query known folder path"))
+            return fs::path{};
         return fs::path(raw);
     };
     wchar_t buffer[MAX_PATH]{};
-    Require(GetWindowsDirectoryW(buffer, ARRAYSIZE(buffer)) != 0, "read Windows directory");
+    if (!Require(GetWindowsDirectoryW(buffer, ARRAYSIZE(buffer)) != 0, "read Windows directory"))
+        return;
     const fs::path windowsDir(buffer);
-    Require(GetSystemDirectoryW(buffer, ARRAYSIZE(buffer)) != 0, "read System32 directory");
+    if (!Require(GetSystemDirectoryW(buffer, ARRAYSIZE(buffer)) != 0, "read System32 directory"))
+        return;
     const fs::path systemDir(buffer);
-    Require(GetTempPathW(ARRAYSIZE(buffer), buffer) != 0, "read temporary directory");
+    if (!Require(GetTempPathW(ARRAYSIZE(buffer), buffer) != 0, "read temporary directory"))
+        return;
     const fs::path tempDir(buffer);
     const fs::path programFiles = known(FOLDERID_ProgramFiles);
     const fs::path downloads = known(FOLDERID_Downloads);
     const fs::path localAppData = known(FOLDERID_LocalAppData);
+    if (programFiles.empty() || downloads.empty() || localAppData.empty())
+        return;
 
     Require(IsSharedAppFolder(L""), "empty folder is treated as shared");
     Require(IsSharedAppFolder(L"C:\\"), "drive root is treated as shared");
@@ -151,6 +167,8 @@ void CheckTermination(const fs::path& self)
     Require(CanTerminateApp({{}, L"package!app"}), "packaged apps can use AUMID alone");
 
     Fixture fixture;
+    if (fixture.root.empty())
+        return;
     Require(!IsSharedAppFolder((fixture.root / L"app").wstring()), "isolated test app folder is not shared");
     const auto app = fixture.Copy(self, L"app", L"probe.exe");
     // The app starts a helper from its own folder, which starts another program from elsewhere.
@@ -160,15 +178,21 @@ void CheckTermination(const fs::path& self)
     const auto shell = fixture.Copy(self, L"shell", L"explorer.exe");
     const auto eventName = L"Local\\AtriumProcessTests-" + std::to_wstring(GetCurrentProcessId());
     Handle ready(CreateEventW(nullptr, TRUE, FALSE, eventName.c_str()), CloseHandle);
-    Require(bool(ready), "create probe readiness event");
+    if (!Require(bool(ready), "create probe readiness event"))
+        return;
     fixture.children.push_back(Spawn(app, {L"--probe", eventName, helper.wstring(), grandchild.wstring()}));
-    Require(WaitForSingleObject(ready.get(), 5000) == WAIT_OBJECT_0, "helper tree is ready");
+    if (!Require(bool(fixture.children.back()), "start probe root") ||
+        !Require(WaitForSingleObject(ready.get(), 5000) == WAIT_OBJECT_0, "helper tree is ready"))
+        return;
     fixture.children.push_back(FindProcess(helper));
     fixture.children.push_back(FindProcess(grandchild));
-    Require(bool(fixture.children[1]) && bool(fixture.children[2]), "capture helper tree handles");
+    if (!Require(bool(fixture.children[1]) && bool(fixture.children[2]), "capture helper tree handles"))
+        return;
     fixture.children.push_back(Spawn(app, {L"--probe", eventName}));
     fixture.children.push_back(Spawn(unrelated, {L"--probe", eventName}));
     fixture.children.push_back(Spawn(shell, {L"--probe", eventName}));
+    if (!Require(bool(fixture.children[3]) && bool(fixture.children[4]) && bool(fixture.children[5]), "start sibling probes"))
+        return;
 
     std::wstring upperPath = app.wstring();
     CharUpperBuffW(upperPath.data(), DWORD(upperPath.size()));
@@ -277,31 +301,34 @@ void CheckHiddenMainWindow()
 
 int wmain(int argc, wchar_t** argv)
 {
-    try {
-        if (argc >= 3 && std::wstring(argv[1]) == L"--probe") {
-            if (argc > 3) {
-                std::vector<std::wstring> arguments{L"--probe", argv[2]};
-                for (int i = 4; i < argc; ++i)
-                    arguments.emplace_back(argv[i]);
-                auto child = Spawn(argv[3], arguments);
-            } else {
-                Handle ready(OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[2]), CloseHandle);
-                Require(ready && SetEvent(ready.get()), "signal probe readiness");
-            }
-            Sleep(INFINITE);
-            return 0;
+    if (argc >= 3 && std::wstring(argv[1]) == L"--probe") {
+        if (argc > 3) {
+            std::vector<std::wstring> arguments{L"--probe", argv[2]};
+            for (int i = 4; i < argc; ++i)
+                arguments.emplace_back(argv[i]);
+            auto child = Spawn(argv[3], arguments);
+            if (!child)
+                return 1;
+        } else {
+            Handle ready(OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[2]), CloseHandle);
+            if (!Require(ready && SetEvent(ready.get()), "signal probe readiness"))
+                return 1;
         }
-        wchar_t self[32768]{};
-        Require(GetModuleFileNameW(nullptr, self, ARRAYSIZE(self)) != 0, "read test executable path");
+        Handle idle(CreateEventW(nullptr, TRUE, FALSE, nullptr), CloseHandle);
+        if (idle)
+            WaitForSingleObject(idle.get(), INFINITE);
+        return 0;
+    }
+    wchar_t self[32768]{};
+    if (Require(GetModuleFileNameW(nullptr, self, ARRAYSIZE(self)) != 0, "read test executable path")) {
         CheckSharedFolders();
         CheckTermination(self);
         CheckTaskRules();
         CheckPendingRestores();
         CheckHiddenMainWindow();
-        std::cout << "PASS: application termination, taskbar rules, and process isolation\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "FAIL: " << error.what() << '\n';
-        return 1;
     }
+    if (g_failed)
+        return 1;
+    std::cout << "PASS: application termination, taskbar rules, and process isolation\n";
+    return 0;
 }
