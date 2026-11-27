@@ -368,6 +368,35 @@ void Bar::FileDragLeave()
     Publish();
 }
 
+RECT Bar::DropBarRect() const
+{
+    if (!visible_ || tucked_ || slidOut_ || IsRectEmpty(&window_))
+        return RECT{};
+    return BarRect();
+}
+
+bool Bar::ApplyRemoteFileDragOver(POINT screen, std::wstring& keyOut)
+{
+    keyOut.clear();
+    if (!visible_ || tucked_ || slidOut_)
+        return false;
+    keyOut = FileDragOver(screen);
+    return !keyOut.empty() && canOpenFiles && canOpenFiles(keyOut);
+}
+
+void Bar::ApplyRemoteFileDragLeave()
+{
+    if (!fileHoverKey_.empty())
+        FileDragLeave();
+}
+
+void Bar::ApplyRemoteDropFiles(const std::wstring& key, const std::vector<std::wstring>& files)
+{
+    FileDragLeave();
+    if (!key.empty() && !files.empty() && (!canOpenFiles || canOpenFiles(key)) && onDropFiles)
+        onDropFiles(key, files);
+}
+
 void Bar::WatchPointer()
 {
     if (!covered_ || !visible_) {

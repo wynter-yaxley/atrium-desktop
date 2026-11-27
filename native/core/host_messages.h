@@ -23,5 +23,8 @@ constexpr UINT WM_USB = WM_APP + 13;          // the device worker has queued re
 constexpr UINT WM_IME_STATE = WM_APP + 20;    // the input method may have changed (ImeWatcher)
 constexpr UINT WM_BADGES = WM_APP + 21;       // an app's unread badge count changed (WeChatSource)
 constexpr UINT WM_ATRIUM_SERVER_READY = WM_APP + 22; // settings server pipe is listening and Ready() is true
+constexpr UINT WM_ATRIUM_AGENT_DRAG_OVER = WM_APP + 23;
+constexpr UINT WM_ATRIUM_AGENT_DRAG_LEAVE = WM_APP + 24;
+constexpr UINT WM_ATRIUM_AGENT_DROP_FILES = WM_APP + 25;
 
 } // namespace atrium

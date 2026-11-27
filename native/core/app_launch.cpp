@@ -7,6 +7,7 @@
 #include "log.h"
 #include "settings.h"
 #include "shell/app_registration.h"
+#include "shell/desktop_agent_host.h"
 #include "shell/logon_task.h"
 #include "shell/process_integrity.h"
 #include "shell/shell_launch.h"
@@ -102,17 +103,7 @@ bool QuitOtherInstance(HWND other, DWORD timeoutMs)
     return exited;
 }
 
-} // namespace
-
-std::wstring ExeDir()
-{
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring p(path);
-    return p.substr(0, p.find_last_of(L'\\'));
-}
-
-static void OpenSettingsImpl(const wchar_t* page, bool showErrorUi)
+void OpenSettingsImpl(const wchar_t* page, bool showErrorUi)
 {
     const std::wstring dir = ExeDir();
     std::vector<std::wstring> candidates = {dir + L"\\Settings\\Atrium.Settings.exe", dir + L"\\Atrium.Settings.exe"};
@@ -147,6 +138,16 @@ static void OpenSettingsImpl(const wchar_t* page, bool showErrorUi)
     }
 }
 
+} // namespace
+
+std::wstring ExeDir()
+{
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring p(path);
+    return p.substr(0, p.find_last_of(L'\\'));
+}
+
 // page: the settings app opens on it ("widgets"); an open window just comes to the front.
 void OpenSettings(const wchar_t* page) { OpenSettingsImpl(page, true); }
 
@@ -163,7 +164,7 @@ std::thread StartLogonUpdate(const Settings& settings)
     });
 }
 
-std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch)
+std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch, HINSTANCE instance)
 {
     if (launch.uninstall) {
         if (MessageBoxW(nullptr, Tr(L"Uninstall Atrium? Your personal settings and desktop widget layout will be kept."), L"Atrium",
@@ -175,6 +176,10 @@ std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch)
         const std::wstring arguments = L"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + ExeDir() + L"\\Uninstall.ps1\" -Confirmed";
         return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", powershell.c_str(), arguments.c_str(), nullptr, SW_HIDE)) > 32 ? 0 : 1;
     }
+    if (launch.desktopAgent)
+        return launch.desktopAgentCorePid ?
+                   RunDesktopAgent(launch.desktopAgentCorePid, launch.desktopAgentGeneration, instance ? instance : GetModuleHandleW(nullptr)) :
+                   1;
     if (launch.guard)
         return launch.guardPid ? RunGuard(launch.guardPid, kHostClass, ParseGuardGenerationFromCommandLine()) : 1;
     if (!launch.exitRequested)

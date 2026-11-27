@@ -237,3 +237,8 @@ set_tests_properties(privilege_lifecycle PROPERTIES TIMEOUT 20)
 add_executable(shell_launch_tests shell_launch.cpp)
 target_link_libraries(shell_launch_tests PRIVATE atrium_core_lib)
 add_test(NAME shell_launch COMMAND shell_launch_tests)
+
+add_executable(desktop_agent_tests desktop_agent.cpp)
+target_link_libraries(desktop_agent_tests PRIVATE atrium_core_lib)
+add_test(NAME desktop_agent COMMAND desktop_agent_tests)
+set_tests_properties(desktop_agent PROPERTIES TIMEOUT 30)

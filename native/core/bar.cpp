@@ -33,6 +33,7 @@ constexpr wchar_t kVisualClass[] = L"AtriumBarVisual";
 constexpr wchar_t kInputClass[] = L"AtriumBarInput";
 
 std::map<HWINEVENTHOOK, Bar*> g_guards; // each display has its own stacking guard
+std::atomic<uint64_t> g_nextDropBarId{1};
 struct CaptureWindows {
     HWND visual, input;
     bool visible;
@@ -80,6 +81,7 @@ int Bar::Px(double dip, float scale) { return int(std::lround(dip * scale)); }
 
 Bar::Bar(HINSTANCE instance, bool debugCapturable, std::wstring display)
     : debugCapturable_(debugCapturable),
+      dropId_(g_nextDropBarId.fetch_add(1)),
       displayOverride_(std::move(display)),
       wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)),
       quit_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
@@ -545,6 +547,7 @@ void Bar::UpdateAutoHide()
         return;
     tucked_ = scene_.tucked = tuck;
     onTuckChanged();
+    onDropLayoutChanged();
     if (tuck) {
         HideTooltip();
         SetRegion(false);

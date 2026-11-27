@@ -1,4 +1,5 @@
 #include "guard_process.h"
+#include "launch_args.h"
 #include "lifecycle_server.h"
 #include "settings.h"
 #include "settings_server.h"
@@ -395,6 +396,79 @@ void CheckGuardInstanceGeneration()
     Check(ShouldGuardUndoLeftover(g2, 0), "missing active generation allows guard undo");
 }
 
+void CheckDesktopAgentLaunchArgs()
+{
+    using namespace atrium;
+    {
+        const CoreLaunchOptions opt = ParseCoreLaunchOptions({L"Atrium.exe", L"--desktop-agent", L"4242", L"--agent-gen", L"99"});
+        Check(opt.desktopAgent && opt.desktopAgentCorePid == 4242 && opt.desktopAgentGeneration == 99 && !opt.guard && opt.guardPid == 0,
+              "--desktop-agent 4242 --agent-gen 99 parses cleanly");
+    }
+    {
+        const CoreLaunchOptions opt =
+            ParseCoreLaunchOptions({L"Atrium.exe", L"--data-dir", L"D:\\tests\\--desktop-agent 111", L"--desktop-agent", L"4242", L"--agent-gen", L"99"});
+        Check(opt.desktopAgent && opt.desktopAgentCorePid == 4242 && opt.desktopAgentGeneration == 99,
+              "--desktop-agent and --agent-gen parse cleanly when combined with --data-dir");
+    }
+    {
+        const CoreLaunchOptions inDataDir = ParseCoreLaunchOptions({L"Atrium.exe", L"--data-dir", L"D:\\tests\\--desktop-agent 111 --agent-gen 7"});
+        Check(!inDataDir.desktopAgent && inDataDir.desktopAgentCorePid == 0 && inDataDir.desktopAgentGeneration == 0,
+              "--data-dir value containing --desktop-agent must not trigger desktopAgent");
+    }
+    {
+        const CoreLaunchOptions missing = ParseCoreLaunchOptions({L"Atrium.exe", L"--desktop-agent"});
+        const CoreLaunchOptions zero = ParseCoreLaunchOptions({L"Atrium.exe", L"--desktop-agent", L"0"});
+        const CoreLaunchOptions badDigits = ParseCoreLaunchOptions({L"Atrium.exe", L"--desktop-agent", L"12abc"});
+        const CoreLaunchOptions nextFlag = ParseCoreLaunchOptions({L"Atrium.exe", L"--desktop-agent", L"--exit"});
+        Check(missing.desktopAgent && missing.desktopAgentCorePid == 0, "bare --desktop-agent leaves desktopAgentCorePid=0");
+        Check(zero.desktopAgent && zero.desktopAgentCorePid == 0, "--desktop-agent 0 leaves desktopAgentCorePid=0");
+        Check(badDigits.desktopAgent && badDigits.desktopAgentCorePid == 0, "--desktop-agent 12abc leaves desktopAgentCorePid=0");
+        Check(nextFlag.desktopAgent && nextFlag.desktopAgentCorePid == 0 && nextFlag.exitRequested,
+              "--desktop-agent followed by --exit leaves desktopAgentCorePid=0 and parses --exit");
+    }
+    {
+        const CoreLaunchOptions zeroGen = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-gen", L"0"});
+        const CoreLaunchOptions negGen = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-gen", L"-1"});
+        const CoreLaunchOptions badGen = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-gen", L"99xyz"});
+        const CoreLaunchOptions trailingGen = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-gen"});
+        const CoreLaunchOptions guardGen = ParseCoreLaunchOptions({L"Atrium.exe", L"--guard", L"4242", L"--guard-gen", L"77"});
+        Check(zeroGen.desktopAgentGeneration == 0, "--agent-gen 0 parses as 0");
+        Check(negGen.desktopAgentGeneration == 0, "--agent-gen -1 leaves desktopAgentGeneration=0");
+        Check(badGen.desktopAgentGeneration == 0, "--agent-gen 99xyz leaves desktopAgentGeneration=0");
+        Check(trailingGen.desktopAgentGeneration == 0, "trailing --agent-gen leaves desktopAgentGeneration=0");
+        Check(guardGen.guard && guardGen.guardPid == 4242 && guardGen.guardGeneration == 77, "--guard-gen 77 parses guardGeneration");
+    }
+}
+
+void CheckGuardAgentPidFile()
+{
+    using namespace atrium;
+    TempDir temp(L"atrium-agent-pid-test-");
+    const std::wstring pidPath = (temp.path / L"agent.pid").wstring();
+
+    Check(ReadAgentPid(pidPath) == 0, "missing agent.pid reads as 0");
+    Check(!WriteAgentPid(0, pidPath), "WriteAgentPid(0) is rejected");
+    Check(!WriteAgentPid(4242, L""), "WriteAgentPid with empty path is rejected");
+    Check(ReadAgentPid(L"") == 0, "ReadAgentPid with empty path reads as 0");
+
+    Check(WriteAgentPid(4242, pidPath), "WriteAgentPid(4242) succeeds in temp path");
+    Check(ReadAgentPid(pidPath) == 4242, "ReadAgentPid returns written PID 4242");
+
+    Check(WriteAgentPid(9876, pidPath), "WriteAgentPid(9876) overwrites existing agent.pid");
+    Check(ReadAgentPid(pidPath) == 9876, "ReadAgentPid returns overwritten PID 9876");
+
+    Check(WriteTextFile(pidPath, L"not-a-pid"), "seed invalid agent.pid contents");
+    Check(ReadAgentPid(pidPath) == 0, "invalid agent.pid contents read as 0");
+
+    Check(WriteTextFile(pidPath, L"99999999999"), "seed out-of-range DWORD agent.pid contents");
+    Check(ReadAgentPid(pidPath) == 0, "out-of-range DWORD agent.pid contents read as 0");
+
+    ClearAgentPid(pidPath);
+    Check(ReadAgentPid(pidPath) == 0 && !fs::exists(pidPath), "ClearAgentPid removes agent.pid");
+    ClearAgentPid(pidPath);
+    Check(ReadAgentPid(pidPath) == 0, "ClearAgentPid on missing file stays 0");
+}
+
 } // namespace
 
 int main()
@@ -404,6 +478,8 @@ int main()
     CheckPipeAndMutexAcls();
     CheckLifecycleAndSettingsServers();
     CheckGuardInstanceGeneration();
+    CheckDesktopAgentLaunchArgs();
+    CheckGuardAgentPidFile();
     if (g_failures) {
         std::fprintf(stderr, "%d privilege/lifecycle check(s) failed\n", g_failures);
         return 1;

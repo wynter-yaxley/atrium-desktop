@@ -10,9 +10,11 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -24,6 +26,7 @@ namespace atrium {
 class Bar;
 class CalendarPanel;
 class ControlCenter;
+class DesktopAgentClient;
 class DesktopWidgets;
 class ExtrasHost;
 class FeishuSource;
@@ -94,6 +97,16 @@ struct AppState {
     std::map<std::pair<Messenger, DWORD>, MessengerSourceMeta> messengerSources;
     std::unique_ptr<TrayModel> tray;
     std::unique_ptr<TrayPanel> trayPanel;
+    std::unique_ptr<DesktopAgentClient> desktopAgent;
+    std::atomic_bool desktopAgentStopping{false};
+    struct RemoteDragOverState {
+        std::mutex mutex;
+        uint32_t seq = 0;
+        POINT pt{};
+        bool done = false;
+        bool allow = false;
+        std::wstring key;
+    } remoteDragOver;
     std::unique_ptr<ExtrasHost> extras; // Launchpad, the now-playing entry, the folder stack
     std::unique_ptr<ControlCenter> control;
     std::unique_ptr<CalendarPanel> calendar;
@@ -163,7 +176,12 @@ void CloseBarPopups();
 void ConfigureBar(Bar& bar);
 std::vector<TaskItem> BarItems();
 void SyncDisplayBars(const Settings& settings, bool refresh = false, bool workAreaOnly = false);
+void SyncDesktopDropBars();
 void UpdateDesktopMonitor(bool notify);
+
+void HandleAgentDragOverMessage(WPARAM w);
+void HandleAgentDragLeaveMessage();
+void HandleAgentDropFilesMessage(LPARAM l);
 
 void InitializeSubsystems(HINSTANCE instance, Settings& settings);
 void ShutdownApp(HANDLE mutex, std::thread& startupThread);

@@ -30,6 +30,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -95,6 +96,11 @@ public:
     RECT EntryRect(const std::wstring& key) const;
     // Screen rectangle of the glass shape.
     RECT BarRect() const;
+    uint64_t DropBarId() const { return dropId_; }
+    RECT DropBarRect() const;
+    bool ApplyRemoteFileDragOver(POINT screen, std::wstring& keyOut);
+    void ApplyRemoteFileDragLeave();
+    void ApplyRemoteDropFiles(const std::wstring& key, const std::vector<std::wstring>& files);
     BarEdge Edge() const { return edge_; }
     // The window that had the foreground before a click on the logo activated the bar.
     HWND PreviousForeground() const { return previousForeground_; }
@@ -156,6 +162,7 @@ public:
     std::function<void()> onInteract = [] {}; // this display owns the next popup
     std::function<void()> onItemsChanged = [] {}; // keep an open preview filtered after a window crosses displays
     std::function<void()> onTuckChanged = [] {};  // auto-hide tucked the bar away or brought it up
+    std::function<void()> onDropLayoutChanged = [] {}; // drop target rect, visibility, or tuck changed
 
 private:
     static constexpr UINT WM_BAR_LAYOUT = WM_APP + 0x71; // defer DPI relayout until SetWindowPos returns
@@ -269,6 +276,7 @@ private:
     void PlaceWindows(const RECT& win, bool shown);
 
     bool debugCapturable_ = false;
+    uint64_t dropId_ = 0;
     bool ShowOwnWindowsToCapture(bool visible); // render thread; waits for the UI thread
     HWND visual_ = nullptr;
     HWND input_ = nullptr;

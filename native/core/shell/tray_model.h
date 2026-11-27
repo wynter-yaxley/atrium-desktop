@@ -6,6 +6,7 @@
 
 #include "icon_image.h"
 #include "pinned_app.h"
+#include "shell/desktop_agent_client.h"
 #include "shell/tray_click.h"
 #include "shell/tray_host.h"
 #include "shell/tray_match.h"
@@ -14,6 +15,7 @@
 
 #include <winrt/base.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -101,7 +103,11 @@ public:
     TrayModel& operator=(const TrayModel&) = delete;
 
     void Refresh(); // asynchronous
-    std::vector<TrayIcon> Icons() const;
+    std::vector<TrayIcon> Icons() const
+    {
+        std::lock_guard g(mutex_);
+        return snapshot_ ? *snapshot_ : std::vector<TrayIcon>{};
+    }
     bool Loaded() const
     {
         std::lock_guard g(mutex_);
@@ -124,15 +130,37 @@ public:
     bool OpenExisting(const std::wstring& exe, DWORD preferredPid = 0);
     // The tray host (setting `trayHost`): the apps' icons as they send them, clicked with
     // the shell's own messages. Icons only Explorer's tray has stay in the list. UI thread.
+    void SetDesktopAgent(DesktopAgentClient* agent)
+    {
+        std::lock_guard buildGuard(snapshotBuildMutex_);
+        std::lock_guard g(mutex_);
+        desktopAgent_.store(agent);
+        hostInk_.clear();
+    }
+    void NotifyRemoteChanged(bool refresh = false)
+    {
+        RebuildSnapshot(refresh);
+        if (refresh)
+            Refresh();
+    }
     void SetHosting(bool on);
-    bool Hosting() const { return host_ != nullptr; }
+    bool Hosting() const
+    {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            return agent->Hosting();
+        return host_ != nullptr;
+    }
     bool HostYielded() const
     {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            return agent->Yielded();
         std::lock_guard g(mutex_);
         return host_ && host_->Yielded();
     }
     TrayHostYieldReason HostYieldReason() const
     {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            return agent->YieldReason();
         std::lock_guard g(mutex_);
         return host_ ? host_->YieldReason() : TrayHostYieldReason::None;
     }
@@ -140,21 +168,31 @@ public:
     // the middle button, and the pointer resting on an icon (null: on none).
     void MiddleClick(const TrayIcon& icon, RECT cell = {});
     void Hover(const TrayIcon* icon, RECT cell = {});
-    void SetHostPlaces(RECT anchor); // the panel's place on screen, for apps that ask where their icon is
+    void SetHostPlaces(RECT anchor)
+    {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            agent->SetPlaces(anchor);
+        else if (host_)
+            host_->SetPlaces(anchor);
+    }
     // The programs whose tray icon flashes now (hosted icons only): a message waiting.
     std::vector<std::wstring> Flashing() const
     {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            return !agent->Yielded() ? agent->Flashing() : std::vector<std::wstring>{};
         std::lock_guard g(mutex_);
         return host_ && !host_->Yielded() ? host_->Flashing() : std::vector<std::wstring>{};
     }
     std::vector<FlashingTrayIcon> FlashingIcons() const
     {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            return !agent->Yielded() ? agent->FlashingIcons() : std::vector<FlashingTrayIcon>{};
         std::lock_guard g(mutex_);
         return host_ && !host_->Yielded() ? host_->FlashingIcons() : std::vector<FlashingTrayIcon>{};
     }
 
     // First line of a tooltip, for display.
-    static std::wstring Title(const std::wstring& tip);
+    static std::wstring Title(const std::wstring& tip) { return tray::Title(tip); }
 
 private:
     struct Job {
@@ -170,6 +208,7 @@ private:
     void RunClickJob(IUIAutomation* uia, const Job& job, const tray::ShellSession& session, ULONGLONG findStart);
     void RunRefreshJob(WorkerState& ws, const tray::ShellSession& session, ULONGLONG findStart);
     void RebuildSnapshot(bool forceNotify);
+    HostSendStatus SendHosted(const std::wstring& key, tray::HostAction action, POINT at, RECT cell);
     bool ClickHosted(const TrayIcon& icon, tray::HostAction action, RECT cell = {}, bool allowProgramWake = false);
     void EnqueueUrgent(Job job);
     HWND notify_;
@@ -184,6 +223,7 @@ private:
     std::shared_ptr<const std::vector<TrayIcon>> snapshot_;
     bool loaded_ = false, available_ = false, stop_ = false;
     std::thread thread_;
+    std::atomic<DesktopAgentClient*> desktopAgent_{nullptr};
     std::unique_ptr<TrayHost> host_;
     // Ink for a hosted one-shade glyph, by picture version.
     mutable std::map<uint64_t, std::pair<std::shared_ptr<const IconImage>, bool>> hostInk_;

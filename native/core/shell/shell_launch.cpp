@@ -357,11 +357,11 @@ private:
     static DWORD WINAPI WorkerThreadProc(LPVOID param)
     {
         const std::unique_ptr<std::shared_ptr<WorkerState>> holder(static_cast<std::shared_ptr<WorkerState>*>(param));
-        WorkerMain(std::move(*holder));
+        WorkerMain(*holder);
         return 0;
     }
 
-    static void WorkerMain(std::shared_ptr<WorkerState> state)
+    static void WorkerMain(const std::shared_ptr<WorkerState>& state)
     {
         const StaComScope com;
         MSG msg{};
@@ -442,11 +442,9 @@ LaunchRoute ResolveLaunchRoute(PrivilegeMode mode, LaunchPrivilege privilege, La
         return LaunchRoute::ExplorerComMedium;
     case PrivilegeMode::Standard: return LaunchRoute::DirectCurrentToken;
     case PrivilegeMode::ElevatedUnified:
-        // Unified elevation has no medium-integrity Explorer shell; fail closed when Medium is required.
-        return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;
     case PrivilegeMode::CrossAccountElevated:
     case PrivilegeMode::Unknown:
-        // Never delegate across user accounts or unknown privilege states; fail closed when Medium is required.
+        // Never delegate when Explorer is elevated, cross-account, or unknown; fail closed when Medium is required.
         return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;
     }
     return privilege == LaunchPrivilege::RequireMedium ? LaunchRoute::BlockedMismatch : LaunchRoute::DirectCurrentToken;

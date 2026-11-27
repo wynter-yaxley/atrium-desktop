@@ -7,17 +7,21 @@
 #include "crash_dump.h"
 #include "desktop_helpers.h"
 #include "extras_host.h"
+#include "guard_process.h"
 #include "host_messages.h"
 #include "lifecycle_server.h"
 #include "log.h"
+#include "posted.h"
 #include "render/capture.h"
 #include "render/shutdown_wait.h"
 #include "resource.h"
 #include "settings_server.h"
 #include "shell/app_catalog.h"
+#include "shell/desktop_agent_client.h"
 #include "shell/feishu_source.h"
 #include "shell/jump_list.h"
 #include "shell/notification_listener.h"
+#include "shell/process_integrity.h"
 #include "shell/shell_icon.h"
 #include "shell/shell_launch.h"
 #include "shell/system_chrome.h"
@@ -161,6 +165,74 @@ void AbortStuckShutdown(HANDLE mutex, const wchar_t* reason)
     ReleaseMutex(mutex);
     ShutdownLog();
     TerminateProcess(GetCurrentProcess(), 0);
+}
+
+struct RemoteDropPayload {
+    std::wstring key;
+    std::vector<std::wstring> paths;
+};
+
+void InitializeDesktopAgent()
+{
+    if (CurrentPrivilegeMode() != PrivilegeMode::ElevatedSplit)
+        return;
+    g_app.desktopAgentStopping.store(false);
+    DesktopAgentCallbacks cb;
+    cb.onAgentPidChanged = [](DWORD pid) {
+        if (g_app.desktopAgentStopping.load())
+            return;
+        if (pid)
+            WriteAgentPid(pid);
+        else
+            ClearAgentPid();
+    };
+    cb.onTrayChanged = [] {
+        if (!g_app.desktopAgentStopping.load() && g_app.tray)
+            g_app.tray->NotifyRemoteChanged(false);
+    };
+    cb.onYieldChanged = [] {
+        if (!g_app.desktopAgentStopping.load() && g_app.tray)
+            g_app.tray->NotifyRemoteChanged(true);
+    };
+    cb.onDragOver = [](POINT pt) -> AgentDragOverResult {
+        if (g_app.desktopAgentStopping.load() || !g_app.displaysReady)
+            return {};
+        HWND host = g_app.host;
+        if (!host)
+            return {};
+        uint32_t seq = 0;
+        {
+            std::lock_guard g(g_app.remoteDragOver.mutex);
+            seq = ++g_app.remoteDragOver.seq;
+            if (seq == 0)
+                seq = ++g_app.remoteDragOver.seq;
+            g_app.remoteDragOver.pt = pt;
+            g_app.remoteDragOver.done = false;
+            g_app.remoteDragOver.allow = false;
+            g_app.remoteDragOver.key.clear();
+        }
+        DWORD_PTR answer = 0;
+        if (!SendMessageTimeoutW(host, WM_ATRIUM_AGENT_DRAG_OVER, static_cast<WPARAM>(seq), 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 250, &answer))
+            return {};
+        std::lock_guard g(g_app.remoteDragOver.mutex);
+        if (seq != g_app.remoteDragOver.seq || !g_app.remoteDragOver.done)
+            return {};
+        return {g_app.remoteDragOver.allow, g_app.remoteDragOver.key};
+    };
+    cb.onDragLeave = [] {
+        if (!g_app.desktopAgentStopping.load() && g_app.host)
+            PostMessageW(g_app.host, WM_ATRIUM_AGENT_DRAG_LEAVE, 0, 0);
+    };
+    cb.onDropFiles = [](const std::wstring& key, const std::vector<std::wstring>& paths) {
+        if (!g_app.desktopAgentStopping.load() && g_app.host)
+            PostOwned(g_app.host, WM_ATRIUM_AGENT_DROP_FILES, 0, std::make_unique<RemoteDropPayload>(RemoteDropPayload{key, paths}));
+    };
+    DesktopAgentClientOptions opts;
+    opts.corePid = GetCurrentProcessId();
+    opts.generation = ActiveInstanceGeneration();
+    g_app.desktopAgent = std::make_unique<DesktopAgentClient>(std::move(cb), std::move(opts));
+    if (g_app.tray)
+        g_app.tray->SetDesktopAgent(g_app.desktopAgent.get());
 }
 
 } // namespace
@@ -388,6 +460,7 @@ void InitializeSubsystems(HINSTANCE instance, Settings& settings)
             names.push_back(AppCatalog::PinFor(app));
         return names;
     });
+    InitializeDesktopAgent();
     g_app.trayPanel = std::make_unique<TrayPanel>(instance, *g_app.tray);
     g_app.trayPanel->onSystemTray = OpenTray;
     g_app.trayPanel->SetAttention(g_app.tasks->Snapshot(true));
@@ -454,9 +527,77 @@ void InitializeSubsystems(HINSTANCE instance, Settings& settings)
     BindStartMenuCallbacks(settings);
 }
 
+void HandleAgentDragOverMessage(WPARAM w)
+{
+    if (g_app.desktopAgentStopping.load() || !g_app.displaysReady || !g_app.bar)
+        return;
+    const auto seq = static_cast<uint32_t>(w);
+    POINT pt{};
+    {
+        std::lock_guard g(g_app.remoteDragOver.mutex);
+        if (seq != g_app.remoteDragOver.seq)
+            return;
+        pt = g_app.remoteDragOver.pt;
+    }
+    bool allow = false;
+    std::wstring key;
+    Bar* hitBar = nullptr;
+    ForBars([&](Bar& bar) {
+        const RECT r = bar.DropBarRect();
+        if (!hitBar && !IsRectEmpty(&r) && PtInRect(&r, pt))
+            hitBar = &bar;
+    });
+    ForBars([&](Bar& bar) {
+        if (&bar == hitBar)
+            allow = bar.ApplyRemoteFileDragOver(pt, key);
+        else
+            bar.ApplyRemoteFileDragLeave();
+    });
+    std::lock_guard g(g_app.remoteDragOver.mutex);
+    if (seq == g_app.remoteDragOver.seq) {
+        g_app.remoteDragOver.allow = allow;
+        g_app.remoteDragOver.key = std::move(key);
+        g_app.remoteDragOver.done = true;
+    }
+}
+
+void HandleAgentDragLeaveMessage()
+{
+    if (g_app.desktopAgentStopping.load() || !g_app.bar)
+        return;
+    ForBars([](Bar& bar) { bar.ApplyRemoteFileDragLeave(); });
+}
+
+void HandleAgentDropFilesMessage(LPARAM l)
+{
+    const auto payload = TakePosted<RemoteDropPayload>(l);
+    if (!payload || g_app.desktopAgentStopping.load() || !g_app.bar)
+        return;
+    Bar* target = nullptr;
+    POINT cursor{};
+    if (GetCursorPos(&cursor)) {
+        ForBars([&](Bar& bar) {
+            const RECT r = bar.DropBarRect();
+            if (!target && !IsRectEmpty(&r) && PtInRect(&r, cursor))
+                target = &bar;
+        });
+    }
+    if (!target)
+        target = &ActiveBar();
+    target->ApplyRemoteDropFiles(payload->key, payload->paths);
+}
+
 void ShutdownApp(HANDLE mutex, std::thread& startupThread)
 {
+    g_app.desktopAgentStopping.store(true);
     g_app.displaysReady = false;
+    if (g_app.tray)
+        g_app.tray->SetDesktopAgent(nullptr);
+    if (g_app.desktopAgent) {
+        g_app.desktopAgent->Shutdown();
+        g_app.desktopAgent.reset();
+    }
+    ClearAgentPid();
     if (g_app.chrome)
         g_app.chrome->RestoreForExit();
     g_app.stage->RestoreAll();

@@ -478,6 +478,7 @@ void Bar::ApplyLayout(const RelayoutTarget& target, const LayoutMetrics& m)
     if (target.monitorChanged)
         onMonitorChanged();
     onItemsChanged();
+    onDropLayoutChanged();
 }
 
 void Bar::Relayout()

@@ -83,6 +83,9 @@ add_library(atrium_core_lib STATIC
     shell/games.cpp
     shell/launchpad_order.cpp
     shell/displays.cpp
+    shell/desktop_agent_client.cpp
+    shell/desktop_agent_host.cpp
+    shell/desktop_agent_ipc.cpp
     shell/tray_host.cpp
     shell/tray_model.cpp
     shell/tray_actions.cpp

@@ -62,10 +62,7 @@ void CollectHostButtons(IUIAutomation* uia, HWND host, bool promoted, bool xaml,
     winrt::com_ptr<IUIAutomationCondition> cond;
     VARIANT v{};
     v.vt = VARTYPE(xaml ? VT_BSTR : VT_I4);
-    if (xaml)
-        v.bstrVal = SysAllocString(L"NotifyItemIcon");
-    else
-        v.lVal = UIA_ButtonControlTypeId;
+    xaml ? void(v.bstrVal = SysAllocString(L"NotifyItemIcon")) : void(v.lVal = UIA_ButtonControlTypeId);
     const HRESULT hr = uia->CreatePropertyCondition(xaml ? UIA_AutomationIdPropertyId : UIA_ControlTypePropertyId, v, cond.put());
     VariantClear(&v);
     winrt::com_ptr<IUIAutomationElementArray> all;
@@ -189,12 +186,10 @@ winrt::com_ptr<IUIAutomationElement> FindOverflowChevron(IUIAutomation* uia, HWN
 
 const wchar_t* RouteName(tray::Route route)
 {
-    switch (route) {
-    case tray::Route::Invoke: return L"uia-invoke";
-    case tray::Route::ContextMenu: return L"uia-context-menu";
-    case tray::Route::LegacyDefault: return L"legacy-default";
-    default: return L"toolbar-messages";
-    }
+    return route == tray::Route::Invoke        ? L"uia-invoke" :
+           route == tray::Route::ContextMenu   ? L"uia-context-menu" :
+           route == tray::Route::LegacyDefault ? L"legacy-default" :
+                                                 L"toolbar-messages";
 }
 
 const wchar_t* ActionName(tray::Action a)
@@ -232,19 +227,10 @@ HRESULT ToolbarClick(const tray_detail::Found& target, tray::Action action)
         UINT message = WM_MOUSEMOVE;
         WPARAM keys = 0;
         switch (event) {
-        case tray::MouseEvent::LeftDown:
-            message = WM_LBUTTONDOWN;
-            keys = MK_LBUTTON;
-            break;
+        case tray::MouseEvent::LeftDown: message = WM_LBUTTONDOWN, keys = MK_LBUTTON; break;
         case tray::MouseEvent::LeftUp: message = WM_LBUTTONUP; break;
-        case tray::MouseEvent::LeftDouble:
-            message = WM_LBUTTONDBLCLK;
-            keys = MK_LBUTTON;
-            break;
-        case tray::MouseEvent::RightDown:
-            message = WM_RBUTTONDOWN;
-            keys = MK_RBUTTON;
-            break;
+        case tray::MouseEvent::LeftDouble: message = WM_LBUTTONDBLCLK, keys = MK_LBUTTON; break;
+        case tray::MouseEvent::RightDown: message = WM_RBUTTONDOWN, keys = MK_RBUTTON; break;
         case tray::MouseEvent::RightUp: message = WM_RBUTTONUP; break;
         default: break;
         }
@@ -518,20 +504,18 @@ int32_t InvokeTrayRoute(tray_detail::Found* target, const tray::ShellSession& se
     if (target && elem && session == tray_detail::ReadShellSession()) {
         const BOOL allowed = AllowSetForegroundWindow(session.pid);
         Log(L"tray: click foreground-delegate pid=%lu allowed=%d error=%lu", DWORD(session.pid), allowed, allowed ? 0 : GetLastError());
-        if (route == tray::Route::Toolbar) {
+        if (route == tray::Route::Toolbar)
             hr = ToolbarClick(*target, action);
-        } else if (route == tray::Route::ContextMenu) {
+        else if (route == tray::Route::ContextMenu) {
             auto e3 = elem.try_as<IUIAutomationElement3>();
             hr = e3 ? e3->ShowContextMenu() : E_NOINTERFACE;
         } else if (route == tray::Route::Invoke) {
             winrt::com_ptr<IUIAutomationInvokePattern> p;
-            hr = elem->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(p.put()));
-            if (SUCCEEDED(hr))
+            if (hr = elem->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(p.put())); SUCCEEDED(hr))
                 hr = p ? p->Invoke() : E_NOINTERFACE;
         } else {
             winrt::com_ptr<IUIAutomationLegacyIAccessiblePattern> p;
-            hr = elem->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(p.put()));
-            if (SUCCEEDED(hr))
+            if (hr = elem->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(p.put())); SUCCEEDED(hr))
                 hr = p ? p->DoDefaultAction() : E_NOINTERFACE;
         }
     }
@@ -597,8 +581,7 @@ std::vector<Found> FindButtons(IUIAutomation* uia, bool& available)
     CollectHostButtons(uia, FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr), false, true, out, available);
     if (!out.empty())
         return out;
-    HWND tray = ShellTaskbar();
-    HWND notify = tray ? FindWindowExW(tray, nullptr, L"TrayNotifyWnd", nullptr) : nullptr;
+    HWND tray = ShellTaskbar(), notify = tray ? FindWindowExW(tray, nullptr, L"TrayNotifyWnd", nullptr) : nullptr;
     HWND pager = notify ? FindWindowExW(notify, nullptr, L"SysPager", nullptr) : nullptr;
     CollectHostButtons(uia, pager ? FindWindowExW(pager, nullptr, L"ToolbarWindow32", nullptr) : nullptr, true, false, out, available);
     HWND overflow = FindWindowW(L"NotifyIconOverflowWindow", nullptr);
@@ -625,8 +608,7 @@ bool ShowOverflow(IUIAutomation* uia, HANDLE stopEvent)
         return false;
     winrt::com_ptr<IUIAutomationInvokePattern> invoke;
     HRESULT hr = chevron->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(invoke.put()));
-    if (SUCCEEDED(hr))
-        hr = invoke ? invoke->Invoke() : E_NOINTERFACE;
+    hr = SUCCEEDED(hr) ? (invoke ? invoke->Invoke() : E_NOINTERFACE) : hr;
     Log(L"tray: overflow chevron hr=0x%08X taskbarVisible=%d", unsigned(hr), IsWindowVisible(tray));
     if (FAILED(hr))
         return false;
@@ -639,18 +621,52 @@ bool ShowOverflow(IUIAutomation* uia, HANDLE stopEvent)
 
 DWORD TrayModel::LastSyntheticInput() { return g_syntheticInput; }
 
+HostSendStatus TrayModel::SendHosted(const std::wstring& key, tray::HostAction action, POINT at, RECT cell)
+{
+    DesktopAgentClient* agent = desktopAgent_.load();
+    if (!agent)
+        return host_ ? (host_->Hover(L"", at), host_->Send(key, action, at, cell)) : HostSendStatus::NotSent;
+    agent->Hover(L"", at);
+    bool higher = false;
+    const HostSendStatus status = agent->Send(key, action, at, cell, &higher);
+    if (status != HostSendStatus::NotSent || !higher)
+        return status;
+    for (const HostIcon& icon : agent->Icons()) {
+        if (icon.key != key || !icon.callback || !icon.hwnd || !IsWindow(icon.hwnd))
+            continue;
+        AllowSetForegroundWindow(icon.pid);
+        const std::vector<UINT> seq = tray::CallbackSequence(action, icon.version);
+        size_t sent = 0;
+        WPARAM wp = 0;
+        LPARAM lp = 0;
+        for (UINT note : seq) {
+            tray::EncodeCallback(icon.version, icon.uid, note, at, wp, lp);
+            if (!SendNotifyMessageW(icon.hwnd, icon.callback, wp, lp))
+                break;
+            ++sent;
+        }
+        return sent == 0 ? HostSendStatus::NotSent : sent == seq.size() ? HostSendStatus::Sent : HostSendStatus::Partial;
+    }
+    return HostSendStatus::NotSent;
+}
+
 void TrayModel::MiddleClick(const TrayIcon& icon, RECT cell)
 {
     POINT at{};
-    if (host_ && !icon.hostKey.empty() && GetCursorPos(&at))
-        host_->Hover(L"", at), host_->Send(icon.hostKey, tray::HostAction::Middle, at, cell);
+    if (!icon.hostKey.empty() && GetCursorPos(&at))
+        SendHosted(icon.hostKey, tray::HostAction::Middle, at, cell);
 }
 
 void TrayModel::Hover(const TrayIcon* icon, RECT cell)
 {
     POINT at{};
-    if (host_ && GetCursorPos(&at))
-        host_->Hover(icon ? icon->hostKey : L"", at, cell);
+    if (!GetCursorPos(&at))
+        return;
+    const std::wstring key = icon ? icon->hostKey : L"";
+    if (DesktopAgentClient* agent = desktopAgent_.load())
+        agent->Hover(key, at, cell);
+    else if (host_)
+        host_->Hover(key, at, cell);
 }
 
 void TrayModel::EnqueueUrgent(Job job)
@@ -666,9 +682,7 @@ bool TrayModel::ClickHosted(const TrayIcon& icon, tray::HostAction hostAction, R
         return false;
     POINT at{};
     GetCursorPos(&at);
-    if (host_)
-        host_->Hover(L"", at);
-    const HostSendStatus status = host_ ? host_->Send(icon.hostKey, hostAction, at, cell) : HostSendStatus::NotSent;
+    const HostSendStatus status = SendHosted(icon.hostKey, hostAction, at, cell);
     if (status == HostSendStatus::Sent || status == HostSendStatus::Partial)
         return true;
     const tray::Action action = hostAction == tray::HostAction::Right              ? tray::Action::Right :
@@ -676,20 +690,11 @@ bool TrayModel::ClickHosted(const TrayIcon& icon, tray::HostAction hostAction, R
                                 hostAction == tray::HostAction::DoubleContinuation ? tray::Action::DoubleContinuation :
                                                                                      tray::Action::Left;
     // Fall back to Explorer only on NotSent and only through a strict 1-to-1 Explorer binding.
-    TrayIcon fallback;
-    if (icon.explorerTarget) {
-        fallback.tip = icon.explorerTarget->tip;
-        fallback.exe = icon.explorerTarget->exe;
-        fallback.recordId = icon.explorerTarget->identity;
-        fallback.runtimeId = icon.explorerTarget->runtime;
-        fallback.shell = icon.explorerTarget->shell;
-        fallback.explorerTarget = icon.explorerTarget;
-    } else {
-        fallback.tip = icon.tip;
-        fallback.exe = icon.exe;
-        fallback.recordId = icon.recordId;
-        fallback.shell = icon.shell;
-    }
+    const auto& fb = icon.explorerTarget;
+    TrayIcon fallback{fb ? fb->tip : icon.tip, fb ? fb->exe : icon.exe};
+    fallback.recordId = fb ? fb->identity : icon.recordId, fallback.shell = fb ? fb->shell : icon.shell;
+    if (fb)
+        fallback.runtimeId = fb->runtime, fallback.explorerTarget = fb;
     EnqueueUrgent({false, std::move(fallback), action, false, allowProgramWake});
     return true;
 }
@@ -717,12 +722,11 @@ bool TrayModel::OpenExisting(const std::wstring& exe, DWORD preferredPid)
     for (const TrayIcon& icon : current) {
         if (icon.exe.empty() || _wcsicmp(AppExecutable(icon.exe).c_str(), exe.c_str()) != 0)
             continue;
-        if (preferredPid && icon.pid == preferredPid) {
+        if (!chosen || (!chosen->flashing && icon.flashing) || (preferredPid && icon.pid == preferredPid)) {
             chosen = &icon;
-            break;
+            if (preferredPid && icon.pid == preferredPid)
+                break;
         }
-        if (!chosen || (!chosen->flashing && icon.flashing))
-            chosen = &icon;
     }
     if (chosen)
         return ClickHosted(*chosen, tray::HostAction::Open, {}, true) || (EnqueueUrgent({false, *chosen, tray::Action::Left, false, true}), true);
@@ -733,11 +737,8 @@ bool TrayModel::OpenExisting(const std::wstring& exe, DWORD preferredPid)
         return false;
     TrayIcon icon;
     icon.exe = std::move(lowerExe);
-    for (const TrayIcon& t : current)
-        if (t.exe == icon.exe) {
-            icon = t;
-            break;
-        }
+    if (const auto it = std::ranges::find_if(current, [&](const TrayIcon& t) { return t.exe == icon.exe; }); it != current.end())
+        icon = *it;
     return ClickHosted(icon, tray::HostAction::Open, {}, true) || (EnqueueUrgent({false, icon, tray::Action::Left, false, true}), true);
 }
 

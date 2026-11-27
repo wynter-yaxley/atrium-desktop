@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cwchar>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -33,7 +34,31 @@ HWND FindProcessWindow(const wchar_t* className, DWORD pid)
     return nullptr;
 }
 
-uint64_t ParseGenerationText(std::wstring_view text)
+HWND FindExplorerTaskbar(DWORD corePid, DWORD agentPid, DWORD trayOwnerPid)
+{
+    HWND shell = ShellTaskbar(trayOwnerPid);
+    if (!shell || agentPid == 0 || agentPid == corePid)
+        return shell;
+    DWORD owner = 0;
+    GetWindowThreadProcessId(shell, &owner);
+    if (owner != corePid && owner != agentPid)
+        return shell;
+    DWORD shellPid = 0;
+    if (HWND desktop = GetShellWindow())
+        GetWindowThreadProcessId(desktop, &shellPid);
+    HWND other = nullptr;
+    for (HWND h = nullptr; (h = FindWindowExW(nullptr, h, L"Shell_TrayWnd", nullptr)) != nullptr;) {
+        DWORD wndPid = 0;
+        GetWindowThreadProcessId(h, &wndPid);
+        if (shellPid && wndPid == shellPid)
+            return h;
+        if (wndPid != corePid && wndPid != agentPid && !other)
+            other = h;
+    }
+    return other;
+}
+
+uint64_t ParseUnsignedText(std::wstring_view text)
 {
     while (!text.empty() && (text.front() == L' ' || text.front() == L'\t' || text.front() == L'\r' || text.front() == L'\n'))
         text.remove_prefix(1);
@@ -77,6 +102,52 @@ HANDLE AcquireGuardMutex()
     return held;
 }
 
+void CheckGuardTrayHost(DWORD corePid, DWORD& activeTrayOwnerPid, int& traySilent, bool& trayBack)
+{
+    const DWORD rawAgentPid = ReadAgentPid();
+    const DWORD agentPid = (rawAgentPid != 0 && rawAgentPid != corePid) ? rawAgentPid : 0;
+    DWORD trayOwnerPid = corePid;
+    HWND trayHost = FindProcessWindow(L"Shell_TrayWnd", corePid);
+    if (!trayHost && agentPid != 0) {
+        trayHost = FindProcessWindow(L"Shell_TrayWnd", agentPid);
+        if (trayHost)
+            trayOwnerPid = agentPid;
+    }
+    if (trayHost)
+        activeTrayOwnerPid = trayOwnerPid;
+    DWORD_PTR answer = 0;
+    const bool trayAlive = !trayHost || SendMessageTimeoutW(trayHost, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 1500, &answer);
+    traySilent = trayAlive ? 0 : traySilent + 1;
+    if (traySilent >= 2) {
+        if (HWND shell = FindExplorerTaskbar(corePid, agentPid, trayOwnerPid))
+            SetWindowPos(shell, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        if (!trayBack)
+            Log(L"guard: Atrium's tray host (%lu) is not responding: Explorer's tray in front", trayOwnerPid);
+        trayBack = true;
+    } else if (trayAlive && trayBack) {
+        Log(L"guard: Atrium's tray host (%lu) responds again", activeTrayOwnerPid);
+        trayBack = false;
+    }
+}
+
+void CheckGuardHostWindow(DWORD corePid, const wchar_t* hostClass, HWND& host, int& silent, bool& shown)
+{
+    if (!host || !IsWindow(host))
+        host = FindProcessWindow(hostClass, corePid);
+    DWORD_PTR answer = 0;
+    const bool alive = !host || SendMessageTimeoutW(host, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &answer);
+    silent = alive ? 0 : silent + 1;
+    if (silent >= 4 && !shown) {
+        // About 15 s without an answer: the taskbar back (Atrium hides it again if it recovers).
+        Log(L"guard: Atrium (%lu) is not responding: Windows' taskbar shown", corePid);
+        SystemChrome::ShowTaskbarsNow();
+        shown = true;
+    } else if (alive && shown) {
+        Log(L"guard: Atrium (%lu) responds again", corePid);
+        shown = false;
+    }
+}
+
 } // namespace
 
 std::wstring InstanceGenerationPath()
@@ -89,7 +160,7 @@ uint64_t ReadInstanceGeneration(const std::wstring& path)
 {
     if (path.empty())
         return 0;
-    return ParseGenerationText(ReadTextFile(path));
+    return ParseUnsignedText(ReadTextFile(path));
 }
 
 uint64_t AdvanceInstanceGeneration(const std::wstring& path)
@@ -110,6 +181,39 @@ bool ShouldGuardUndoLeftover(uint64_t guardGeneration, uint64_t activeGeneration
     if (guardGeneration == 0 || activeGeneration == 0)
         return true;
     return activeGeneration <= guardGeneration;
+}
+
+std::wstring AgentPidPath()
+{
+    const std::wstring dir = DataDirectory();
+    return dir.empty() ? std::wstring() : (dir + L"\\agent.pid");
+}
+
+bool WriteAgentPid(DWORD pid, const std::wstring& path)
+{
+    if (path.empty() || pid == 0)
+        return false;
+    if (!WriteTextFile(path, std::to_wstring(pid))) {
+        Log(L"guard: could not persist agent pid %lu (%lu)", pid, GetLastError());
+        return false;
+    }
+    return true;
+}
+
+DWORD ReadAgentPid(const std::wstring& path)
+{
+    if (path.empty())
+        return 0;
+    const uint64_t val = ParseUnsignedText(ReadTextFile(path));
+    if (val == 0 || val > (std::numeric_limits<DWORD>::max)())
+        return 0;
+    return static_cast<DWORD>(val);
+}
+
+void ClearAgentPid(const std::wstring& path)
+{
+    if (!path.empty())
+        DeleteFileW(path.c_str());
 }
 
 // While Windows' taskbar or its banners are hidden, a second Atrium.exe (`--guard`, RunGuard)
@@ -156,39 +260,15 @@ int RunGuard(DWORD pid, const wchar_t* hostClass, uint64_t generation)
     if (!process)
         return 1;
     HWND host = nullptr;
+    DWORD activeTrayOwnerPid = pid;
     int silent = 0, traySilent = 0; // checks in a row without an answer (and Atrium's tray host)
     bool shown = false, trayBack = false;
     while (WaitForSingleObject(process, 2000) == WAIT_TIMEOUT) {
         // Apps' tray calls go to the tray host first and wait for it. Not answering
         // (Atrium hung, or its host thread), Explorer's taskbar goes in front of it so
         // that they reach Explorer; the host moves back once it runs again.
-        HWND trayHost = FindProcessWindow(L"Shell_TrayWnd", pid);
-        DWORD_PTR answer = 0;
-        const bool trayAlive = !trayHost || SendMessageTimeoutW(trayHost, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 1500, &answer);
-        traySilent = trayAlive ? 0 : traySilent + 1;
-        if (traySilent >= 2) {
-            if (HWND shell = ShellTaskbar(pid))
-                SetWindowPos(shell, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-            if (!trayBack)
-                Log(L"guard: Atrium's tray host (%lu) is not responding: Explorer's tray in front", pid);
-            trayBack = true;
-        } else if (trayAlive && trayBack) {
-            Log(L"guard: Atrium's tray host (%lu) responds again", pid);
-            trayBack = false;
-        }
-        if (!host || !IsWindow(host))
-            host = FindProcessWindow(hostClass, pid);
-        const bool alive = !host || SendMessageTimeoutW(host, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &answer);
-        silent = alive ? 0 : silent + 1;
-        if (silent >= 4 && !shown) {
-            // About 15 s without an answer: the taskbar back (Atrium hides it again if it recovers).
-            Log(L"guard: Atrium (%lu) is not responding: Windows' taskbar shown", pid);
-            SystemChrome::ShowTaskbarsNow();
-            shown = true;
-        } else if (alive && shown) {
-            Log(L"guard: Atrium (%lu) responds again", pid);
-            shown = false;
-        }
+        CheckGuardTrayHost(pid, activeTrayOwnerPid, traySilent, trayBack);
+        CheckGuardHostWindow(pid, hostClass, host, silent, shown);
     }
     DWORD code = 0;
     GetExitCodeProcess(process, &code);

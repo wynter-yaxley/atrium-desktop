@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -577,8 +578,6 @@ std::vector<int> MatchButtons(std::vector<Found>& buttons, std::vector<Record>& 
 
 } // namespace tray_detail
 
-std::wstring TrayModel::Title(const std::wstring& tip) { return tray::Title(tip); }
-
 TrayModel::TrayModel(HWND notify, UINT msg, std::function<std::vector<PinnedApp>()> appNames)
     : notify_(notify),
       msg_(msg),
@@ -615,30 +614,23 @@ void TrayModel::Refresh()
 
 void TrayModel::SetHosting(bool on)
 {
-    if (on == (host_ != nullptr))
-        return;
-    auto onYield = [this] { RebuildSnapshot(true), Refresh(); };
-    auto onIcons = [this] { RebuildSnapshot(false); };
-    std::unique_ptr<TrayHost> host = on ? std::make_unique<TrayHost>(notify_, msg_, 3000, 0, onYield, onIcons) : nullptr;
-    if (host && !host->Running())
-        host.reset();
+    std::unique_ptr<TrayHost> host;
+    if (DesktopAgentClient* agent = desktopAgent_.load()) {
+        agent->SetTrayHosting(on);
+    } else {
+        if (on == (host_ != nullptr))
+            return;
+        auto onYield = [this] { RebuildSnapshot(true), Refresh(); };
+        auto onIcons = [this] { RebuildSnapshot(false); };
+        host = on ? std::make_unique<TrayHost>(notify_, msg_, 3000, 0, onYield, onIcons) : nullptr;
+        if (host && !host->Running())
+            host.reset();
+    }
     {
         std::lock_guard g(mutex_);
         std::swap(host, host_), hostInk_.clear();
     }
     host.reset(), RebuildSnapshot(true), Refresh();
-}
-
-void TrayModel::SetHostPlaces(RECT anchor)
-{
-    if (host_)
-        host_->SetPlaces(anchor);
-}
-
-std::vector<TrayIcon> TrayModel::Icons() const
-{
-    std::lock_guard g(mutex_);
-    return snapshot_ ? *snapshot_ : std::vector<TrayIcon>{};
 }
 
 void TrayModel::RebuildSnapshot(bool forceNotify)
@@ -650,19 +642,31 @@ void TrayModel::RebuildSnapshot(bool forceNotify)
     HostNameMap names, newNames;
     InkCache ink, newInk;
     const TrayHost* hostPtr = nullptr;
-    bool hostedActive = false;
+    DesktopAgentClient* agent = desktopAgent_.load();
+    bool hostedActive = agent && agent->Hosting() && !agent->Yielded();
+    if (hostedActive) {
+        hosted = agent->Icons();
+        for (const auto& f : agent->FlashingIcons())
+            for (HostIcon& h : hosted)
+                h.flashUntil = h.key == f.hostKey ? (std::numeric_limits<ULONGLONG>::max)() : h.flashUntil;
+    }
     {
         std::lock_guard g(mutex_);
-        explorer = icons_, hostedActive = host_ && !host_->Yielded();
+        explorer = icons_;
+        if (!agent) {
+            hostedActive = host_ && !host_->Yielded();
+            if (hostedActive)
+                hostPtr = host_.get(), hosted = host_->Icons();
+        }
         if (hostedActive)
-            hostPtr = host_.get(), hosted = host_->Icons(), order = windowsOrder_, names = hostNames_, ink = hostInk_;
+            order = windowsOrder_, names = hostNames_, ink = hostInk_;
     }
     std::vector<TrayIcon> next = hostedActive ? MergeSnapshotIcons(explorer, hosted, order, names, newNames, ink, newInk) : std::move(explorer);
     bool changed = false;
     {
         std::lock_guard g(mutex_);
         InsertCapped(hostNames_, newNames);
-        if (host_.get() == hostPtr)
+        if (agent ? (desktopAgent_.load() == agent) : (host_.get() == hostPtr))
             InsertCapped(hostInk_, newInk);
         changed = !snapshot_ || next.size() != snapshot_->size() || !std::equal(next.begin(), next.end(), snapshot_->begin(), SameTrayIcon);
         if (changed)
@@ -754,22 +758,21 @@ void TrayModel::Worker()
 {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     WorkerState ws;
-    HRESULT created = CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(ws.uia.put()));
-    if (FAILED(created))
-        created = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(ws.uia.put()));
-    if (FAILED(created))
-        Log(L"tray: UI Automation unavailable");
+    if (FAILED(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(ws.uia.put()))))
+        if (FAILED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(ws.uia.put()))))
+            Log(L"tray: UI Automation unavailable");
     if (auto options = ws.uia.try_as<IUIAutomation2>())
         options->put_ConnectionTimeout(250), options->put_TransactionTimeout(250);
     for (Job job; DequeueWorkerJob(ws, job);) {
         if (!ws.uia) {
-            if (!job.refresh) {
+            if (!job.refresh)
                 PostMessageW(notify_, msg_, tray_detail::ShowOverflow(nullptr, stopEvent_) ? 2 : 3, 0);
-            } else {
-                std::unique_lock g(mutex_);
-                const bool firstLoad = !loaded_;
-                loaded_ = true, available_ = false;
-                g.unlock();
+            else {
+                bool firstLoad = false;
+                {
+                    std::lock_guard g(mutex_);
+                    firstLoad = !loaded_, loaded_ = true, available_ = false;
+                }
                 if (firstLoad)
                     RebuildSnapshot(true);
             }

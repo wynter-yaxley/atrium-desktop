@@ -10,6 +10,7 @@
 #include "log.h"
 #include "render/capture.h"
 #include "render/shutdown_wait.h"
+#include "shell/desktop_agent_client.h"
 #include "shell/displays.h"
 #include "shell/feishu_source.h"
 #include "shell/games.h"
@@ -267,6 +268,7 @@ void ConfigureBar(Bar& bar)
             g_app.preview->Refresh(bar.Items());
     };
     bar.onCloseRequest = [] { PostMessageW(g_app.host, WM_CLOSE, 0, 0); };
+    bar.onDropLayoutChanged = [] { SyncDesktopDropBars(); };
 }
 
 // The bar's items, lit for attention also where an app's tray icon flashes (QQ and WeChat flash
@@ -350,6 +352,20 @@ void SyncDisplayBars(const Settings& settings, bool refresh, bool workAreaOnly)
     g_app.widgets->SetBarEdge(edge);
     g_app.stage->SetBarEdge(edge);
     g_app.notes->PanelsChanged();
+    SyncDesktopDropBars();
+}
+
+void SyncDesktopDropBars()
+{
+    if (!g_app.desktopAgent || !g_app.bar || g_app.desktopAgentStopping.load())
+        return;
+    std::vector<AgentBarRect> bars;
+    ForBars([&](Bar& bar) {
+        const RECT r = bar.DropBarRect();
+        if (!IsRectEmpty(&r))
+            bars.push_back({bar.DropBarId(), r, true});
+    });
+    g_app.desktopAgent->SyncDropBars(bars);
 }
 
 void UpdateDesktopMonitor(bool notify)

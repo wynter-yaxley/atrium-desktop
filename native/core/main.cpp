@@ -80,7 +80,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     LocalFree(static_cast<HLOCAL>(startupArguments));
     const atrium::CoreLaunchOptions launch = atrium::ParseCoreLaunchOptions(args);
     g_app.readyEvent = launch.readyEvent;
-    if (const std::optional<int> code = HandleLaunchCommand(launch))
+    if (const std::optional<int> code = HandleLaunchCommand(launch, instance))
         return *code;
     int instanceExit = 0;
     HANDLE mutex = AcquireInstanceMutex(instanceExit, launch.replace);
