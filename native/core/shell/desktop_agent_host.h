@@ -21,6 +21,7 @@ struct DesktopAgentHostOptions {
     std::function<void(std::function<void()> pushSnapshot, std::function<void()> pushYield)> onReadyForTest;
     std::wstring nonce;
     bool failOverlayShowForTest = false;
+    int failSnapshotPostCountForTest = 0;
 };
 
 int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride = nullptr, const wchar_t* evtPipeOverride = nullptr,

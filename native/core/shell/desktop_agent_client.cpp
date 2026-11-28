@@ -271,8 +271,10 @@ void DesktopAgentClient::SyncDropBars(const std::vector<AgentBarRect>& bars)
 {
     {
         std::lock_guard lock(stateMutex_);
-        if (bars == desiredDropBars_ && desiredDropBarsSeq_ == confirmedDropBarsSeq_)
+        if (bars == desiredDropBars_ && activeAgentPid_ != 0 && activeAgentEpoch_ != 0 && desiredDropBarsSeq_ == confirmedDropBarsSeq_ &&
+            confirmedDropBarsEpoch_ == activeAgentEpoch_) {
             return;
+        }
         desiredDropBars_ = bars;
         ++desiredDropBarsSeq_;
     }
@@ -284,26 +286,26 @@ void DesktopAgentClient::FlushDropBars()
 {
     std::lock_guard sendLock(dropBarsSendMutex_);
     for (;;) {
-        uint64_t seq = 0;
+        uint64_t seq = 0, epoch = 0;
         std::vector<AgentBarRect> bars;
         {
             std::lock_guard lock(stateMutex_);
-            if (desiredDropBarsSeq_ == confirmedDropBarsSeq_ || agentPid_.load() == 0)
+            if (agentPid_.load() == 0 || activeAgentPid_ == 0 || activeAgentEpoch_ == 0 ||
+                (desiredDropBarsSeq_ == confirmedDropBarsSeq_ && confirmedDropBarsEpoch_ == activeAgentEpoch_)) {
                 return;
-            seq = desiredDropBarsSeq_;
-            bars = desiredDropBars_;
+            }
+            seq = desiredDropBarsSeq_, epoch = activeAgentEpoch_, bars = desiredDropBars_;
         }
         AgentCommandMessage cmd;
-        cmd.type = AgentCommandType::SyncDropBars;
-        cmd.bars = bars;
+        cmd.type = AgentCommandType::SyncDropBars, cmd.bars = bars;
         AgentCommandReply reply;
         if (SendCommand(cmd, &reply, kFastCmdTimeoutMs) != SendCommandOutcome::Succeeded || !reply.ok)
             return;
         std::lock_guard lock(stateMutex_);
-        if (seq > confirmedDropBarsSeq_) {
-            confirmedDropBars_ = std::move(bars);
-            confirmedDropBarsSeq_ = seq;
-        }
+        if (activeAgentPid_ == 0 || activeAgentEpoch_ != epoch)
+            return;
+        if (confirmedDropBarsEpoch_ != epoch || seq > confirmedDropBarsSeq_)
+            confirmedDropBars_ = std::move(bars), confirmedDropBarsSeq_ = seq, confirmedDropBarsEpoch_ = epoch;
     }
 }
 
@@ -399,7 +401,12 @@ void DesktopAgentClient::ServeEvtPipe(HANDLE pipe)
         CloseHandle(event);
         return;
     }
+    {
+        std::lock_guard pipeLock(activeEvtPipeMutex_);
+        activeEvtPipe_ = pipe;
+    }
     bool verified = false;
+    uint64_t verifiedEpoch = 0;
     while (WaitForSingleObject(quitEvent_, 0) == WAIT_TIMEOUT) {
         std::string raw;
         bool disconnected = false;
@@ -416,13 +423,12 @@ void DesktopAgentClient::ServeEvtPipe(HANDLE pipe)
                 FILETIME expectedCreation{};
                 {
                     std::lock_guard lock(stateMutex_);
-                    expectedPid = activeAgentPid_;
-                    expectedCreation = activeAgentCreationTime_;
+                    expectedPid = activeAgentPid_, expectedCreation = activeAgentCreationTime_, verifiedEpoch = activeAgentEpoch_;
                 }
                 const std::wstring exePath = ModulePath();
                 const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
                 AgentPeerIdentity peer;
-                if (expectedPid == 0 || exePath.empty() || !VerifyNamedPipePeerProcess(pipe, true, exePath, requireNonElevated, peer) ||
+                if (expectedPid == 0 || verifiedEpoch == 0 || exePath.empty() || !VerifyNamedPipePeerProcess(pipe, true, exePath, requireNonElevated, peer) ||
                     (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) || peer.pid != expectedPid ||
                     CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
                     Log(L"desktop agent client: rejected Evt client pid=%lu (expected %lu)", peer.pid, expectedPid);
@@ -430,18 +436,25 @@ void DesktopAgentClient::ServeEvtPipe(HANDLE pipe)
                 }
             }
             verified = true;
+        } else if (!options_.allowUnboundTestEvtPeer) {
+            std::lock_guard lock(stateMutex_);
+            if (activeAgentPid_ == 0 || activeAgentEpoch_ != verifiedEpoch)
+                break;
         }
         AgentEventMessage evt;
         AgentEventReply reply;
-        if (!ValidateAndParseAgentEvent(raw, evt)) {
-            reply.ok = false;
-            reply.error = L"invalid_event";
-        } else {
+        if (!ValidateAndParseAgentEvent(raw, evt))
+            reply.ok = false, reply.error = L"invalid_event";
+        else
             reply = HandleEvent(evt);
-        }
         const std::string encoded = SerializeAgentEventReply(reply);
         if (!WritePipeMessageOverlapped(pipe, ov, quitEvent_, encoded))
             break;
+    }
+    {
+        std::lock_guard pipeLock(activeEvtPipeMutex_);
+        if (activeEvtPipe_ == pipe)
+            activeEvtPipe_ = INVALID_HANDLE_VALUE;
     }
     DisconnectNamedPipe(pipe);
     CloseHandle(event);
@@ -545,34 +558,29 @@ int DesktopAgentClient::TryAttachCmdPeer(HANDLE pipe, const std::wstring& exePat
         Log(L"desktop agent client: rejected Cmd pipe peer pid=%lu", peer.pid);
         return CloseHandle(pipe), -1;
     }
-    {
-        std::lock_guard lock(stateMutex_);
-        activeAgentPid_ = peer.pid, activeAgentCreationTime_ = peer.creationTime;
-    }
-    {
-        std::lock_guard lock(cmdPipeMutex_);
-        CloseCmdPipeLocked();
-        cmdPipe_ = pipe;
-    }
     AgentCommandMessage ping;
     ping.type = AgentCommandType::Ping;
+    std::string rawPingReply;
     AgentCommandReply reply;
-    const SendCommandOutcome pingOutcome = SendCommand(ping, &reply, 200);
+    const bool pingOk =
+        SendPipeRequestOverlapped(pipe, SerializeAgentCommand(ping), rawPingReply, 200, quitEvent_) && ValidateAndParseAgentCommandReply(rawPingReply, reply);
     const bool nonceOk =
         options_.allowSameProcessPeer ? (reply.nonce.empty() || reply.nonce == spawnNonce) : (!reply.nonce.empty() && reply.nonce == spawnNonce);
-    if (pingOutcome == SendCommandOutcome::Succeeded && reply.ok && reply.pid == peer.pid && (generation_ == 0 || reply.generation == generation_) && nonceOk) {
+    if (pingOk && reply.ok && reply.pid == peer.pid && (generation_ == 0 || reply.generation == generation_) && nonceOk) {
+        {
+            std::lock_guard lock(cmdPipeMutex_);
+            CloseCmdPipeLocked();
+            cmdPipe_ = pipe;
+        }
+        {
+            std::lock_guard lock(stateMutex_);
+            activeAgentPid_ = peer.pid, activeAgentCreationTime_ = peer.creationTime, ++activeAgentEpoch_;
+        }
         pidOut = peer.pid, procOut = std::move(verifiedProc);
         return 1;
     }
-    {
-        std::lock_guard lock(cmdPipeMutex_);
-        CloseCmdPipeLocked();
-    }
-    {
-        std::lock_guard lock(stateMutex_);
-        activeAgentPid_ = 0, activeAgentCreationTime_ = {};
-    }
-    if (pingOutcome == SendCommandOutcome::Succeeded) {
+    CloseHandle(pipe);
+    if (pingOk) {
         Log(L"desktop agent client: rejected Cmd pipe peer pid=%lu due to Ping identity/nonce mismatch", peer.pid);
         return -1;
     }
@@ -660,14 +668,21 @@ void DesktopAgentClient::ClearAgentStateOnExit()
         std::lock_guard lock(stateMutex_);
         activeAgentPid_ = 0;
         activeAgentCreationTime_ = {};
+        ++activeAgentEpoch_;
         confirmedDropBars_.clear();
         confirmedDropBarsSeq_ = 0;
+        confirmedDropBarsEpoch_ = 0;
         seenDropOps_.Clear();
         hadHostedState = !icons_.empty() || yielded_;
         icons_.clear();
         imageCache_.clear();
         yielded_ = false;
         yieldReason_ = TrayHostYieldReason::None;
+    }
+    {
+        std::lock_guard evtLock(activeEvtPipeMutex_);
+        if (activeEvtPipe_ != INVALID_HANDLE_VALUE)
+            CancelIoEx(activeEvtPipe_, nullptr);
     }
     if (callbacks_.onAgentPidChanged)
         callbacks_.onAgentPidChanged(0);

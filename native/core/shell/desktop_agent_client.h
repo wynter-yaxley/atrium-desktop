@@ -109,6 +109,7 @@ private:
     mutable std::mutex stateMutex_;
     DWORD activeAgentPid_ = 0;
     FILETIME activeAgentCreationTime_{};
+    uint64_t activeAgentEpoch_ = 0;
     bool hosting_ = false;
     bool hasAnchor_ = false;
     RECT anchor_{};
@@ -116,6 +117,7 @@ private:
     std::vector<AgentBarRect> confirmedDropBars_;
     uint64_t desiredDropBarsSeq_ = 0;
     uint64_t confirmedDropBarsSeq_ = 0;
+    uint64_t confirmedDropBarsEpoch_ = 0;
     bool yielded_ = false;
     TrayHostYieldReason yieldReason_ = TrayHostYieldReason::None;
     std::vector<CachedIcon> icons_;
@@ -123,6 +125,8 @@ private:
     RecentOpTracker seenDropOps_;
 
     std::mutex dropBarsSendMutex_;
+    std::mutex activeEvtPipeMutex_;
+    HANDLE activeEvtPipe_ = INVALID_HANDLE_VALUE;
     std::mutex cmdPipeMutex_;
     HANDLE cmdPipe_ = INVALID_HANDLE_VALUE;
 

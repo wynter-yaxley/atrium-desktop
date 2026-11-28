@@ -89,7 +89,8 @@ public:
           generation_(generation),
           instance_(instance),
           options_(std::move(options)),
-          quitEvent_(CreateEventW(nullptr, TRUE, FALSE, nullptr))
+          quitEvent_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
+          remainingFailSnapshotPostsForTest_(options_.failSnapshotPostCountForTest)
     {
     }
     ~DesktopAgentHostApp() override { Cleanup(); }
@@ -205,6 +206,14 @@ private:
         }
         evtPushCv_.notify_one();
     }
+    bool RequestTraySnapshotResync()
+    {
+        for (int n = remainingFailSnapshotPostsForTest_.load(); n > 0;) {
+            if (remainingFailSnapshotPostsForTest_.compare_exchange_weak(n, n - 1))
+                return false;
+        }
+        return hostHwnd_ != nullptr && PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0) != FALSE;
+    }
     bool EnsureEvtConnectedLocked(DWORD timeoutMs)
     {
         if (evtPipe_ != INVALID_HANDLE_VALUE)
@@ -215,14 +224,13 @@ private:
         if (!IsCorePeer(pipe, false, L"Evt"))
             return CloseHandle(pipe), false;
         evtPipe_ = pipe, evtSession_.fetch_add(1);
-        bool postResync = false;
+        bool needResync = false;
         {
             std::lock_guard lock(evtPushMutex_);
-            if (resyncNeeded_)
-                resyncNeeded_ = false, postResync = true;
+            needResync = resyncNeeded_;
         }
-        if (postResync && hostHwnd_)
-            PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
+        if (needResync)
+            (void)RequestTraySnapshotResync();
         return true;
     }
     bool SendEvent(const AgentEventMessage& msg, AgentEventReply& replyOut, DWORD timeoutMs, uint64_t* sessionOut = nullptr);
@@ -356,6 +364,7 @@ private:
     std::mutex evtPushMutex_;
     std::condition_variable evtPushCv_;
     bool pendingSnapshot_ = false, pendingSnapshotDeferred_ = false, pendingYield_ = false, resyncNeeded_ = false;
+    std::atomic<int> remainingFailSnapshotPostsForTest_{0};
     AgentEventMessage queuedSnapshot_, queuedYield_;
     std::thread cmdThread_, evtPushThread_;
 };
@@ -567,14 +576,15 @@ void DesktopAgentHostApp::HandleIdleEvtReconnect(DWORD& resyncBackoffMs)
         resyncBackoffMs = (std::min)(DWORD(2000), resyncBackoffMs * 2);
         return;
     }
-    bool postResync = false;
+    bool needResync = false;
     {
         std::lock_guard lock(evtPushMutex_);
-        if (resyncNeeded_)
-            resyncNeeded_ = false, postResync = true;
+        needResync = resyncNeeded_;
     }
-    if (postResync && hostHwnd_)
-        PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
+    if (needResync && !RequestTraySnapshotResync()) {
+        resyncBackoffMs = (std::min)(DWORD(2000), resyncBackoffMs * 2);
+        return;
+    }
     resyncBackoffMs = 250;
 }
 
@@ -586,8 +596,10 @@ void DesktopAgentHostApp::RecordSentSnapshotAck(uint64_t sessionUsed, const Agen
         snapshotAckState_.RecordAck(sessionUsed, msg.snapshot, true);
         needResend = needResend || snapshotAckState_.HasUnconfirmedWithEmptyPixels(sessionUsed, msg.snapshot);
     }
-    if (needResend && hostHwnd_)
-        PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
+    if (needResend && !RequestTraySnapshotResync()) {
+        std::lock_guard lock(evtPushMutex_);
+        resyncNeeded_ = true;
+    }
 }
 
 void DesktopAgentHostApp::EvtPushLoop()
@@ -623,8 +635,13 @@ void DesktopAgentHostApp::EvtPushLoop()
         const bool ok = SendEvent(msg, reply, kTrayEventTimeoutMs, &sessionUsed);
         if (ok && reply.ok) {
             resyncBackoffMs = 250;
-            if (msg.type == AgentEventType::TraySnapshot)
+            if (msg.type == AgentEventType::TraySnapshot) {
+                {
+                    std::lock_guard lock(evtPushMutex_);
+                    resyncNeeded_ = false;
+                }
                 RecordSentSnapshotAck(sessionUsed, msg, deferred);
+            }
         } else {
             std::lock_guard lock(evtPushMutex_);
             resyncNeeded_ = true;
