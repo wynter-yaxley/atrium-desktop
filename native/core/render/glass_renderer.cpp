@@ -115,7 +115,7 @@ GlassRenderer::GlassRenderer(Gpu gpu, HWND hwnd, int width, int height, bool top
       w_(width),
       h_(height),
       alignedBackdrop_(alignedBackdrop),
-      sync_(overlay ? 1 : 0) // the bar draws its content over the glass; a popup's content is its own
+      sync_(0) // composition swap chains sync to DWM vblank without blocking in Present(1, 0)
 {
     auto* dev = gpu_.device.get();
     Check(dev->CreateVertexShader(g_GlassVS, sizeof(g_GlassVS), nullptr, vs_.put()));
@@ -639,9 +639,9 @@ bool GlassRenderer::PresentSpan(std::span<const GlassParams> shapes, const std::
         lastGlassDrawn_ = true;
         recordPresented = true;
     }
-    const UINT presentFlags = sync_ == 0 ? DXGI_PRESENT_DO_NOT_WAIT : 0;
+    const UINT presentFlags = DXGI_PRESENT_DO_NOT_WAIT;
     HRESULT hr = swap_->Present(sync_, presentFlags);
-    if (presentFlags != 0 && hr == DXGI_ERROR_INVALID_CALL)
+    if (hr == DXGI_ERROR_INVALID_CALL)
         hr = swap_->Present(sync_, 0);
     const PresentStateTransition next = ResolvePresentTransition(hr, hasPresented_, hasBackdrop_, recordPresented);
     ready_ = next.ready;

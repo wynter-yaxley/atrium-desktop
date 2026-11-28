@@ -527,6 +527,14 @@ PanelGlassHost::StepResult PanelGlassHost::RenderSinglePanel(const GlassPanel& p
     // Once per composed frame (a new picture under it or new shapes may come in between),
     // and only when its last frame is on screen; else at the next tick.
     if ((ps.drawnTick == tick && !moved) || !r.Ready()) {
+        if (!r.Ready() && IsPresentReadyStalled(false, now, ps.readyStalledSinceMs, 1000.0)) {
+            Log(L"render: popup glass swap chain stalled; recreating");
+            ps.renderer = nullptr;
+            ps.ready = false;
+            ps.readyStalledSinceMs = 0.0;
+            ps.owed = true;
+            return StepResult::Ok;
+        }
         ps.owed = true;
         return StepResult::Ok;
     }
@@ -537,9 +545,16 @@ PanelGlassHost::StepResult PanelGlassHost::RenderSinglePanel(const GlassPanel& p
     if (!r.Present(gp_, nullptr))
         return StepResult::Retry;
     if (r.LastPresentBusy()) {
+        if (IsPresentReadyStalled(false, now, ps.readyStalledSinceMs, 1000.0)) {
+            Log(L"render: popup glass Present stayed busy; recreating");
+            ps.renderer = nullptr;
+            ps.ready = false;
+            ps.readyStalledSinceMs = 0.0;
+        }
         ps.owed = true;
         return StepResult::Ok;
     }
+    ps.readyStalledSinceMs = 0.0;
     gpuSubmitted = true;
     RecordPanelPresent(ps, p, w, h, now, t0, created, t1, moved, newDesktop, under, same);
     return StepResult::Ok;

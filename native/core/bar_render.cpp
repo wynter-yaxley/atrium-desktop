@@ -499,7 +499,6 @@ struct BarRender {
             owedMusic |= anim.music;
             return true;
         }
-        readyStalledSinceMs = 0;
         if (!renderer.HasBackdrop() && ClockMs() - sessionStartMs < 1500) {
             barOwed = true; // no backdrop yet: drawn when it is
             owedBody |= anim.body;
@@ -518,6 +517,17 @@ struct BarRender {
             Log(L"render: device lost");
             return false;
         }
+        if (renderer.LastPresentBusy()) {
+            if (IsPresentReadyStalled(false, nowMs, readyStalledSinceMs, 1000.0)) {
+                Log(L"render: swap chain Present stayed busy; rebuilding");
+                return false;
+            }
+            barOwed = true;
+            owedBody |= anim.body;
+            owedMusic |= anim.music;
+            return true;
+        }
+        readyStalledSinceMs = 0;
         if (renderer.LastPresentDrewGlass())
             ++stats.glassDraws;
         ++stats.presents;

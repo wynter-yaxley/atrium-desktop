@@ -64,13 +64,15 @@ std::wstring ExtractArgValue(const std::wstring& args, const std::wstring& flag)
     return args.substr(start, end - start);
 }
 
-int CountOverlayWindowsForPid(DWORD pid, const RECT* expectedVisibleRect = nullptr)
+int CountOverlayWindowsForPid(DWORD pid, const RECT* expectedVisibleRect = nullptr, bool* clickThroughOkOut = nullptr, HWND* overlayHwndOut = nullptr)
 {
     struct Query {
         DWORD pid = 0;
         const RECT* expectedRect = nullptr;
         int count = 0;
-    } query{pid, expectedVisibleRect, 0};
+        bool clickThroughOk = true;
+        HWND overlayHwnd = nullptr;
+    } query{pid, expectedVisibleRect, 0, true, nullptr};
 
     EnumWindows(
         [](HWND hwnd, LPARAM lp) -> BOOL {
@@ -87,10 +89,22 @@ int CountOverlayWindowsForPid(DWORD pid, const RECT* expectedVisibleRect = nullp
                 if (!IsWindowVisible(hwnd) || !GetWindowRect(hwnd, &rc) || !EqualRect(&rc, q->expectedRect))
                     return TRUE;
             }
+            const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            BYTE alpha = 0;
+            DWORD flags = 0;
+            if ((ex & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) != (WS_EX_LAYERED | WS_EX_TRANSPARENT) ||
+                !GetLayeredWindowAttributes(hwnd, nullptr, &alpha, &flags) || (flags & LWA_ALPHA) == 0 || alpha != 255) {
+                q->clickThroughOk = false;
+            }
+            q->overlayHwnd = hwnd;
             ++q->count;
             return TRUE;
         },
         reinterpret_cast<LPARAM>(&query));
+    if (clickThroughOkOut)
+        *clickThroughOkOut = query.clickThroughOk;
+    if (overlayHwndOut)
+        *overlayHwndOut = query.overlayHwnd;
     return query.count;
 }
 
@@ -230,7 +244,12 @@ void TestRealMultiProcessAgentLifecycle()
         const DWORD pid1 = client.AgentPid();
         Check(pid1 != 0 && pid1 != selfPid, "child agent #1 runs in separate OS process");
         client.SyncDropBars({{1, barRect, true}});
-        Check(WaitUntil([&] { return CountOverlayWindowsForPid(pid1, &barRect) == 1; }, 3000), "SyncDropBars created visible overlay in child #1");
+        bool clickThroughOk1 = false;
+        HWND overlay1 = nullptr;
+        Check(WaitUntil([&] { return CountOverlayWindowsForPid(pid1, &barRect, &clickThroughOk1, &overlay1) == 1; }, 3000) && clickThroughOk1,
+              "SyncDropBars created layered click-through overlay in child #1");
+        const POINT barMid{(barRect.left + barRect.right) / 2, (barRect.top + barRect.bottom) / 2};
+        Check(overlay1 != nullptr && WindowFromPoint(barMid) != overlay1, "layered+transparent drop overlay passes WindowFromPoint click-through");
 
         HANDLE proc1 = nullptr;
         {
@@ -243,7 +262,9 @@ void TestRealMultiProcessAgentLifecycle()
               "supervisor detected exit and respawned child agent #2");
         const DWORD pid2 = client.AgentPid();
         Check(pid2 != 0 && pid2 != selfPid && pid2 != pid1, "child agent #2 has new OS PID");
-        Check(WaitUntil([&] { return CountOverlayWindowsForPid(pid2, &barRect) == 1; }, 4000), "supervisor automatically replayed SyncDropBars to child #2");
+        bool clickThroughOk2 = false;
+        Check(WaitUntil([&] { return CountOverlayWindowsForPid(pid2, &barRect, &clickThroughOk2) == 1; }, 4000) && clickThroughOk2,
+              "supervisor automatically replayed click-through SyncDropBars to child #2");
         {
             std::lock_guard lock(mu);
             Check(seenNonces.size() >= 2 && seenNonces[0] != seenNonces[1] && seenNonces[1].size() == 32,

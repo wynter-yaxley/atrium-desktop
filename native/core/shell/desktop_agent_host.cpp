@@ -253,6 +253,7 @@ private:
     {
         if (dropTimerActive_ && hostHwnd_)
             KillTimer(hostHwnd_, kDropPollTimerId), dropTimerActive_ = false;
+        prevButtonDown_ = buttonPressedInsideOverlay_ = false;
         for (auto& [id, ov] : overlays_)
             DestroyOverlay(ov);
         overlays_.clear();
@@ -350,7 +351,7 @@ private:
     RecentOpTracker seenTraySendOps_;
     std::atomic<uint64_t> nextOpId_{1};
     std::map<uint64_t, DropOverlay> overlays_;
-    bool dropTimerActive_ = false;
+    bool dropTimerActive_ = false, prevButtonDown_ = false, buttonPressedInsideOverlay_ = false;
 
     std::mutex taskMutex_;
     std::deque<std::shared_ptr<StaTaskState>> taskQueue_;
@@ -662,14 +663,8 @@ bool DesktopAgentHostApp::SetTrayHosting(bool on)
         trayHost_.reset(), PushTraySnapshot();
         return true;
     }
-    auto onYield = [this] {
-        if (hostHwnd_)
-            PostMessageW(hostHwnd_, kMsgTrayYield, 0, 0);
-    };
-    auto onIcons = [this] {
-        if (hostHwnd_)
-            PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
-    };
+    auto onYield = [this] { hostHwnd_ ? (void)PostMessageW(hostHwnd_, kMsgTrayYield, 0, 0) : (void)0; };
+    auto onIcons = [this] { hostHwnd_ ? (void)PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0) : (void)0; };
     trayHost_ =
         options_.failTrayHostStartForTest ? nullptr : std::make_unique<TrayHost>(hostHwnd_, kMsgTrayNotify, 3000, 0, std::move(onYield), std::move(onIcons));
     if (!trayHost_ || !trayHost_->Running()) {
@@ -718,9 +713,11 @@ bool DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
                 allOk = false;
             continue;
         }
-        HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT, kOverlayWindowClass,
-                                    L"", WS_POPUP, bar.rect.left, bar.rect.top, w, h, nullptr, nullptr, instance_, nullptr);
-        if (!hwnd) {
+        HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                                    kOverlayWindowClass, L"", WS_POPUP, bar.rect.left, bar.rect.top, w, h, nullptr, nullptr, instance_, nullptr);
+        if (!hwnd || !SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)) {
+            if (hwnd)
+                DestroyWindow(hwnd);
             allOk = false;
             continue;
         }
@@ -753,11 +750,17 @@ void DesktopAgentHostApp::OnDropPollTimer()
     if (overlays_.empty() || !GetCursorPos(&pt))
         return;
     const bool buttonDown = (GetAsyncKeyState(VK_LBUTTON) < 0) || (GetAsyncKeyState(VK_RBUTTON) < 0);
+    const bool cursorInAny = std::ranges::any_of(overlays_, [&](const auto& kv) { return PtInRect(&kv.second.rect, pt) != FALSE; });
+    if (!buttonDown)
+        buttonPressedInsideOverlay_ = false;
+    else if (!prevButtonDown_)
+        buttonPressedInsideOverlay_ = cursorInAny;
+    prevButtonDown_ = buttonDown;
     GUITHREADINFO gui{sizeof(gui)};
     DWORD capturePid = 0;
     if (GetGUIThreadInfo(0, &gui) && gui.hwndCapture)
         GetWindowThreadProcessId(gui.hwndCapture, &capturePid);
-    const bool externalDrag = buttonDown && (capturePid != corePid_) && (GetCapture() == nullptr);
+    const bool externalDrag = buttonDown && !buttonPressedInsideOverlay_ && (capturePid != corePid_) && (GetCapture() == nullptr);
     for (auto& [id, ov] : overlays_) {
         const bool cursorIn = PtInRect(&ov.rect, pt) != FALSE;
         if (ov.target && ov.target->inDrag && (!buttonDown || !cursorIn)) {

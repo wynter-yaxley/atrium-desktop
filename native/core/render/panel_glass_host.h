@@ -97,6 +97,7 @@ private:
         bool owed = false;      // a frame to draw once its last one is on screen (Ready), or at the next tick
         bool pendingFresh = false;
         double uncoveredSinceMs = 0.0;
+        double readyStalledSinceMs = 0.0;
         uint64_t drawnTick = 0; // the compositor frame it was last drawn in
         bool dark = false;
         InkGrid grid;         // ink region by region (published for the popup)

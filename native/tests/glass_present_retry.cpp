@@ -63,6 +63,21 @@ void TestPresentReadyStallWatchdog()
     Require(!atrium::IsPresentReadyStalled(true, 1300.0, stalledSince) && stalledSince == 0.0, "subsequent ready == true resets stalledSinceMs");
 }
 
+void TestRepeatedBusyPresentTripsWatchdog()
+{
+    double stalledSince = 0;
+    const atrium::PresentStateTransition b1 = atrium::ResolvePresentTransition(DXGI_ERROR_WAS_STILL_DRAWING, true, true, true);
+    Require(b1.lastPresentBusy && b1.ready && !b1.commitPresentedBackdrop, "busy transition reports lastPresentBusy without committing");
+    Require(!atrium::IsPresentReadyStalled(false, 500.0, stalledSince), "first busy Present starts watchdog cleanly");
+
+    const atrium::PresentStateTransition b2 = atrium::ResolvePresentTransition(DXGI_ERROR_WAS_STILL_DRAWING, b1.hasPresented, true, true);
+    Require(b2.lastPresentBusy && atrium::IsPresentReadyStalled(false, 1505.0, stalledSince), "repeated busy Present past 1000 ms trips rebuild watchdog");
+
+    const atrium::PresentStateTransition ok = atrium::ResolvePresentTransition(S_OK, b2.hasPresented, true, true);
+    Require(!ok.lastPresentBusy && ok.commitPresentedBackdrop && !atrium::IsPresentReadyStalled(true, 1520.0, stalledSince) && stalledSince == 0.0,
+            "S_OK recovery clears busy flag and resets stall watchdog");
+}
+
 } // namespace
 
 int main()
@@ -71,6 +86,7 @@ int main()
     TestBusyPreservesPreviousPresentedBackdrop();
     TestNonBusyErrorAndOverlayOnly();
     TestPresentReadyStallWatchdog();
+    TestRepeatedBusyPresentTripsWatchdog();
     if (g_failures > 0)
         return 1;
     std::printf("glass present retry: all checks passed\n");
