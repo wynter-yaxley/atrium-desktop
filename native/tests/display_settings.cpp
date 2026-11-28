@@ -212,6 +212,12 @@ void CheckSettingsNormalization()
             "startupMode defaults to run");
     Require(Settings::FromJson(taskStartup.ToJson(), Settings{}, parsed) && parsed.startupMode == L"task", "startupMode task persists across round trip");
     Require(Settings::FromJson(LR"({"startupMode":"bogus"})", taskStartup, parsed) && parsed.startupMode == L"run", "invalid startupMode normalizes to run");
+
+    Settings spacing;
+    Require(Settings::FromJson(LR"({"iconSpacing":1})", Settings{}, parsed) && parsed.iconSpacing == 2, "iconSpacing clamps lower bound");
+    Require(Settings::FromJson(LR"({"iconSpacing":99})", Settings{}, parsed) && parsed.iconSpacing == 40, "iconSpacing clamps upper bound");
+    spacing.iconSpacing = 12.5;
+    Require(Settings::FromJson(spacing.ToJson(), Settings{}, parsed) && parsed.iconSpacing == 12.5, "iconSpacing survives saving");
 }
 
 void CheckExtrasSettings()

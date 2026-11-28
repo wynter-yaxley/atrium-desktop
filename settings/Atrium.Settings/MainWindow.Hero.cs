@@ -151,7 +151,7 @@ public sealed partial class MainWindow
     {
         double h = s.Height, i = Math.Clamp(s.IconSize, 12, h - 16);
         double p = Math.Max(i + 4, Math.Min(h - 12, Math.Round(i * 1.55)));
-        double v = Math.Floor((h - p) / 2), pad = v + 4, gap = Math.Max(4, Math.Round(i * 0.18));
+        double v = Math.Floor((h - p) / 2), pad = v + 4, gap = Math.Max(2, Math.Round(s.IconSpacing));
         double timePx = h * 0.25, datePx = h * 0.19, sepGap = 8;
         double clockW = s.ShowClock ? Math.Max(timePx * (s.ShowClockSeconds ? 4.8 : 2.75), datePx * 5.7) + 22 : 0;
         double deskW = s.ShowDesktop ? Math.Max(10, Math.Round(i * 0.45)) : 0; // the Show Desktop slot
@@ -366,6 +366,15 @@ public sealed partial class MainWindow
             double x = bar.PlateX(0) + bar.P / 2 - bar.Icon / 2 - 4, y0 = bar.PlateY + bar.P / 2 - bar.Icon / 2, y1 = y0 + bar.Icon;
             Line(x, y0, x, y1); Line(x - 3, y0, x + 3, y0); Line(x - 3, y1, x + 3, y1);
             Chip($"{Math.Round(CurrentSettings.IconSize)} px", bar.PlateX(0) + bar.P / 2, bar.BarY - 28);
+        }
+        else if (_engaged == Loc.T("Icon spacing"))
+        {
+            // The air between the first two plates: exactly what the setting changes (the plates
+            // stay the same size, and the whole bar follows their new pitch).
+            if (bar.N < 2) return;
+            double x0 = bar.PlateX(0) + bar.P, x1 = bar.PlateX(1), y = bar.BarY - 12;
+            Line(x0, y, x1, y); Line(x0, y - 4, x0, y + 4); Line(x1, y - 4, x1, y + 4);
+            Chip($"{Math.Round(CurrentSettings.IconSpacing)} px", (x0 + x1) / 2, y - 24);
         }
     }
 

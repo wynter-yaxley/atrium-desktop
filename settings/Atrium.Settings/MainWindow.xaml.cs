@@ -41,6 +41,8 @@ public sealed partial class MainWindow : Window, IDisposable
             s => s.CornerRadius, (s, v) => s.CornerRadius = v, false),
         new("dock", Loc.T("Icon size"), 16, 64, 1, "px",
             s => s.IconSize, (s, v) => s.IconSize = v, false),
+        new("dock", Loc.T("Icon spacing"), 2, 40, 1, "px",
+            s => s.IconSpacing, (s, v) => s.IconSpacing = v, false),
         new("width", Loc.T("Maximum width"), 300, 2400, 10, "px",
             s => s.Width, (s, v) => s.Width = v, false),
         new("dock", Loc.T("Edge spacing"), 0, 200, 1, "px",
