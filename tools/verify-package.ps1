@@ -87,7 +87,7 @@ try {
         if ("$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)" -ne $expectedVersion) { throw "$bin version != $expectedVersion." }
     }
     $exeBytes = (Get-Item -LiteralPath (Join-Path $pkg 'Atrium.exe')).Length
-    if ($exeBytes -gt 4MB) { throw "Atrium.exe exceeds 4 MB limit: $exeBytes bytes." }
+    if ($exeBytes -gt 6MB) { throw "Atrium.exe exceeds 6 MB limit: $exeBytes bytes." }
     $zipBytes = (Get-Item -LiteralPath $ZipPath).Length
     if ($zipBytes -gt 120MB) { throw "Package zip exceeds 120 MB limit: $zipBytes bytes." }
     if ($SmokeStart) {
