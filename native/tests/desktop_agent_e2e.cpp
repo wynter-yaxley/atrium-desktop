@@ -223,7 +223,7 @@ void TestRealMultiProcessAgentLifecycle()
     opts.cmdPipeOverride = cmdPipe;
     opts.evtPipeOverride = evtPipe;
     opts.launchSupervisor = true;
-    opts.allowSameProcessPeer = false;
+    opts.allowSameProcessPeer = false, opts.allowElevatedTestPeer = true;
     opts.pingWaitMs = 4000;
     opts.spawnAgentOverride = [&](const std::wstring& args, DWORD& errOut) -> HANDLE {
         const std::wstring nonce = ExtractArgValue(args, L"--agent-nonce");
@@ -284,7 +284,7 @@ void TestRealMultiProcessAgentLifecycle()
     badOpts.cmdPipeOverride = badCmdPipe;
     badOpts.evtPipeOverride = badEvtPipe;
     badOpts.launchSupervisor = true;
-    badOpts.allowSameProcessPeer = false;
+    badOpts.allowSameProcessPeer = false, badOpts.allowElevatedTestPeer = true;
     badOpts.pingWaitMs = 400;
     badOpts.spawnAgentOverride = [&](const std::wstring&, DWORD& errOut) -> HANDLE {
         winrt::handle tracked;
@@ -604,6 +604,7 @@ void TestEvtBlockedBeforeHandshakeAndTerminatedOnExit()
                                        return h;
                                    },
                                    3000};
+    opts.allowElevatedTestPeer = true;
     {
         DesktopAgentClient client(cb, opts);
         Check(WaitForSingleObject(startedEvt.get(), 4000) == WAIT_OBJECT_0, "mock child paused inside first Ping handshake");
@@ -665,6 +666,7 @@ void TestStaleConfirmDoesNotSkipRestartReplay()
                                        return h;
                                    },
                                    4000};
+    opts.allowElevatedTestPeer = true;
     {
         DesktopAgentClient client({}, opts);
         Check(WaitUntil([&] { return client.Running() && client.AgentPid() != 0; }, 5000), "epoch test child #1 connected");

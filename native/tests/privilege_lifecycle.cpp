@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -219,9 +220,17 @@ void CheckPipeAndMutexAcls()
     if (server.handle == INVALID_HANDLE_VALUE)
         return;
 
+    PSID ownerSid = nullptr;
     PACL dacl = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
-    const DWORD secInfoErr = GetSecurityInfo(server.handle, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &sd);
+    const DWORD secInfoErr =
+        GetSecurityInfo(server.handle, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &ownerSid, nullptr, &dacl, nullptr, &sd);
+    wchar_t* ownerSidText = nullptr;
+    const bool ownerMatchesSelf = secInfoErr == ERROR_SUCCESS && ownerSid != nullptr && ConvertSidToStringSidW(ownerSid, &ownerSidText) != FALSE &&
+                                  ownerSidText != nullptr && _wcsicmp(ownerSidText, SelfSecurityContext().userSid.c_str()) == 0;
+    if (ownerSidText)
+        LocalFree(ownerSidText);
+    Check(ownerMatchesSelf, "pipe owner SID matches current user TokenUser SID");
     Check(secInfoErr == ERROR_SUCCESS && dacl != nullptr, "pipe has explicit DACL");
     if (dacl) {
         ACL_SIZE_INFORMATION info{};

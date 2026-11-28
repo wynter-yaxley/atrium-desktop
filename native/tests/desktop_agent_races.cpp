@@ -170,6 +170,7 @@ void TestEvtStaleMessageReadBeforeExitCannotWriteBack()
                                        return h;
                                    },
                                    3000};
+    opts.allowElevatedTestPeer = true;
     opts.onBeforeHandleEventForTest = [&] {
         if (gateHits.fetch_add(1) == 0) {
             SetEvent(pausedBeforeHandle.get());
@@ -275,8 +276,8 @@ void TestReplayDoesNotOverwriteNewerHostingAndAnchor()
                   4000),
               "server converged to newer SetTrayHosting(false) and anchorB");
         std::lock_guard lock(mu);
-        Check(!observedHosting.back(), "replay hosting=true never overwrote live hosting=false");
-        Check(EqualRect(&observedAnchors.back(), &anchorB), "replay anchorA never overwrote live anchorB");
+        Check(!observedHosting.empty() && !observedHosting.back(), "replay hosting=true never overwrote live hosting=false");
+        Check(!observedAnchors.empty() && EqualRect(&observedAnchors.back(), &anchorB), "replay anchorA never overwrote live anchorB");
         SetEvent(stop.get());
         client.Shutdown();
     }
@@ -326,6 +327,7 @@ void TestDropEpochRejectedAfterAgentExit()
                                        return h;
                                    },
                                    3000};
+    opts.allowElevatedTestPeer = true;
     {
         DesktopAgentClient client(cb, opts);
         clientPtr = &client;

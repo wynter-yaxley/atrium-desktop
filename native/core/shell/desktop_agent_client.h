@@ -45,6 +45,7 @@ struct DesktopAgentClientOptions {
     std::function<HANDLE(const std::wstring& args, DWORD& errorOut)> spawnAgentOverride;
     DWORD pingWaitMs = 3000;
     std::function<void()> onBeforeHandleEventForTest;
+    bool allowElevatedTestPeer = false;
 };
 
 class DesktopAgentClient {

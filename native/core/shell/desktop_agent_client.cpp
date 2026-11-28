@@ -384,7 +384,7 @@ bool DesktopAgentClient::EnsureCmdPipeConnectedLocked(DWORD timeoutMs, uint64_t 
     HANDLE pipe = ConnectSameUserPipeClient(cmdPipeName_, timeoutMs, quitEvent_);
     if (pipe == INVALID_HANDLE_VALUE)
         return false;
-    const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
+    const bool requireNonElevated = !options_.allowSameProcessPeer && !options_.allowElevatedTestPeer && options_.launchSupervisor && IsElevatedProcess();
     AgentPeerIdentity peer;
     if (!VerifyNamedPipePeerProcess(pipe, false, exePath, requireNonElevated, peer) || (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) ||
         peer.pid != expectedPid || CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
@@ -475,7 +475,7 @@ bool DesktopAgentClient::VerifyEvtPeer(HANDLE pipe, uint64_t& verifiedEpochOut)
         expectedPid = activeAgentPid_, expectedCreation = activeAgentCreationTime_, verifiedEpochOut = activeAgentEpoch_;
     }
     const std::wstring exePath = ModulePath();
-    const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
+    const bool requireNonElevated = !options_.allowSameProcessPeer && !options_.allowElevatedTestPeer && options_.launchSupervisor && IsElevatedProcess();
     AgentPeerIdentity peer;
     if (expectedPid == 0 || verifiedEpochOut == 0 || exePath.empty() || !VerifyNamedPipePeerProcess(pipe, true, exePath, requireNonElevated, peer) ||
         (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) || peer.pid != expectedPid ||
@@ -675,7 +675,7 @@ bool DesktopAgentClient::SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut)
     if (!LaunchAgentProcessHandle(options_, exePath, params, launchedHandle, launchedPid, launchedCreation))
         return false;
 
-    const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
+    const bool requireNonElevated = !options_.allowSameProcessPeer && !options_.allowElevatedTestPeer && options_.launchSupervisor && IsElevatedProcess();
     const ULONGLONG deadline = GetTickCount64() + options_.pingWaitMs;
     while (WaitForSingleObject(quitEvent_, 0) == WAIT_TIMEOUT) {
         if (launchedHandle && WaitForSingleObject(launchedHandle.get(), 0) != WAIT_TIMEOUT)

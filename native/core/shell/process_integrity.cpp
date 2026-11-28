@@ -271,7 +271,7 @@ std::wstring BuildSameUserPipeSddl(const std::wstring& userSid, bool includeMedi
         return {};
     static_assert((kPipeClientAccessMask & GENERIC_ALL) == 0);
     static_assert((kPipeClientAccessMask & FILE_CREATE_PIPE_INSTANCE) == 0);
-    std::wstring sddl = L"D:P(A;;0x0012019B;;;" + userSid + L")";
+    std::wstring sddl = L"O:" + userSid + L"D:P(A;;0x0012019B;;;" + userSid + L")";
     if (includeMediumLabel)
         sddl += L"S:(ML;;NW;;;ME)";
     return sddl;
@@ -282,7 +282,7 @@ std::wstring BuildSameUserMutexSddl(const std::wstring& userSid, bool includeMed
     if (userSid.empty())
         return {};
     static_assert((kMutexSameUserAccessMask & GENERIC_ALL) == 0);
-    std::wstring sddl = L"D:P(A;;0x001F0001;;;" + userSid + L")";
+    std::wstring sddl = L"O:" + userSid + L"D:P(A;;0x001F0001;;;" + userSid + L")";
     if (includeMediumLabel)
         sddl += L"S:(ML;;NW;;;ME)";
     return sddl;
