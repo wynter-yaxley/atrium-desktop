@@ -22,6 +22,7 @@ struct DesktopAgentHostOptions {
     std::wstring nonce;
     bool failOverlayShowForTest = false;
     int failSnapshotPostCountForTest = 0;
+    std::function<void(RECT)> onAnchorAppliedForTest;
 };
 
 int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride = nullptr, const wchar_t* evtPipeOverride = nullptr,

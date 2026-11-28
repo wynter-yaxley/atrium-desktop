@@ -1,4 +1,5 @@
 #include "shell/desktop_agent_client.h"
+#include "shell/desktop_agent_host.h"
 #include "shell/desktop_agent_ipc.h"
 #include "win32_path.h"
 
@@ -116,6 +117,14 @@ int RunRaceChild(int argc, LPWSTR* argv)
                 std::string replyOut;
                 if (!SendPipeRequestOverlapped(evtCli.get(), SerializeAgentEvent(snap), replyOut, 2000, stop.get()) && sentEvt)
                     SetEvent(sentEvt.get());
+            }
+        }
+        if (cmd.type == AgentCommandType::TrayHover) {
+            const winrt::handle evtCli{ConnectSameUserPipeClient(evtPipe, 2000, stop.get())};
+            if (evtCli.get() != INVALID_HANDLE_VALUE && evtCli) {
+                AgentEventMessage dropEvt{AgentEventType::Drop, 901, {}, false, TrayHostYieldReason::None, {}, L"app:race", {L"C:\\demo.txt"}};
+                std::string replyOut;
+                SendPipeRequestOverlapped(evtCli.get(), SerializeAgentEvent(dropEvt), replyOut, 2000, stop.get());
             }
         }
         if (cmd.type == AgentCommandType::Quit)
@@ -274,6 +283,179 @@ void TestReplayDoesNotOverwriteNewerHostingAndAnchor()
         mockSrv.join();
 }
 
+void TestDropEpochRejectedAfterAgentExit()
+{
+    const std::wstring cmdPipe = UniquePipe(L"DropEpochCmd", 3), evtPipe = UniquePipe(L"DropEpochEvt", 3);
+    const std::wstring unusedEvtName = L"Local\\Atrium.Race.DropUnused." + std::to_wstring(GetCurrentProcessId());
+    const winrt::handle unusedEvt{CreateEventW(nullptr, TRUE, FALSE, unusedEvtName.c_str())}, inDropCb{CreateEventW(nullptr, TRUE, FALSE, nullptr)},
+        releaseDropCb{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    const DWORD selfPid = GetCurrentProcessId();
+    constexpr uint64_t kGen = 503;
+    std::vector<winrt::handle> childProcs;
+    std::mutex mu;
+    std::atomic_int spawns{0};
+    std::atomic_bool consumerRejected{false};
+
+    DesktopAgentClient* clientPtr = nullptr;
+    DesktopAgentCallbacks cb;
+    cb.onDropFilesAcceptedEpoch = [&](const std::wstring&, const std::vector<std::wstring>&, uint64_t epoch) -> bool {
+        SetEvent(inDropCb.get());
+        WaitForSingleObject(releaseDropCb.get(), 4000);
+        const bool ok = clientPtr != nullptr && clientPtr->IsActiveEpoch(epoch);
+        consumerRejected.store(!ok);
+        return ok;
+    };
+    DesktopAgentClientOptions opts{0,
+                                   selfPid,
+                                   kGen,
+                                   cmdPipe,
+                                   evtPipe,
+                                   true,
+                                   false,
+                                   false,
+                                   [&](const std::wstring& args, DWORD& e) -> HANDLE {
+                                       winrt::handle tracked;
+                                       HANDLE h = (spawns.fetch_add(1) > 0) ? (e = ERROR_NOT_READY, nullptr) :
+                                                                              SpawnRaceChild(kGen, cmdPipe, evtPipe, ExtractArgValue(args, L"--agent-nonce"),
+                                                                                             unusedEvtName, &tracked, e);
+                                       if (tracked) {
+                                           std::lock_guard lock(mu);
+                                           childProcs.push_back(std::move(tracked));
+                                       }
+                                       return h;
+                                   },
+                                   3000};
+    {
+        DesktopAgentClient client(cb, opts);
+        clientPtr = &client;
+        Check(WaitUntil([&] { return client.Running() && client.ActiveAgentEpoch() != 0; }, 4000), "drop epoch child connected");
+        const uint64_t epoch1 = client.ActiveAgentEpoch();
+        client.Hover(L"app:race", POINT{1, 1});
+        Check(WaitForSingleObject(inDropCb.get(), 4000) == WAIT_OBJECT_0, "Drop callback entered while agent #1 active");
+
+        HANDLE proc1 = nullptr;
+        {
+            std::lock_guard lock(mu);
+            if (!childProcs.empty())
+                proc1 = childProcs.front().get();
+        }
+        Check(proc1 != nullptr && TerminateProcess(proc1, 1) != FALSE, "terminated child #1 inside Drop callback");
+        Check(WaitUntil([&] { return !client.Running(); }, 4000), "ClearAgentStateOnExit ran and exposed !Running()");
+        Check(!client.IsActiveEpoch(epoch1), "!Running() guarantees IsActiveEpoch(oldEpoch) is already false");
+        SetEvent(releaseDropCb.get());
+        Check(WaitUntil([&] { return consumerRejected.load(); }, 2000), "Drop consumer rejected stale epoch after agent exit");
+        clientPtr = nullptr;
+        client.Shutdown();
+    }
+    for (auto& proc : childProcs) {
+        if (proc && WaitForSingleObject(proc.get(), 1500) != WAIT_OBJECT_0)
+            TerminateProcess(proc.get(), 1), WaitForSingleObject(proc.get(), 1500);
+    }
+}
+
+void ServeLostReplySession(const std::wstring& cmdPipe, HANDLE ev, HANDLE stop, DWORD selfPid, uint64_t gen, std::atomic_int& dropFirstHosting,
+                           std::atomic_int& dropFirstBars, std::atomic_int& sawDisableHosting, std::atomic_int& sawClearBars)
+{
+    const winrt::handle srv{CreateSameUserNamedPipeServer(cmdPipe)};
+    OVERLAPPED ov{};
+    ov.hEvent = ev;
+    if (srv.get() == INVALID_HANDLE_VALUE || !ConnectNamedPipeOverlapped(srv.get(), ov, stop))
+        return;
+    while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT) {
+        std::string raw;
+        bool disc = false;
+        AgentCommandMessage cmd;
+        if (!ReadPipeMessageOverlapped(srv.get(), ov, stop, raw, disc) || !ValidateAndParseAgentCommand(raw, cmd))
+            break;
+        if (cmd.type == AgentCommandType::SetTrayHosting && cmd.hosting && dropFirstHosting.exchange(0) == 1)
+            break;
+        if (cmd.type == AgentCommandType::SyncDropBars && !cmd.bars.empty() && dropFirstBars.exchange(0) == 1)
+            break;
+        if (cmd.type == AgentCommandType::SetTrayHosting && !cmd.hosting)
+            sawDisableHosting.fetch_add(1);
+        if (cmd.type == AgentCommandType::SyncDropBars && cmd.bars.empty())
+            sawClearBars.fetch_add(1);
+        AgentCommandReply r{true, selfPid, gen};
+        if (!WritePipeMessageOverlapped(srv.get(), ov, stop, SerializeAgentCommandReply(r)) || cmd.type == AgentCommandType::Quit)
+            break;
+    }
+    DisconnectNamedPipe(srv.get());
+}
+
+void TestLostReplyDoesNotSkipDisableOrClear()
+{
+    const std::wstring cmdPipe = UniquePipe(L"LostReplyCmd", 4), evtPipe = UniquePipe(L"LostReplyEvt", 4);
+    const DWORD selfPid = GetCurrentProcessId();
+    constexpr uint64_t kGen = 504;
+    const winrt::handle stop{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, ev{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::atomic_int dropFirstHosting{1}, dropFirstBars{1}, sawDisableHosting{0}, sawClearBars{0};
+
+    std::thread mockSrv([&] {
+        for (int pass = 0; pass < 4 && WaitForSingleObject(stop.get(), 0) == WAIT_TIMEOUT; ++pass)
+            ServeLostReplySession(cmdPipe, ev.get(), stop.get(), selfPid, kGen, dropFirstHosting, dropFirstBars, sawDisableHosting, sawClearBars);
+    });
+
+    DesktopAgentClientOptions opts{
+        0, selfPid, kGen, cmdPipe, evtPipe, true, false, true, [](const std::wstring&, DWORD& e) -> HANDLE {
+                                       return e = 0, nullptr; }, 3000};
+    {
+        DesktopAgentClient client({}, opts);
+        Check(WaitUntil([&] { return client.Running(); }, 4000), "lost-reply mock client connected");
+        client.SetTrayHosting(true);
+        client.SetTrayHosting(false);
+        client.SyncDropBars({{1, RECT{0, 0, 80, 30}, true}});
+        client.SyncDropBars({});
+        Check(sawDisableHosting.load() >= 1, "SetTrayHosting(false) was sent after unconfirmed SetTrayHosting(true)");
+        Check(sawClearBars.load() >= 1, "empty SyncDropBars was sent after unconfirmed non-empty SyncDropBars");
+        SetEvent(stop.get());
+        client.Shutdown();
+    }
+    if (mockSrv.joinable())
+        mockSrv.join();
+}
+
+void TestHostPersistsAnchorAcrossTrayHostToggle()
+{
+    const std::wstring cmdPipe = UniquePipe(L"AnchorCmd", 5), evtPipe = UniquePipe(L"AnchorEvt", 5);
+    const winrt::handle stop{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    const RECT anchor{120, 800, 420, 840};
+    std::mutex mu;
+    std::vector<RECT> appliedAnchors;
+
+    DesktopAgentHostOptions opts{cmdPipe, evtPipe, 5000, stop.get()};
+    opts.onAnchorAppliedForTest = [&](RECT r) {
+        std::lock_guard lock(mu);
+        appliedAnchors.push_back(r);
+    };
+    std::atomic<int> hostExit{-1};
+    std::thread hostThread([&] { hostExit.store(RunDesktopAgentWithOptions(GetCurrentProcessId(), 505, GetModuleHandleW(nullptr), opts)); });
+
+    const winrt::handle pipe{ConnectSameUserPipeClient(cmdPipe, 3000, stop.get())};
+    Check(pipe.get() != INVALID_HANDLE_VALUE && pipe, "connected to anchor persistence test host");
+    if (pipe.get() != INVALID_HANDLE_VALUE) {
+        std::string rawReply;
+        AgentCommandReply reply;
+        const auto sendCmd = [&](const AgentCommandMessage& c) {
+            return SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(c), rawReply, 2000) && ValidateAndParseAgentCommandReply(rawReply, reply) &&
+                   reply.ok;
+        };
+        Check(sendCmd(AgentCommandMessage{AgentCommandType::SetTrayPlaces, 0, false, anchor}), "SetTrayPlaces before TrayHost created succeeded");
+        Check(sendCmd(AgentCommandMessage{AgentCommandType::SetTrayHosting, 0, true}), "SetTrayHosting(true) #1 succeeded");
+        Check(sendCmd(AgentCommandMessage{AgentCommandType::SetTrayHosting, 0, false}), "SetTrayHosting(false) succeeded");
+        Check(sendCmd(AgentCommandMessage{AgentCommandType::SetTrayHosting, 0, true}), "SetTrayHosting(true) #2 succeeded");
+        {
+            std::lock_guard lock(mu);
+            Check(appliedAnchors.size() == 2 && EqualRect(appliedAnchors.data(), &anchor) && EqualRect(&appliedAnchors[1], &anchor),
+                  "stored tray anchor applied on initial TrayHost creation and re-applied after toggle");
+        }
+        sendCmd(AgentCommandMessage{AgentCommandType::Quit});
+    }
+    SetEvent(stop.get());
+    if (hostThread.joinable())
+        hostThread.join();
+    Check(hostExit.load() == 0, "anchor persistence host exited cleanly");
+}
+
 } // namespace
 
 int main()
@@ -291,6 +473,9 @@ int main()
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     TestEvtStaleMessageReadBeforeExitCannotWriteBack();
     TestReplayDoesNotOverwriteNewerHostingAndAnchor();
+    TestDropEpochRejectedAfterAgentExit();
+    TestLostReplyDoesNotSkipDisableOrClear();
+    TestHostPersistsAnchorAcrossTrayHostToggle();
     winrt::uninit_apartment();
     return g_failures == 0 ? 0 : 1;
 }

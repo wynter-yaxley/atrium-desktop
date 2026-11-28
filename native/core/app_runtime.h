@@ -102,6 +102,7 @@ struct AppState {
     struct RemoteDragOverState {
         std::mutex mutex;
         uint32_t seq = 0;
+        uint64_t epoch = 0;
         POINT pt{};
         bool done = false;
         bool allow = false;
@@ -180,7 +181,7 @@ void SyncDesktopDropBars();
 void UpdateDesktopMonitor(bool notify);
 
 void HandleAgentDragOverMessage(WPARAM w);
-void HandleAgentDragLeaveMessage();
+void HandleAgentDragLeaveMessage(WPARAM w);
 void HandleAgentDropFilesMessage(LPARAM l);
 
 void InitializeSubsystems(HINSTANCE instance, Settings& settings);

@@ -22,9 +22,12 @@ struct DesktopAgentCallbacks {
     std::function<void()> onTrayChanged;
     std::function<void()> onYieldChanged;
     std::function<AgentDragOverResult(POINT)> onDragOver;
+    std::function<AgentDragOverResult(POINT, uint64_t)> onDragOverEpoch;
     std::function<void()> onDragLeave;
+    std::function<void(uint64_t)> onDragLeaveEpoch;
     std::function<void(const std::wstring&, const std::vector<std::wstring>&)> onDropFiles;
     std::function<bool(const std::wstring&, const std::vector<std::wstring>&)> onDropFilesAccepted;
+    std::function<bool(const std::wstring&, const std::vector<std::wstring>&, uint64_t)> onDropFilesAcceptedEpoch;
     std::function<void(DWORD)> onAgentPidChanged;
 };
 
@@ -52,6 +55,8 @@ public:
 
     bool EvtServerReady() const { return evtReady_.load(); }
     DWORD AgentPid() const { return agentPid_.load(); }
+    uint64_t ActiveAgentEpoch() const;
+    bool IsActiveEpoch(uint64_t epoch) const;
     bool Running() const { return agentPid_.load() != 0; }
     bool Degraded() const { return degraded_.load(); }
 
@@ -83,6 +88,7 @@ private:
     bool VerifyEvtPeer(HANDLE pipe, uint64_t& verifiedEpochOut);
     bool IsEvtEpochValidLocked(uint64_t verifiedEpoch) const;
     bool ApplyTraySnapshot(const AgentTraySnapshot& snapshot, uint64_t verifiedEpoch, bool& yieldChangedOut);
+    AgentEventReply HandleDragOrDropEvent(const AgentEventMessage& evt, uint64_t verifiedEpoch, bool& epochValidOut);
     AgentEventReply HandleEvent(const AgentEventMessage& evt, uint64_t verifiedEpoch, bool& epochValidOut);
 
     void SupervisorLoop();
@@ -121,6 +127,7 @@ private:
     uint64_t desiredHostingSeq_ = 0;
     uint64_t confirmedHostingSeq_ = 0;
     uint64_t confirmedHostingEpoch_ = 0;
+    uint64_t attemptedHostingEpoch_ = 0;
     bool hasAnchor_ = false;
     RECT anchor_{};
     uint64_t desiredAnchorSeq_ = 0;
@@ -131,6 +138,7 @@ private:
     uint64_t desiredDropBarsSeq_ = 0;
     uint64_t confirmedDropBarsSeq_ = 0;
     uint64_t confirmedDropBarsEpoch_ = 0;
+    uint64_t attemptedDropBarsEpoch_ = 0;
     bool yielded_ = false;
     TrayHostYieldReason yieldReason_ = TrayHostYieldReason::None;
     std::vector<CachedIcon> icons_;

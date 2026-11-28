@@ -158,16 +158,14 @@ private:
         hc.lpfnWndProc = HostWndProc, hc.hInstance = instance_, hc.lpszClassName = kHostWindowClass, RegisterClassExW(&hc);
         oc.lpfnWndProc = OverlayWndProc, oc.hInstance = instance_, oc.lpszClassName = kOverlayWindowClass, RegisterClassExW(&oc);
         hostHwnd_ = CreateWindowExW(0, kHostWindowClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, instance_, this);
-        if (!hostHwnd_)
-            return Log(L"desktop agent: CreateWindowExW host failed (%lu)", GetLastError()), false;
-        return SetTimer(hostHwnd_, kWatchdogTimerId, kWatchdogMs, nullptr), true;
+        return hostHwnd_ ? (SetTimer(hostHwnd_, kWatchdogTimerId, kWatchdogMs, nullptr), true) :
+                           (Log(L"desktop agent: CreateWindowExW host failed (%lu)", GetLastError()), false);
     }
     void Cleanup()
     {
-        quitRequested_ = true;
+        quitRequested_ = true, evtPushCv_.notify_all();
         if (quitEvent_)
             SetEvent(quitEvent_.get());
-        evtPushCv_.notify_all();
         if (cmdThread_.joinable())
             cmdThread_.join();
         if (evtPushThread_.joinable())
@@ -234,17 +232,20 @@ private:
         return true;
     }
     bool SendEvent(const AgentEventMessage& msg, AgentEventReply& replyOut, DWORD timeoutMs, uint64_t* sessionOut = nullptr);
-    void CloseEvtPipeLocked()
-    {
-        if (evtPipe_ != INVALID_HANDLE_VALUE)
-            CloseHandle(evtPipe_), evtPipe_ = INVALID_HANDLE_VALUE;
-    }
+    void CloseEvtPipeLocked() { evtPipe_ != INVALID_HANDLE_VALUE ? (CloseHandle(evtPipe_), evtPipe_ = INVALID_HANDLE_VALUE) : INVALID_HANDLE_VALUE; }
     void SetTrayHosting(bool on);
+    void ApplyAnchorIfHosted()
+    {
+        if (hasTrayAnchor_ && trayHost_) {
+            trayHost_->SetPlaces(trayAnchor_);
+            if (options_.onAnchorAppliedForTest)
+                options_.onAnchorAppliedForTest(trayAnchor_);
+        }
+    }
     void PushTraySnapshot();
     void PushTrayYield()
     {
-        AgentEventMessage msg;
-        msg.type = AgentEventType::TrayYield;
+        AgentEventMessage msg{AgentEventType::TrayYield};
         if (trayHost_)
             msg.yielded = trayHost_->Yielded(), msg.yieldReason = trayHost_->YieldReason();
         QueueEvtPush(std::move(msg), false);
@@ -349,6 +350,8 @@ private:
     std::atomic_bool quitRequested_{false};
 
     std::unique_ptr<TrayHost> trayHost_;
+    bool hasTrayAnchor_ = false;
+    RECT trayAnchor_{};
     std::mutex imageVersionsMutex_;
     TraySnapshotAckState snapshotAckState_;
     RecentOpTracker seenTraySendOps_;
@@ -459,7 +462,7 @@ AgentCommandReply DesktopAgentHostApp::ExecuteStaCommand(const AgentCommandMessa
     AgentCommandReply reply;
     switch (cmd.type) {
     case AgentCommandType::SetTrayHosting: SetTrayHosting(cmd.hosting), reply.ok = true; break;
-    case AgentCommandType::SetTrayPlaces: return trayHost_ ? trayHost_->SetPlaces(cmd.anchor) : (void)0, reply.ok = true, reply;
+    case AgentCommandType::SetTrayPlaces: return hasTrayAnchor_ = true, trayAnchor_ = cmd.anchor, ApplyAnchorIfHosted(), reply.ok = true, reply;
     case AgentCommandType::TraySend:
         if (!seenTraySendOps_.MarkSeenIfNew(cmd.opId))
             return reply.ok = true, reply.sendStatus = HostSendStatus::NotSent, reply;
@@ -659,8 +662,7 @@ void DesktopAgentHostApp::SetTrayHosting(bool on)
         snapshotAckState_.Reset();
     }
     if (!on) {
-        trayHost_.reset();
-        PushTraySnapshot();
+        trayHost_.reset(), PushTraySnapshot();
         return;
     }
     auto onYield = [this] {
@@ -673,11 +675,10 @@ void DesktopAgentHostApp::SetTrayHosting(bool on)
     };
     trayHost_ = std::make_unique<TrayHost>(hostHwnd_, kMsgTrayNotify, 3000, 0, std::move(onYield), std::move(onIcons));
     if (!trayHost_->Running()) {
-        Log(L"desktop agent: TrayHost failed to start");
-        trayHost_.reset();
+        Log(L"desktop agent: TrayHost failed to start"), trayHost_.reset();
         return;
     }
-    PushTraySnapshot();
+    ApplyAnchorIfHosted(), PushTraySnapshot();
 }
 
 void DesktopAgentHostApp::PushTraySnapshot()
@@ -785,9 +786,15 @@ int RunDesktopAgentWithOptions(DWORD corePid, uint64_t generation, HINSTANCE ins
 int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride, const wchar_t* evtPipeOverride,
                     const wchar_t* nonceOverride)
 {
-    DesktopAgentHostOptions opts{cmdPipeOverride ? cmdPipeOverride : L"", evtPipeOverride ? evtPipeOverride : L""};
-    opts.nonce = nonceOverride ? nonceOverride : L"";
-    return RunDesktopAgentWithOptions(corePid, generation, instance, opts);
+    return RunDesktopAgentWithOptions(corePid, generation, instance,
+                                      DesktopAgentHostOptions{cmdPipeOverride ? cmdPipeOverride : L"",
+                                                              evtPipeOverride ? evtPipeOverride : L"",
+                                                              5000,
+                                                              nullptr,
+                                                              {},
+                                                              false,
+                                                              {},
+                                                              nonceOverride ? nonceOverride : L""});
 }
 
 } // namespace atrium

@@ -170,6 +170,7 @@ void AbortStuckShutdown(HANDLE mutex, const wchar_t* reason)
 struct RemoteDropPayload {
     std::wstring key;
     std::vector<std::wstring> paths;
+    uint64_t epoch = 0;
 };
 
 void InitializeDesktopAgent()
@@ -181,10 +182,13 @@ void InitializeDesktopAgent()
     cb.onAgentPidChanged = [](DWORD pid) {
         if (g_app.desktopAgentStopping.load())
             return;
-        if (pid)
+        if (pid) {
             WriteAgentPid(pid);
-        else
+        } else {
             ClearAgentPid();
+            if (g_app.host)
+                PostMessageW(g_app.host, WM_ATRIUM_AGENT_DRAG_LEAVE, 0, 0);
+        }
     };
     cb.onTrayChanged = [] {
         if (!g_app.desktopAgentStopping.load() && g_app.tray)
@@ -194,8 +198,8 @@ void InitializeDesktopAgent()
         if (!g_app.desktopAgentStopping.load() && g_app.tray)
             g_app.tray->NotifyRemoteChanged(true);
     };
-    cb.onDragOver = [](POINT pt) -> AgentDragOverResult {
-        if (g_app.desktopAgentStopping.load())
+    cb.onDragOverEpoch = [](POINT pt, uint64_t epoch) -> AgentDragOverResult {
+        if (g_app.desktopAgentStopping.load() || !g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(epoch))
             return {};
         HWND host = g_app.host;
         if (!host)
@@ -206,6 +210,7 @@ void InitializeDesktopAgent()
             seq = ++g_app.remoteDragOver.seq;
             if (seq == 0)
                 seq = ++g_app.remoteDragOver.seq;
+            g_app.remoteDragOver.epoch = epoch;
             g_app.remoteDragOver.pt = pt;
             g_app.remoteDragOver.done = false;
             g_app.remoteDragOver.allow = false;
@@ -215,18 +220,20 @@ void InitializeDesktopAgent()
         if (!SendMessageTimeoutW(host, WM_ATRIUM_AGENT_DRAG_OVER, static_cast<WPARAM>(seq), 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 250, &answer))
             return {};
         std::lock_guard g(g_app.remoteDragOver.mutex);
-        if (seq != g_app.remoteDragOver.seq || !g_app.remoteDragOver.done)
+        if (seq != g_app.remoteDragOver.seq || !g_app.remoteDragOver.done || !g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(epoch))
             return {};
         return {g_app.remoteDragOver.allow, g_app.remoteDragOver.key};
     };
-    cb.onDragLeave = [] {
-        if (!g_app.desktopAgentStopping.load() && g_app.host)
-            PostMessageW(g_app.host, WM_ATRIUM_AGENT_DRAG_LEAVE, 0, 0);
+    cb.onDragLeaveEpoch = [](uint64_t epoch) {
+        if (!g_app.desktopAgentStopping.load() && g_app.host && g_app.desktopAgent && g_app.desktopAgent->IsActiveEpoch(epoch))
+            PostMessageW(g_app.host, WM_ATRIUM_AGENT_DRAG_LEAVE, static_cast<WPARAM>(epoch), 0);
     };
-    cb.onDropFilesAccepted = [](const std::wstring& key, const std::vector<std::wstring>& paths) -> bool {
-        if (g_app.desktopAgentStopping.load() || !g_app.host || key.empty() || paths.empty())
+    cb.onDropFilesAcceptedEpoch = [](const std::wstring& key, const std::vector<std::wstring>& paths, uint64_t epoch) -> bool {
+        if (g_app.desktopAgentStopping.load() || !g_app.host || key.empty() || paths.empty() || !g_app.desktopAgent ||
+            !g_app.desktopAgent->IsActiveEpoch(epoch)) {
             return false;
-        return PostOwned(g_app.host, WM_ATRIUM_AGENT_DROP_FILES, 0, std::make_unique<RemoteDropPayload>(RemoteDropPayload{key, paths}));
+        }
+        return PostOwned(g_app.host, WM_ATRIUM_AGENT_DROP_FILES, 0, std::make_unique<RemoteDropPayload>(RemoteDropPayload{key, paths, epoch}));
     };
     DesktopAgentClientOptions opts;
     opts.corePid = GetCurrentProcessId();
@@ -540,11 +547,19 @@ void HandleAgentDragOverMessage(WPARAM w)
         return;
     const auto seq = static_cast<uint32_t>(w);
     POINT pt{};
+    uint64_t epoch = 0;
     {
         std::lock_guard g(g_app.remoteDragOver.mutex);
         if (seq != g_app.remoteDragOver.seq)
             return;
         pt = g_app.remoteDragOver.pt;
+        epoch = g_app.remoteDragOver.epoch;
+    }
+    if (!g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(epoch)) {
+        std::lock_guard g(g_app.remoteDragOver.mutex);
+        if (seq == g_app.remoteDragOver.seq)
+            g_app.remoteDragOver.allow = false, g_app.remoteDragOver.key.clear(), g_app.remoteDragOver.done = true;
+        return;
     }
     bool allow = false;
     std::wstring key;
@@ -568,9 +583,11 @@ void HandleAgentDragOverMessage(WPARAM w)
     }
 }
 
-void HandleAgentDragLeaveMessage()
+void HandleAgentDragLeaveMessage(WPARAM w)
 {
     if (g_app.desktopAgentStopping.load() || !g_app.bar)
+        return;
+    if (w != 0 && (!g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(static_cast<uint64_t>(w))))
         return;
     ForBars([](Bar& bar) { bar.ApplyRemoteFileDragLeave(); });
 }
@@ -578,7 +595,7 @@ void HandleAgentDragLeaveMessage()
 void HandleAgentDropFilesMessage(LPARAM l)
 {
     const auto payload = TakePosted<RemoteDropPayload>(l);
-    if (!payload || g_app.desktopAgentStopping.load() || !g_app.bar)
+    if (!payload || g_app.desktopAgentStopping.load() || !g_app.bar || !g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(payload->epoch))
         return;
     Bar* target = nullptr;
     POINT cursor{};

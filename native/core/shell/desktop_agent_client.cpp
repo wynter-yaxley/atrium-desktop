@@ -24,18 +24,9 @@ constexpr DWORD kMonitorIntervalMs = 1000;
 HostIcon ConvertDtoToHostIcon(const AgentTrayIconDto& dto, const std::shared_ptr<const IconImage>& cachedImage)
 {
     HostIcon icon;
-    icon.key = dto.key;
-    icon.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(dto.hwnd));
-    icon.uid = dto.uid;
-    icon.callback = dto.callback;
-    icon.version = dto.version;
-    icon.showTip = dto.showTip;
-    icon.tip = dto.tip;
-    icon.exe = dto.exe;
-    icon.pid = dto.pid;
-    icon.imageVersion = dto.imageVersion;
-    icon.hidden = dto.hidden;
-    icon.added = dto.added;
+    icon.key = dto.key, icon.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(dto.hwnd)), icon.uid = dto.uid;
+    icon.callback = dto.callback, icon.version = dto.version, icon.showTip = dto.showTip, icon.tip = dto.tip;
+    icon.exe = dto.exe, icon.pid = dto.pid, icon.imageVersion = dto.imageVersion, icon.hidden = dto.hidden, icon.added = dto.added;
     if (dto.width > 0 && dto.height > 0 && !dto.pixels.empty())
         icon.image = std::make_shared<const IconImage>(dto.width, dto.height, dto.pixels);
     else if (dto.imageVersion != 0)
@@ -138,6 +129,18 @@ void DesktopAgentClient::Shutdown()
         CloseHandle(quitEvent_);
         quitEvent_ = nullptr;
     }
+}
+
+uint64_t DesktopAgentClient::ActiveAgentEpoch() const
+{
+    std::lock_guard lock(stateMutex_);
+    return activeAgentPid_ != 0 ? activeAgentEpoch_ : 0;
+}
+
+bool DesktopAgentClient::IsActiveEpoch(uint64_t epoch) const
+{
+    std::lock_guard lock(stateMutex_);
+    return epoch != 0 && activeAgentPid_ != 0 && activeAgentEpoch_ == epoch;
 }
 
 bool DesktopAgentClient::Hosting() const
@@ -316,10 +319,9 @@ void DesktopAgentClient::FlushTrayHosting()
         [this](AgentCommandMessage& cmd, uint64_t& seq, uint64_t epoch) {
             if (desiredHostingSeq_ == confirmedHostingSeq_ && confirmedHostingEpoch_ == epoch)
                 return false;
-            if (!hosting_ && confirmedHostingEpoch_ != epoch) {
-                confirmedHostingSeq_ = desiredHostingSeq_, confirmedHostingEpoch_ = epoch;
-                return false;
-            }
+            if (!hosting_ && confirmedHostingEpoch_ != epoch && attemptedHostingEpoch_ != epoch)
+                return confirmedHostingSeq_ = desiredHostingSeq_, confirmedHostingEpoch_ = epoch, false;
+            attemptedHostingEpoch_ = epoch;
             cmd.type = AgentCommandType::SetTrayHosting, cmd.hosting = hosting_, seq = desiredHostingSeq_;
             return true;
         },
@@ -351,12 +353,11 @@ void DesktopAgentClient::FlushDropBars()
     FlushDesiredLoop(
         kFastCmdTimeoutMs,
         [this, &sentBars](AgentCommandMessage& cmd, uint64_t& seq, uint64_t epoch) {
-            if (desiredDropBars_.empty() && confirmedDropBarsEpoch_ != epoch) {
-                confirmedDropBars_.clear(), confirmedDropBarsSeq_ = desiredDropBarsSeq_, confirmedDropBarsEpoch_ = epoch;
-                return false;
-            }
+            if (desiredDropBars_.empty() && confirmedDropBarsEpoch_ != epoch && attemptedDropBarsEpoch_ != epoch)
+                return confirmedDropBars_.clear(), confirmedDropBarsSeq_ = desiredDropBarsSeq_, confirmedDropBarsEpoch_ = epoch, false;
             if (desiredDropBarsSeq_ == confirmedDropBarsSeq_ && confirmedDropBarsEpoch_ == epoch)
                 return false;
+            attemptedDropBarsEpoch_ = epoch;
             cmd.type = AgentCommandType::SyncDropBars, cmd.bars = desiredDropBars_, sentBars = cmd.bars, seq = desiredDropBarsSeq_;
             return true;
         },
@@ -551,13 +552,40 @@ bool DesktopAgentClient::ApplyTraySnapshot(const AgentTraySnapshot& snapshot, ui
     return true;
 }
 
+AgentEventReply DesktopAgentClient::HandleDragOrDropEvent(const AgentEventMessage& evt, uint64_t verifiedEpoch, bool& epochValidOut)
+{
+    AgentEventReply reply;
+    reply.ok = true;
+    {
+        std::lock_guard lock(stateMutex_);
+        if (!IsEvtEpochValidLocked(verifiedEpoch))
+            return epochValidOut = false, reply.ok = false, reply;
+        if (evt.type == AgentEventType::Drop && evt.opId != 0 && !seenDropOps_.MarkSeenIfNew(evt.opId))
+            return reply.allow = false, reply;
+    }
+    if (evt.type == AgentEventType::DragOver && (callbacks_.onDragOverEpoch || callbacks_.onDragOver)) {
+        const AgentDragOverResult res = callbacks_.onDragOverEpoch ? callbacks_.onDragOverEpoch(evt.pt, verifiedEpoch) : callbacks_.onDragOver(evt.pt);
+        reply.allow = res.allow, reply.key = res.key;
+    } else if (evt.type == AgentEventType::DragLeave) {
+        if (callbacks_.onDragLeaveEpoch)
+            callbacks_.onDragLeaveEpoch(verifiedEpoch);
+        else if (callbacks_.onDragLeave)
+            callbacks_.onDragLeave();
+    } else if (evt.type == AgentEventType::Drop) {
+        reply.allow = callbacks_.onDropFilesAcceptedEpoch ? callbacks_.onDropFilesAcceptedEpoch(evt.key, evt.paths, verifiedEpoch) :
+                      callbacks_.onDropFilesAccepted      ? callbacks_.onDropFilesAccepted(evt.key, evt.paths) :
+                      callbacks_.onDropFiles              ? (callbacks_.onDropFiles(evt.key, evt.paths), true) :
+                                                            false;
+    }
+    return reply;
+}
+
 AgentEventReply DesktopAgentClient::HandleEvent(const AgentEventMessage& evt, uint64_t verifiedEpoch, bool& epochValidOut)
 {
     epochValidOut = true;
     AgentEventReply reply;
     reply.ok = true;
-    switch (evt.type) {
-    case AgentEventType::TraySnapshot: {
+    if (evt.type == AgentEventType::TraySnapshot) {
         bool yieldChanged = false;
         if (!ApplyTraySnapshot(evt.snapshot, verifiedEpoch, yieldChanged))
             return epochValidOut = false, reply.ok = false, reply;
@@ -567,55 +595,18 @@ AgentEventReply DesktopAgentClient::HandleEvent(const AgentEventMessage& evt, ui
             callbacks_.onYieldChanged();
         return reply;
     }
-    case AgentEventType::TrayYield: {
-        bool yieldChanged = false;
-        {
-            std::lock_guard lock(stateMutex_);
-            if (!IsEvtEpochValidLocked(verifiedEpoch))
-                return epochValidOut = false, reply.ok = false, reply;
-            yieldChanged = (yielded_ != evt.yielded) || (yieldReason_ != evt.yieldReason);
-            yielded_ = evt.yielded, yieldReason_ = evt.yieldReason;
-        }
-        if (yieldChanged && callbacks_.onYieldChanged)
-            callbacks_.onYieldChanged();
-        return reply;
+    if (evt.type != AgentEventType::TrayYield)
+        return HandleDragOrDropEvent(evt, verifiedEpoch, epochValidOut);
+    bool yieldChanged = false;
+    {
+        std::lock_guard lock(stateMutex_);
+        if (!IsEvtEpochValidLocked(verifiedEpoch))
+            return epochValidOut = false, reply.ok = false, reply;
+        yieldChanged = (yielded_ != evt.yielded) || (yieldReason_ != evt.yieldReason);
+        yielded_ = evt.yielded, yieldReason_ = evt.yieldReason;
     }
-    case AgentEventType::DragOver: {
-        {
-            std::lock_guard lock(stateMutex_);
-            if (!IsEvtEpochValidLocked(verifiedEpoch))
-                return epochValidOut = false, reply.ok = false, reply;
-        }
-        if (callbacks_.onDragOver) {
-            const AgentDragOverResult res = callbacks_.onDragOver(evt.pt);
-            reply.allow = res.allow, reply.key = res.key;
-        }
-        return reply;
-    }
-    case AgentEventType::DragLeave: {
-        {
-            std::lock_guard lock(stateMutex_);
-            if (!IsEvtEpochValidLocked(verifiedEpoch))
-                return epochValidOut = false, reply.ok = false, reply;
-        }
-        if (callbacks_.onDragLeave)
-            callbacks_.onDragLeave();
-        return reply;
-    }
-    case AgentEventType::Drop: {
-        {
-            std::lock_guard lock(stateMutex_);
-            if (!IsEvtEpochValidLocked(verifiedEpoch))
-                return epochValidOut = false, reply.ok = false, reply;
-            if (evt.opId != 0 && !seenDropOps_.MarkSeenIfNew(evt.opId))
-                return reply.allow = false, reply;
-        }
-        reply.allow = callbacks_.onDropFilesAccepted ? callbacks_.onDropFilesAccepted(evt.key, evt.paths) :
-                      callbacks_.onDropFiles         ? (callbacks_.onDropFiles(evt.key, evt.paths), true) :
-                                                       false;
-        return reply;
-    }
-    }
+    if (yieldChanged && callbacks_.onYieldChanged)
+        callbacks_.onYieldChanged();
     return reply;
 }
 
@@ -711,7 +702,6 @@ void DesktopAgentClient::ReplayDesiredState()
 
 void DesktopAgentClient::ClearAgentStateOnExit()
 {
-    agentPid_.store(0);
     {
         std::lock_guard lock(cmdPipeMutex_);
         CloseCmdPipeLocked();
@@ -719,27 +709,21 @@ void DesktopAgentClient::ClearAgentStateOnExit()
     bool hadHostedState = false;
     {
         std::lock_guard lock(stateMutex_);
-        activeAgentPid_ = 0;
-        activeAgentCreationTime_ = {};
-        ++activeAgentEpoch_;
-        confirmedHostingSeq_ = 0;
-        confirmedHostingEpoch_ = 0;
-        confirmedAnchorSeq_ = 0;
-        confirmedAnchorEpoch_ = 0;
-        confirmedDropBars_.clear();
-        confirmedDropBarsSeq_ = 0;
-        confirmedDropBarsEpoch_ = 0;
+        activeAgentPid_ = 0, activeAgentCreationTime_ = {}, ++activeAgentEpoch_;
+        confirmedHostingSeq_ = 0, confirmedHostingEpoch_ = 0, attemptedHostingEpoch_ = 0;
+        confirmedAnchorSeq_ = 0, confirmedAnchorEpoch_ = 0;
+        confirmedDropBars_.clear(), confirmedDropBarsSeq_ = 0, confirmedDropBarsEpoch_ = 0, attemptedDropBarsEpoch_ = 0;
         seenDropOps_.Clear();
         hadHostedState = !icons_.empty() || yielded_;
-        icons_.clear();
-        imageCache_.clear();
-        yielded_ = false;
-        yieldReason_ = TrayHostYieldReason::None;
-        std::lock_guard evtLock(activeEvtPipeMutex_);
-        if (activeEvtCancelEvent_)
-            SetEvent(activeEvtCancelEvent_);
-        if (activeEvtPipe_ != INVALID_HANDLE_VALUE)
-            CancelIoEx(activeEvtPipe_, nullptr);
+        icons_.clear(), imageCache_.clear(), yielded_ = false, yieldReason_ = TrayHostYieldReason::None;
+        {
+            std::lock_guard evtLock(activeEvtPipeMutex_);
+            if (activeEvtCancelEvent_)
+                SetEvent(activeEvtCancelEvent_);
+            if (activeEvtPipe_ != INVALID_HANDLE_VALUE)
+                CancelIoEx(activeEvtPipe_, nullptr);
+        }
+        agentPid_.store(0);
     }
     if (callbacks_.onAgentPidChanged)
         callbacks_.onAgentPidChanged(0);

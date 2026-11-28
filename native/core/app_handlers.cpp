@@ -491,7 +491,7 @@ bool HandleUiAndStatusMessage(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT& resul
     case WM_ATRIUM_SETTINGS: ApplySettings(g_app.server->Current()); return true;
     case WM_ATRIUM_SERVER_READY: TrySignalReadyEvent(h); return true;
     case WM_ATRIUM_AGENT_DRAG_OVER: HandleAgentDragOverMessage(w); return true;
-    case WM_ATRIUM_AGENT_DRAG_LEAVE: HandleAgentDragLeaveMessage(); return true;
+    case WM_ATRIUM_AGENT_DRAG_LEAVE: HandleAgentDragLeaveMessage(w); return true;
     case WM_ATRIUM_AGENT_DROP_FILES: HandleAgentDropFilesMessage(l); return true;
     default: return false;
     }
