@@ -86,6 +86,24 @@ void TestMoveSelection()
     Check(MoveSelection(48, 0, 1, 50, 7, 5, page) == 49 && page == 1, "moving down on partial last page clamps to last item");
 }
 
+void TestSelectionOnPage()
+{
+    Check(SelectionOnPage(3, 50, 1, 35) == -1, "paging forward clears selection on the old page");
+    Check(SelectionOnPage(42, 50, 0, 35) == -1, "paging backward clears selection on the old page");
+    Check(SelectionOnPage(-1, 50, 1, 35) == -1, "paging without a selection keeps it empty");
+    Check(SelectionOnPage(49, 50, 1, 35) == 49, "last tile on a partial page stays selected");
+
+    int page = 0;
+    const int sel = MoveSelection(13, 1, 0, 50, 7, 5, page);
+    Check(page == 1 && SelectionOnPage(sel, 50, page, 35) == 42, "arrow navigation preserves selection on the destination page");
+    const int back = MoveSelection(sel, -1, 0, 50, 7, 5, page);
+    Check(page == 0 && SelectionOnPage(back, 50, page, 35) == 13, "backward arrow navigation preserves selection on the destination page");
+
+    page = 1;
+    const int cleared = SelectionOnPage(3, 50, page, 35);
+    Check(MoveSelection(cleared, 1, 0, 50, 7, 5, page) == 35, "arrow after paging selects a tile on the visible page");
+}
+
 void TestSettlePageDrag()
 {
     Check(SettlePageDrag(0, 0, -0.5f, -2.0f) == 0, "empty page count settles to 0");
@@ -210,6 +228,7 @@ int main()
     TestGridLayout();
     TestPaging();
     TestMoveSelection();
+    TestSelectionOnPage();
     TestSettlePageDrag();
     TestTileMutations();
     TestExpandLaunchpadPageIds();

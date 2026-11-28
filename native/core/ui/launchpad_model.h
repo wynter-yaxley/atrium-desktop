@@ -92,6 +92,13 @@ inline LaunchpadSlice PageSlice(size_t count, int page, int perPage)
     return {begin, std::min(count, begin + static_cast<size_t>(perPage))};
 }
 
+// Keep keyboard focus only on a tile visible on the destination page.
+inline int SelectionOnPage(int sel, size_t count, int page, int perPage)
+{
+    const auto slice = PageSlice(count, page, perPage);
+    return sel >= 0 && static_cast<size_t>(sel) >= slice.begin && static_cast<size_t>(sel) < slice.end ? sel : -1;
+}
+
 inline int MoveSelection(int sel, int dx, int dy, int count, int cols, int rows, int& page)
 {
     if (count <= 0 || cols <= 0 || rows <= 0) {
