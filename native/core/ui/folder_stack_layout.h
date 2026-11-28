@@ -117,9 +117,13 @@ inline StackPlacement FanPlacement(RECT bar, RECT entry, RECT work, float scale,
         const float out = (p.labelsRight ? 1.f : -1.f), along = kStackFanIcon / 2 + kStackLabelGap + lw / 2;
         const D2D1_POINT_2F l = D2D1::Point2F(c.x + out * cs * along, c.y - out * side * sn * along);
         const float hx = lw / 2 * cs + kStackLabelH / 2 * sn, hy = lw / 2 * sn + kStackLabelH / 2 * cs;
+        // A tilted name can extend farther than its icon. Keep only the prefix that fits.
+        const float itemTop = std::max(rise + kStackFanIcon / 2, l.y + hy);
+        if (i > 0 && itemTop > room + kStackGap)
+            break;
         minX = std::min({minX, c.x - kStackFanIcon / 2, l.x - hx});
         maxX = std::max({maxX, c.x + kStackFanIcon / 2, l.x + hx});
-        top = std::max({top, rise + kStackFanIcon / 2, l.y + hy});
+        top = std::max(top, itemTop);
         centres.push_back(c);
         labels.push_back(l);
         turns.push_back(turn);
@@ -139,7 +143,7 @@ inline StackPlacement FanPlacement(RECT bar, RECT entry, RECT work, float scale,
     };
     const float ey = float(entry.top + entry.bottom) / 2;
     p.origin = D2D1::Point2F(-leftDip + shift, (ey - y0) / scale);
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < centres.size(); ++i) {
         const D2D1_POINT_2F c = toContent(centres[i].x, centres[i].y), l = toContent(labels[i].x, labels[i].y);
         const float lw = StackLabelWidth(labelW[i]), h = kStackFanIcon / 2;
         StackItemPlace item;
