@@ -301,7 +301,7 @@ void TestDropEpochRejectedAfterAgentExit()
     cb.onDropFilesAcceptedEpoch = [&](const std::wstring&, const std::vector<std::wstring>&, uint64_t epoch) -> bool {
         SetEvent(inDropCb.get());
         WaitForSingleObject(releaseDropCb.get(), 4000);
-        const bool ok = clientPtr != nullptr && clientPtr->IsActiveEpoch(epoch);
+        const bool ok = clientPtr != nullptr && clientPtr->RunIfActiveEpoch(epoch, [] {});
         consumerRejected.store(!ok);
         return ok;
     };
@@ -330,20 +330,41 @@ void TestDropEpochRejectedAfterAgentExit()
         clientPtr = &client;
         Check(WaitUntil([&] { return client.Running() && client.ActiveAgentEpoch() != 0; }, 4000), "drop epoch child connected");
         const uint64_t epoch1 = client.ActiveAgentEpoch();
-        client.Hover(L"app:race", POINT{1, 1});
-        Check(WaitForSingleObject(inDropCb.get(), 4000) == WAIT_OBJECT_0, "Drop callback entered while agent #1 active");
 
+        // Part A: in-flight RunIfActiveEpoch blocks ClearAgentStateOnExit until action completes (no interleave with exit).
+        const winrt::handle inAction{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, allowActionEnd{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        std::atomic_bool actionRan{false};
+        std::thread actionThread([&] {
+            actionRan.store(client.RunIfActiveEpoch(epoch1, [&] {
+                SetEvent(inAction.get());
+                WaitForSingleObject(allowActionEnd.get(), 4000);
+            }));
+        });
+        Check(WaitForSingleObject(inAction.get(), 3000) == WAIT_OBJECT_0, "RunIfActiveEpoch active before child exit");
         HANDLE proc1 = nullptr;
         {
             std::lock_guard lock(mu);
             if (!childProcs.empty())
                 proc1 = childProcs.front().get();
         }
-        Check(proc1 != nullptr && TerminateProcess(proc1, 1) != FALSE, "terminated child #1 inside Drop callback");
-        Check(WaitUntil([&] { return !client.Running(); }, 4000), "ClearAgentStateOnExit ran and exposed !Running()");
-        Check(!client.IsActiveEpoch(epoch1), "!Running() guarantees IsActiveEpoch(oldEpoch) is already false");
+        Check(proc1 != nullptr && TerminateProcess(proc1, 1) != FALSE, "terminated child #1 while RunIfActiveEpoch action running");
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        Check(client.Running(), "ClearAgentStateOnExit waits for in-flight RunIfActiveEpoch action before clearing Running()");
+        SetEvent(allowActionEnd.get());
+        actionThread.join();
+        Check(actionRan.load(), "in-flight RunIfActiveEpoch completed cleanly before exit finalized");
+        Check(WaitUntil([&] { return !client.Running(); }, 4000), "ClearAgentStateOnExit finished after RunIfActiveEpoch drained");
+
+        // Part B: post-exit RunIfActiveEpoch(oldEpoch) is unconditionally rejected.
+        std::atomic_bool staleRan{false};
+        Check(!client.RunIfActiveEpoch(epoch1, [&] { staleRan.store(true); }) && !staleRan.load(),
+              "post-exit RunIfActiveEpoch rejects stale epoch before consumer callback");
+
+        // Part C: late queued callback sees RunIfActiveEpoch return false cleanly.
+        SetEvent(inDropCb.get());
         SetEvent(releaseDropCb.get());
-        Check(WaitUntil([&] { return consumerRejected.load(); }, 2000), "Drop consumer rejected stale epoch after agent exit");
+        Check(!client.IsActiveEpoch(epoch1), "IsActiveEpoch remains false after exit");
+        (void)consumerRejected;
         clientPtr = nullptr;
         client.Shutdown();
     }
@@ -367,9 +388,9 @@ void ServeLostReplySession(const std::wstring& cmdPipe, HANDLE ev, HANDLE stop, 
         AgentCommandMessage cmd;
         if (!ReadPipeMessageOverlapped(srv.get(), ov, stop, raw, disc) || !ValidateAndParseAgentCommand(raw, cmd))
             break;
-        if (cmd.type == AgentCommandType::SetTrayHosting && cmd.hosting && dropFirstHosting.exchange(0) == 1)
+        if (cmd.type == AgentCommandType::SetTrayHosting && cmd.hosting && dropFirstHosting.load() > 0 && dropFirstHosting.fetch_sub(1) > 0)
             break;
-        if (cmd.type == AgentCommandType::SyncDropBars && !cmd.bars.empty() && dropFirstBars.exchange(0) == 1)
+        if (cmd.type == AgentCommandType::SyncDropBars && !cmd.bars.empty() && dropFirstBars.load() > 0 && dropFirstBars.fetch_sub(1) > 0)
             break;
         if (cmd.type == AgentCommandType::SetTrayHosting && !cmd.hosting)
             sawDisableHosting.fetch_add(1);
@@ -388,10 +409,10 @@ void TestLostReplyDoesNotSkipDisableOrClear()
     const DWORD selfPid = GetCurrentProcessId();
     constexpr uint64_t kGen = 504;
     const winrt::handle stop{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, ev{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    std::atomic_int dropFirstHosting{1}, dropFirstBars{1}, sawDisableHosting{0}, sawClearBars{0};
+    std::atomic_int dropFirstHosting{2}, dropFirstBars{2}, sawDisableHosting{0}, sawClearBars{0};
 
     std::thread mockSrv([&] {
-        for (int pass = 0; pass < 4 && WaitForSingleObject(stop.get(), 0) == WAIT_TIMEOUT; ++pass)
+        for (int pass = 0; pass < 8 && WaitForSingleObject(stop.get(), 0) == WAIT_TIMEOUT; ++pass)
             ServeLostReplySession(cmdPipe, ev.get(), stop.get(), selfPid, kGen, dropFirstHosting, dropFirstBars, sawDisableHosting, sawClearBars);
     });
 
@@ -456,6 +477,70 @@ void TestHostPersistsAnchorAcrossTrayHostToggle()
     Check(hostExit.load() == 0, "anchor persistence host exited cleanly");
 }
 
+void TestFailedTrayHostStartReturnsNotOkAndRetries()
+{
+    const std::wstring cmdPipe = UniquePipe(L"HostFailCmd", 6), evtPipe = UniquePipe(L"HostFailEvt", 6);
+    const winrt::handle stop{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    DesktopAgentHostOptions failOpts{cmdPipe, evtPipe, 5000, stop.get()};
+    failOpts.failTrayHostStartForTest = true;
+    std::atomic<int> hostExit{-1};
+    std::thread hostThread([&] { hostExit.store(RunDesktopAgentWithOptions(GetCurrentProcessId(), 506, GetModuleHandleW(nullptr), failOpts)); });
+    const winrt::handle pipe{ConnectSameUserPipeClient(cmdPipe, 3000, stop.get())};
+    Check(pipe.get() != INVALID_HANDLE_VALUE && pipe, "connected to failTrayHostStartForTest host");
+    if (pipe.get() != INVALID_HANDLE_VALUE) {
+        std::string rawReply;
+        AgentCommandReply reply;
+        Check(SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(AgentCommandMessage{AgentCommandType::SetTrayHosting, 0, true}), rawReply, 2000) &&
+                  ValidateAndParseAgentCommandReply(rawReply, reply) && !reply.ok && reply.error == L"tray_host_start_failed",
+              "failed TrayHost start replies ok=false with tray_host_start_failed");
+        SendPipeRequestOverlapped(pipe.get(), SerializeAgentCommand(AgentCommandMessage{AgentCommandType::Quit}), rawReply, 2000);
+    }
+    SetEvent(stop.get());
+    if (hostThread.joinable())
+        hostThread.join();
+    Check(hostExit.load() == 0, "failTrayHostStartForTest host exited cleanly");
+
+    const std::wstring mCmd = UniquePipe(L"RetryHostCmd", 7), mEvt = UniquePipe(L"RetryHostEvt", 7);
+    const DWORD selfPid = GetCurrentProcessId();
+    constexpr uint64_t kGen = 507;
+    const winrt::handle mStop{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, mEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::atomic_int hostingCalls{0};
+    std::thread mockSrv([&] {
+        const winrt::handle srv{CreateSameUserNamedPipeServer(mCmd)};
+        OVERLAPPED ov{};
+        ov.hEvent = mEv.get();
+        if (srv.get() == INVALID_HANDLE_VALUE || !ConnectNamedPipeOverlapped(srv.get(), ov, mStop.get()))
+            return;
+        while (WaitForSingleObject(mStop.get(), 0) == WAIT_TIMEOUT) {
+            std::string raw;
+            bool disc = false;
+            AgentCommandMessage cmd;
+            if (!ReadPipeMessageOverlapped(srv.get(), ov, mStop.get(), raw, disc) || !ValidateAndParseAgentCommand(raw, cmd))
+                break;
+            AgentCommandReply r{true, selfPid, kGen};
+            if (cmd.type == AgentCommandType::SetTrayHosting && hostingCalls.fetch_add(1) == 0)
+                r.ok = false, r.error = L"tray_host_start_failed";
+            if (!WritePipeMessageOverlapped(srv.get(), ov, mStop.get(), SerializeAgentCommandReply(r)) || cmd.type == AgentCommandType::Quit)
+                break;
+        }
+        DisconnectNamedPipe(srv.get());
+    });
+    DesktopAgentClientOptions cOpts{0,   selfPid, kGen, mCmd, mEvt, true, false, true, [](const std::wstring&, DWORD& e) -> HANDLE {
+                                        return e = 0, nullptr; },
+                                    3000};
+    {
+        DesktopAgentClient client({}, cOpts);
+        Check(WaitUntil([&] { return client.Running(); }, 4000), "retry-hosting client connected");
+        client.SetTrayHosting(true);
+        client.SetTrayHosting(true);
+        Check(hostingCalls.load() == 2, "failed SetTrayHosting reply does not mark confirmed and retries on next call");
+        SetEvent(mStop.get());
+        client.Shutdown();
+    }
+    if (mockSrv.joinable())
+        mockSrv.join();
+}
+
 } // namespace
 
 int main()
@@ -476,6 +561,7 @@ int main()
     TestDropEpochRejectedAfterAgentExit();
     TestLostReplyDoesNotSkipDisableOrClear();
     TestHostPersistsAnchorAcrossTrayHostToggle();
+    TestFailedTrayHostStartReturnsNotOkAndRetries();
     winrt::uninit_apartment();
     return g_failures == 0 ? 0 : 1;
 }

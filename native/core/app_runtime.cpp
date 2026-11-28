@@ -555,26 +555,24 @@ void HandleAgentDragOverMessage(WPARAM w)
         pt = g_app.remoteDragOver.pt;
         epoch = g_app.remoteDragOver.epoch;
     }
-    if (!g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(epoch)) {
-        std::lock_guard g(g_app.remoteDragOver.mutex);
-        if (seq == g_app.remoteDragOver.seq)
-            g_app.remoteDragOver.allow = false, g_app.remoteDragOver.key.clear(), g_app.remoteDragOver.done = true;
-        return;
-    }
     bool allow = false;
     std::wstring key;
-    Bar* hitBar = nullptr;
-    ForBars([&](Bar& bar) {
-        const RECT r = bar.DropBarRect();
-        if (!hitBar && !IsRectEmpty(&r) && PtInRect(&r, pt))
-            hitBar = &bar;
+    const bool ran = g_app.desktopAgent && g_app.desktopAgent->RunIfActiveEpoch(epoch, [&] {
+        Bar* hitBar = nullptr;
+        ForBars([&](Bar& bar) {
+            const RECT r = bar.DropBarRect();
+            if (!hitBar && !IsRectEmpty(&r) && PtInRect(&r, pt))
+                hitBar = &bar;
+        });
+        ForBars([&](Bar& bar) {
+            if (&bar == hitBar)
+                allow = bar.ApplyRemoteFileDragOver(pt, key);
+            else
+                bar.ApplyRemoteFileDragLeave();
+        });
     });
-    ForBars([&](Bar& bar) {
-        if (&bar == hitBar)
-            allow = bar.ApplyRemoteFileDragOver(pt, key);
-        else
-            bar.ApplyRemoteFileDragLeave();
-    });
+    if (!ran)
+        allow = false, key.clear();
     std::lock_guard g(g_app.remoteDragOver.mutex);
     if (seq == g_app.remoteDragOver.seq) {
         g_app.remoteDragOver.allow = allow;
@@ -587,28 +585,33 @@ void HandleAgentDragLeaveMessage(WPARAM w)
 {
     if (g_app.desktopAgentStopping.load() || !g_app.bar)
         return;
-    if (w != 0 && (!g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(static_cast<uint64_t>(w))))
+    if (w == 0) {
+        ForBars([](Bar& bar) { bar.ApplyRemoteFileDragLeave(); });
         return;
-    ForBars([](Bar& bar) { bar.ApplyRemoteFileDragLeave(); });
+    }
+    if (g_app.desktopAgent)
+        g_app.desktopAgent->RunIfActiveEpoch(static_cast<uint64_t>(w), [] { ForBars([](Bar& bar) { bar.ApplyRemoteFileDragLeave(); }); });
 }
 
 void HandleAgentDropFilesMessage(LPARAM l)
 {
     const auto payload = TakePosted<RemoteDropPayload>(l);
-    if (!payload || g_app.desktopAgentStopping.load() || !g_app.bar || !g_app.desktopAgent || !g_app.desktopAgent->IsActiveEpoch(payload->epoch))
+    if (!payload || g_app.desktopAgentStopping.load() || !g_app.bar || !g_app.desktopAgent)
         return;
-    Bar* target = nullptr;
-    POINT cursor{};
-    if (GetCursorPos(&cursor)) {
-        ForBars([&](Bar& bar) {
-            const RECT r = bar.DropBarRect();
-            if (!target && !IsRectEmpty(&r) && PtInRect(&r, cursor))
-                target = &bar;
-        });
-    }
-    if (!target)
-        target = &ActiveBar();
-    target->ApplyRemoteDropFiles(payload->key, payload->paths);
+    g_app.desktopAgent->RunIfActiveEpoch(payload->epoch, [&] {
+        Bar* target = nullptr;
+        POINT cursor{};
+        if (GetCursorPos(&cursor)) {
+            ForBars([&](Bar& bar) {
+                const RECT r = bar.DropBarRect();
+                if (!target && !IsRectEmpty(&r) && PtInRect(&r, cursor))
+                    target = &bar;
+            });
+        }
+        if (!target)
+            target = &ActiveBar();
+        target->ApplyRemoteDropFiles(payload->key, payload->paths);
+    });
 }
 
 void ShutdownApp(HANDLE mutex, std::thread& startupThread)

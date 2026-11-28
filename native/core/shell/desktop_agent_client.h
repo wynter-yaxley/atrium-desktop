@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,6 +58,14 @@ public:
     DWORD AgentPid() const { return agentPid_.load(); }
     uint64_t ActiveAgentEpoch() const;
     bool IsActiveEpoch(uint64_t epoch) const;
+    template<class Fn> bool RunIfActiveEpoch(uint64_t epoch, Fn&& fn) const
+    {
+        std::shared_lock actionLock(epochActionMutex_);
+        if (!IsActiveEpoch(epoch))
+            return false;
+        fn();
+        return true;
+    }
     bool Running() const { return agentPid_.load() != 0; }
     bool Degraded() const { return degraded_.load(); }
 
@@ -101,7 +110,8 @@ private:
     void FlushPlaces();
     void FlushDropBars();
     void ClearAgentStateOnExit();
-    SendCommandOutcome SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs);
+    bool EnsureCmdPipeConnectedLocked(DWORD timeoutMs, uint64_t requiredEpoch);
+    SendCommandOutcome SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs, uint64_t requiredEpoch = 0);
     void CloseCmdPipeLocked();
 
     DesktopAgentCallbacks callbacks_;
@@ -145,12 +155,14 @@ private:
     std::map<uint64_t, std::shared_ptr<const IconImage>> imageCache_;
     RecentOpTracker seenDropOps_;
 
+    mutable std::shared_mutex epochActionMutex_;
     std::mutex desiredStateSendMutex_;
     std::mutex activeEvtPipeMutex_;
     HANDLE activeEvtPipe_ = INVALID_HANDLE_VALUE;
     HANDLE activeEvtCancelEvent_ = nullptr;
     std::mutex cmdPipeMutex_;
     HANDLE cmdPipe_ = INVALID_HANDLE_VALUE;
+    uint64_t cmdPipeEpoch_ = 0;
 
     std::thread evtThread_;
     std::thread supervisorThread_;

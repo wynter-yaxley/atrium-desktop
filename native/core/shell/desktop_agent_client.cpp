@@ -303,7 +303,7 @@ template<class PullFn, class CommitFn> void DesktopAgentClient::FlushDesiredLoop
                 return;
         }
         AgentCommandReply reply;
-        if (SendCommand(cmd, &reply, timeoutMs) != SendCommandOutcome::Succeeded || !reply.ok)
+        if (SendCommand(cmd, &reply, timeoutMs, epoch) != SendCommandOutcome::Succeeded || !reply.ok)
             return;
         std::lock_guard lock(stateMutex_);
         if (activeAgentPid_ == 0 || activeAgentEpoch_ != epoch)
@@ -373,9 +373,40 @@ void DesktopAgentClient::CloseCmdPipeLocked()
         CloseHandle(cmdPipe_);
         cmdPipe_ = INVALID_HANDLE_VALUE;
     }
+    cmdPipeEpoch_ = 0;
 }
 
-DesktopAgentClient::SendCommandOutcome DesktopAgentClient::SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs)
+bool DesktopAgentClient::EnsureCmdPipeConnectedLocked(DWORD timeoutMs, uint64_t requiredEpoch)
+{
+    DWORD expectedPid = 0;
+    FILETIME expectedCreation{};
+    uint64_t expectedEpoch = 0;
+    {
+        std::lock_guard stateLock(stateMutex_);
+        expectedPid = activeAgentPid_, expectedCreation = activeAgentCreationTime_, expectedEpoch = activeAgentEpoch_;
+    }
+    const std::wstring exePath = ModulePath();
+    if (expectedPid == 0 || expectedEpoch == 0 || (requiredEpoch != 0 && expectedEpoch != requiredEpoch) || exePath.empty())
+        return false;
+    HANDLE pipe = ConnectSameUserPipeClient(cmdPipeName_, timeoutMs, quitEvent_);
+    if (pipe == INVALID_HANDLE_VALUE)
+        return false;
+    const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
+    AgentPeerIdentity peer;
+    if (!VerifyNamedPipePeerProcess(pipe, false, exePath, requireNonElevated, peer) || (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) ||
+        peer.pid != expectedPid || CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
+        Log(L"desktop agent client: rejected reconnected Cmd peer pid=%lu (expected %lu)", peer.pid, expectedPid);
+        return CloseHandle(pipe), false;
+    }
+    std::lock_guard stateLock(stateMutex_);
+    if (activeAgentPid_ != expectedPid || activeAgentEpoch_ != expectedEpoch)
+        return CloseHandle(pipe), false;
+    cmdPipe_ = pipe, cmdPipeEpoch_ = expectedEpoch;
+    return true;
+}
+
+DesktopAgentClient::SendCommandOutcome DesktopAgentClient::SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs,
+                                                                       uint64_t requiredEpoch)
 {
     if (replyOut)
         *replyOut = {};
@@ -385,36 +416,20 @@ DesktopAgentClient::SendCommandOutcome DesktopAgentClient::SendCommand(const Age
     if (payload.empty() || payload.size() > kMaxAgentMessageBytes)
         return SendCommandOutcome::RejectedBeforeWrite;
     const int maxAttempts = (cmd.type == AgentCommandType::TraySend) ? 1 : 2;
-    const std::wstring exePath = ModulePath();
-    const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
     bool anyWriteCompleted = false;
     std::lock_guard lock(cmdPipeMutex_);
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         if (WaitForSingleObject(quitEvent_, 0) != WAIT_TIMEOUT)
             break;
-        if (cmdPipe_ == INVALID_HANDLE_VALUE) {
-            DWORD expectedPid = 0;
-            FILETIME expectedCreation{};
-            {
-                std::lock_guard stateLock(stateMutex_);
-                expectedPid = activeAgentPid_;
-                expectedCreation = activeAgentCreationTime_;
-            }
-            if (expectedPid == 0 || exePath.empty())
+        if (requiredEpoch != 0) {
+            std::lock_guard stateLock(stateMutex_);
+            if (activeAgentPid_ == 0 || activeAgentEpoch_ != requiredEpoch)
                 break;
-            HANDLE pipe = ConnectSameUserPipeClient(cmdPipeName_, timeoutMs, quitEvent_);
-            if (pipe == INVALID_HANDLE_VALUE)
-                break;
-            AgentPeerIdentity peer;
-            if (!VerifyNamedPipePeerProcess(pipe, false, exePath, requireNonElevated, peer) ||
-                (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) || peer.pid != expectedPid ||
-                CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
-                Log(L"desktop agent client: rejected reconnected Cmd peer pid=%lu (expected %lu)", peer.pid, expectedPid);
-                CloseHandle(pipe);
-                break;
-            }
-            cmdPipe_ = pipe;
         }
+        if (cmdPipe_ != INVALID_HANDLE_VALUE && requiredEpoch != 0 && cmdPipeEpoch_ != requiredEpoch)
+            break;
+        if (cmdPipe_ == INVALID_HANDLE_VALUE && !EnsureCmdPipeConnectedLocked(timeoutMs, requiredEpoch))
+            break;
         std::string rawReply;
         AgentCommandReply parsed;
         bool writeCompleted = false;
@@ -634,13 +649,11 @@ int DesktopAgentClient::TryAttachCmdPeer(HANDLE pipe, const std::wstring& exePat
         options_.allowSameProcessPeer ? (reply.nonce.empty() || reply.nonce == spawnNonce) : (!reply.nonce.empty() && reply.nonce == spawnNonce);
     if (pingOk && reply.ok && reply.pid == peer.pid && (generation_ == 0 || reply.generation == generation_) && nonceOk) {
         {
-            std::lock_guard lock(cmdPipeMutex_);
+            std::lock_guard pipeLock(cmdPipeMutex_);
             CloseCmdPipeLocked();
-            cmdPipe_ = pipe;
-        }
-        {
             std::lock_guard lock(stateMutex_);
             activeAgentPid_ = peer.pid, activeAgentCreationTime_ = peer.creationTime, ++activeAgentEpoch_;
+            cmdPipe_ = pipe, cmdPipeEpoch_ = activeAgentEpoch_;
         }
         pidOut = peer.pid, procOut = std::move(verifiedProc);
         return 1;
@@ -723,8 +736,11 @@ void DesktopAgentClient::ClearAgentStateOnExit()
             if (activeEvtPipe_ != INVALID_HANDLE_VALUE)
                 CancelIoEx(activeEvtPipe_, nullptr);
         }
-        agentPid_.store(0);
     }
+    {
+        std::unique_lock drainLock(epochActionMutex_);
+    }
+    agentPid_.store(0);
     if (callbacks_.onAgentPidChanged)
         callbacks_.onAgentPidChanged(0);
     if (hadHostedState) {

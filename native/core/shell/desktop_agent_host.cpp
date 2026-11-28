@@ -53,9 +53,7 @@ constexpr size_t kSnapshotRawPixelBudget = 1300 * 1024;
 uint64_t ReadGenerationFile()
 {
     const std::wstring dir = DataDirectory();
-    if (dir.empty())
-        return 0;
-    const std::wstring text = TrimAsciiWhitespace(ReadTextFile(dir + L"\\instance.gen"));
+    const std::wstring text = dir.empty() ? std::wstring{} : TrimAsciiWhitespace(ReadTextFile(dir + L"\\instance.gen"));
     if (text.empty() || !std::ranges::all_of(text, [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }))
         return 0;
     wchar_t* end = nullptr;
@@ -233,7 +231,7 @@ private:
     }
     bool SendEvent(const AgentEventMessage& msg, AgentEventReply& replyOut, DWORD timeoutMs, uint64_t* sessionOut = nullptr);
     void CloseEvtPipeLocked() { evtPipe_ != INVALID_HANDLE_VALUE ? (CloseHandle(evtPipe_), evtPipe_ = INVALID_HANDLE_VALUE) : INVALID_HANDLE_VALUE; }
-    void SetTrayHosting(bool on);
+    bool SetTrayHosting(bool on);
     void ApplyAnchorIfHosted()
     {
         if (hasTrayAnchor_ && trayHost_) {
@@ -314,16 +312,11 @@ private:
         if (msg == kMsgTrayYield)
             return self->PushTrayYield(), 0;
         if (msg == WM_TIMER) {
-            if (wp == kDropPollTimerId)
-                self->OnDropPollTimer();
-            else if (wp == kWatchdogTimerId)
-                self->OnWatchdogTimer();
+            wp == kDropPollTimerId ? self->OnDropPollTimer() : (wp == kWatchdogTimerId ? self->OnWatchdogTimer() : void());
             return 0;
         }
         if (msg == WM_CLOSE) {
-            self->quitRequested_ = true;
-            if (self->quitEvent_)
-                SetEvent(self->quitEvent_.get());
+            self->quitRequested_ = true, self->quitEvent_ ? (SetEvent(self->quitEvent_.get()), 0) : 0;
             return PostQuitMessage(0), 0;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -461,7 +454,11 @@ AgentCommandReply DesktopAgentHostApp::ExecuteStaCommand(const AgentCommandMessa
         options_.onBeforeStaCommandForTest(cmd);
     AgentCommandReply reply;
     switch (cmd.type) {
-    case AgentCommandType::SetTrayHosting: SetTrayHosting(cmd.hosting), reply.ok = true; break;
+    case AgentCommandType::SetTrayHosting:
+        reply.ok = SetTrayHosting(cmd.hosting);
+        if (!reply.ok)
+            reply.error = L"tray_host_start_failed";
+        break;
     case AgentCommandType::SetTrayPlaces: return hasTrayAnchor_ = true, trayAnchor_ = cmd.anchor, ApplyAnchorIfHosted(), reply.ok = true, reply;
     case AgentCommandType::TraySend:
         if (!seenTraySendOps_.MarkSeenIfNew(cmd.opId))
@@ -653,17 +650,17 @@ void DesktopAgentHostApp::EvtPushLoop()
     winrt::uninit_apartment();
 }
 
-void DesktopAgentHostApp::SetTrayHosting(bool on)
+bool DesktopAgentHostApp::SetTrayHosting(bool on)
 {
     if (on == (trayHost_ != nullptr))
-        return;
+        return true;
     {
         std::lock_guard lock(imageVersionsMutex_);
         snapshotAckState_.Reset();
     }
     if (!on) {
         trayHost_.reset(), PushTraySnapshot();
-        return;
+        return true;
     }
     auto onYield = [this] {
         if (hostHwnd_)
@@ -673,12 +670,14 @@ void DesktopAgentHostApp::SetTrayHosting(bool on)
         if (hostHwnd_)
             PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
     };
-    trayHost_ = std::make_unique<TrayHost>(hostHwnd_, kMsgTrayNotify, 3000, 0, std::move(onYield), std::move(onIcons));
-    if (!trayHost_->Running()) {
+    trayHost_ =
+        options_.failTrayHostStartForTest ? nullptr : std::make_unique<TrayHost>(hostHwnd_, kMsgTrayNotify, 3000, 0, std::move(onYield), std::move(onIcons));
+    if (!trayHost_ || !trayHost_->Running()) {
         Log(L"desktop agent: TrayHost failed to start"), trayHost_.reset();
-        return;
+        return false;
     }
     ApplyAnchorIfHosted(), PushTraySnapshot();
+    return true;
 }
 
 void DesktopAgentHostApp::PushTraySnapshot()
@@ -786,15 +785,11 @@ int RunDesktopAgentWithOptions(DWORD corePid, uint64_t generation, HINSTANCE ins
 int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride, const wchar_t* evtPipeOverride,
                     const wchar_t* nonceOverride)
 {
-    return RunDesktopAgentWithOptions(corePid, generation, instance,
-                                      DesktopAgentHostOptions{cmdPipeOverride ? cmdPipeOverride : L"",
-                                                              evtPipeOverride ? evtPipeOverride : L"",
-                                                              5000,
-                                                              nullptr,
-                                                              {},
-                                                              false,
-                                                              {},
-                                                              nonceOverride ? nonceOverride : L""});
+    DesktopAgentHostOptions o;
+    o.cmdPipeOverride = cmdPipeOverride ? cmdPipeOverride : L"";
+    o.evtPipeOverride = evtPipeOverride ? evtPipeOverride : L"";
+    o.nonce = nonceOverride ? nonceOverride : L"";
+    return RunDesktopAgentWithOptions(corePid, generation, instance, o);
 }
 
 } // namespace atrium
