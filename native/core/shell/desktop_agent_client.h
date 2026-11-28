@@ -40,6 +40,7 @@ struct DesktopAgentClientOptions {
     // Optional test hook replacing ShellLaunch(..., RequireMedium). Returns an owned waitable handle or nullptr.
     std::function<HANDLE(const std::wstring& args, DWORD& errorOut)> spawnAgentOverride;
     DWORD pingWaitMs = 3000;
+    std::function<void()> onBeforeHandleEventForTest;
 };
 
 class DesktopAgentClient {
@@ -79,13 +80,19 @@ private:
 
     void EvtServerLoop();
     void ServeEvtPipe(HANDLE pipe);
-    AgentEventReply HandleEvent(const AgentEventMessage& evt);
+    bool VerifyEvtPeer(HANDLE pipe, uint64_t& verifiedEpochOut);
+    bool IsEvtEpochValidLocked(uint64_t verifiedEpoch) const;
+    bool ApplyTraySnapshot(const AgentTraySnapshot& snapshot, uint64_t verifiedEpoch, bool& yieldChangedOut);
+    AgentEventReply HandleEvent(const AgentEventMessage& evt, uint64_t verifiedEpoch, bool& epochValidOut);
 
     void SupervisorLoop();
     bool SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut);
     int TryAttachCmdPeer(HANDLE pipe, const std::wstring& exePath, const std::wstring& spawnNonce, const FILETIME& spawnFloor, HANDLE launchedHandle,
                          DWORD launchedPid, const FILETIME& launchedCreation, bool requireNonElevated, winrt::handle& procOut, DWORD& pidOut);
     void ReplayDesiredState();
+    template<class PullFn, class CommitFn> void FlushDesiredLoop(DWORD timeoutMs, PullFn&& pull, CommitFn&& commit);
+    void FlushTrayHosting();
+    void FlushPlaces();
     void FlushDropBars();
     void ClearAgentStateOnExit();
     SendCommandOutcome SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs);
@@ -111,8 +118,14 @@ private:
     FILETIME activeAgentCreationTime_{};
     uint64_t activeAgentEpoch_ = 0;
     bool hosting_ = false;
+    uint64_t desiredHostingSeq_ = 0;
+    uint64_t confirmedHostingSeq_ = 0;
+    uint64_t confirmedHostingEpoch_ = 0;
     bool hasAnchor_ = false;
     RECT anchor_{};
+    uint64_t desiredAnchorSeq_ = 0;
+    uint64_t confirmedAnchorSeq_ = 0;
+    uint64_t confirmedAnchorEpoch_ = 0;
     std::vector<AgentBarRect> desiredDropBars_;
     std::vector<AgentBarRect> confirmedDropBars_;
     uint64_t desiredDropBarsSeq_ = 0;
@@ -124,9 +137,10 @@ private:
     std::map<uint64_t, std::shared_ptr<const IconImage>> imageCache_;
     RecentOpTracker seenDropOps_;
 
-    std::mutex dropBarsSendMutex_;
+    std::mutex desiredStateSendMutex_;
     std::mutex activeEvtPipeMutex_;
     HANDLE activeEvtPipe_ = INVALID_HANDLE_VALUE;
+    HANDLE activeEvtCancelEvent_ = nullptr;
     std::mutex cmdPipeMutex_;
     HANDLE cmdPipe_ = INVALID_HANDLE_VALUE;
 

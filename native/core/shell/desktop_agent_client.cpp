@@ -119,6 +119,13 @@ void DesktopAgentClient::Shutdown()
     }
     if (quitEvent_)
         SetEvent(quitEvent_);
+    {
+        std::lock_guard evtLock(activeEvtPipeMutex_);
+        if (activeEvtCancelEvent_)
+            SetEvent(activeEvtCancelEvent_);
+        if (activeEvtPipe_ != INVALID_HANDLE_VALUE)
+            CancelIoEx(activeEvtPipe_, nullptr);
+    }
     if (supervisorThread_.joinable())
         supervisorThread_.join();
     if (evtThread_.joinable())
@@ -187,22 +194,17 @@ void DesktopAgentClient::SetTrayHosting(bool on)
 {
     {
         std::lock_guard lock(stateMutex_);
-        if (hosting_ == on)
+        if (hosting_ == on && activeAgentPid_ != 0 && activeAgentEpoch_ != 0 && desiredHostingSeq_ == confirmedHostingSeq_ &&
+            confirmedHostingEpoch_ == activeAgentEpoch_) {
             return;
-        hosting_ = on;
-        if (!on) {
-            icons_.clear();
-            imageCache_.clear();
-            yielded_ = false;
-            yieldReason_ = TrayHostYieldReason::None;
         }
+        hosting_ = on;
+        ++desiredHostingSeq_;
+        if (!on)
+            icons_.clear(), imageCache_.clear(), yielded_ = false, yieldReason_ = TrayHostYieldReason::None;
     }
-    if (agentPid_.load() != 0) {
-        AgentCommandMessage cmd;
-        cmd.type = AgentCommandType::SetTrayHosting;
-        cmd.hosting = on;
-        SendCommand(cmd, nullptr, kCmdTimeoutMs);
-    }
+    if (agentPid_.load() != 0)
+        FlushTrayHosting();
     if (!on) {
         if (callbacks_.onTrayChanged)
             callbacks_.onTrayChanged();
@@ -256,15 +258,16 @@ void DesktopAgentClient::SetPlaces(RECT anchor)
 {
     {
         std::lock_guard lock(stateMutex_);
+        if (hasAnchor_ && EqualRect(&anchor_, &anchor) && activeAgentPid_ != 0 && activeAgentEpoch_ != 0 && desiredAnchorSeq_ == confirmedAnchorSeq_ &&
+            confirmedAnchorEpoch_ == activeAgentEpoch_) {
+            return;
+        }
         hasAnchor_ = true;
         anchor_ = anchor;
+        ++desiredAnchorSeq_;
     }
-    if (agentPid_.load() == 0)
-        return;
-    AgentCommandMessage cmd;
-    cmd.type = AgentCommandType::SetTrayPlaces;
-    cmd.anchor = anchor;
-    SendCommand(cmd, nullptr, kFastCmdTimeoutMs);
+    if (agentPid_.load() != 0)
+        FlushPlaces();
 }
 
 void DesktopAgentClient::SyncDropBars(const std::vector<AgentBarRect>& bars)
@@ -282,31 +285,85 @@ void DesktopAgentClient::SyncDropBars(const std::vector<AgentBarRect>& bars)
         FlushDropBars();
 }
 
-void DesktopAgentClient::FlushDropBars()
+template<class PullFn, class CommitFn> void DesktopAgentClient::FlushDesiredLoop(DWORD timeoutMs, PullFn&& pull, CommitFn&& commit)
 {
-    std::lock_guard sendLock(dropBarsSendMutex_);
+    std::lock_guard sendLock(desiredStateSendMutex_);
     for (;;) {
+        AgentCommandMessage cmd;
         uint64_t seq = 0, epoch = 0;
-        std::vector<AgentBarRect> bars;
         {
             std::lock_guard lock(stateMutex_);
-            if (agentPid_.load() == 0 || activeAgentPid_ == 0 || activeAgentEpoch_ == 0 ||
-                (desiredDropBarsSeq_ == confirmedDropBarsSeq_ && confirmedDropBarsEpoch_ == activeAgentEpoch_)) {
+            if (agentPid_.load() == 0 || activeAgentPid_ == 0 || activeAgentEpoch_ == 0)
                 return;
-            }
-            seq = desiredDropBarsSeq_, epoch = activeAgentEpoch_, bars = desiredDropBars_;
+            epoch = activeAgentEpoch_;
+            if (!pull(cmd, seq, epoch))
+                return;
         }
-        AgentCommandMessage cmd;
-        cmd.type = AgentCommandType::SyncDropBars, cmd.bars = bars;
         AgentCommandReply reply;
-        if (SendCommand(cmd, &reply, kFastCmdTimeoutMs) != SendCommandOutcome::Succeeded || !reply.ok)
+        if (SendCommand(cmd, &reply, timeoutMs) != SendCommandOutcome::Succeeded || !reply.ok)
             return;
         std::lock_guard lock(stateMutex_);
         if (activeAgentPid_ == 0 || activeAgentEpoch_ != epoch)
             return;
-        if (confirmedDropBarsEpoch_ != epoch || seq > confirmedDropBarsSeq_)
-            confirmedDropBars_ = std::move(bars), confirmedDropBarsSeq_ = seq, confirmedDropBarsEpoch_ = epoch;
+        commit(seq, epoch);
     }
+}
+
+void DesktopAgentClient::FlushTrayHosting()
+{
+    FlushDesiredLoop(
+        kCmdTimeoutMs,
+        [this](AgentCommandMessage& cmd, uint64_t& seq, uint64_t epoch) {
+            if (desiredHostingSeq_ == confirmedHostingSeq_ && confirmedHostingEpoch_ == epoch)
+                return false;
+            if (!hosting_ && confirmedHostingEpoch_ != epoch) {
+                confirmedHostingSeq_ = desiredHostingSeq_, confirmedHostingEpoch_ = epoch;
+                return false;
+            }
+            cmd.type = AgentCommandType::SetTrayHosting, cmd.hosting = hosting_, seq = desiredHostingSeq_;
+            return true;
+        },
+        [this](uint64_t seq, uint64_t epoch) {
+            if (confirmedHostingEpoch_ != epoch || seq > confirmedHostingSeq_)
+                confirmedHostingSeq_ = seq, confirmedHostingEpoch_ = epoch;
+        });
+}
+
+void DesktopAgentClient::FlushPlaces()
+{
+    FlushDesiredLoop(
+        kFastCmdTimeoutMs,
+        [this](AgentCommandMessage& cmd, uint64_t& seq, uint64_t epoch) {
+            if (!hasAnchor_ || (desiredAnchorSeq_ == confirmedAnchorSeq_ && confirmedAnchorEpoch_ == epoch))
+                return false;
+            cmd.type = AgentCommandType::SetTrayPlaces, cmd.anchor = anchor_, seq = desiredAnchorSeq_;
+            return true;
+        },
+        [this](uint64_t seq, uint64_t epoch) {
+            if (confirmedAnchorEpoch_ != epoch || seq > confirmedAnchorSeq_)
+                confirmedAnchorSeq_ = seq, confirmedAnchorEpoch_ = epoch;
+        });
+}
+
+void DesktopAgentClient::FlushDropBars()
+{
+    std::vector<AgentBarRect> sentBars;
+    FlushDesiredLoop(
+        kFastCmdTimeoutMs,
+        [this, &sentBars](AgentCommandMessage& cmd, uint64_t& seq, uint64_t epoch) {
+            if (desiredDropBars_.empty() && confirmedDropBarsEpoch_ != epoch) {
+                confirmedDropBars_.clear(), confirmedDropBarsSeq_ = desiredDropBarsSeq_, confirmedDropBarsEpoch_ = epoch;
+                return false;
+            }
+            if (desiredDropBarsSeq_ == confirmedDropBarsSeq_ && confirmedDropBarsEpoch_ == epoch)
+                return false;
+            cmd.type = AgentCommandType::SyncDropBars, cmd.bars = desiredDropBars_, sentBars = cmd.bars, seq = desiredDropBarsSeq_;
+            return true;
+        },
+        [this, &sentBars](uint64_t seq, uint64_t epoch) {
+            if (confirmedDropBarsEpoch_ != epoch || seq > confirmedDropBarsSeq_)
+                confirmedDropBars_ = std::move(sentBars), confirmedDropBarsSeq_ = seq, confirmedDropBarsEpoch_ = epoch;
+        });
 }
 
 void DesktopAgentClient::CloseCmdPipeLocked()
@@ -390,108 +447,120 @@ void DesktopAgentClient::EvtServerLoop()
     winrt::uninit_apartment();
 }
 
+bool DesktopAgentClient::IsEvtEpochValidLocked(uint64_t verifiedEpoch) const
+{
+    return options_.allowUnboundTestEvtPeer || (activeAgentPid_ != 0 && verifiedEpoch != 0 && activeAgentEpoch_ == verifiedEpoch);
+}
+
+bool DesktopAgentClient::VerifyEvtPeer(HANDLE pipe, uint64_t& verifiedEpochOut)
+{
+    if (options_.allowUnboundTestEvtPeer) {
+        if (!VerifyNamedPipeClientSameUser(pipe))
+            return Log(L"desktop agent client: rejected Evt client with mismatched user SID"), false;
+        return verifiedEpochOut = 0, true;
+    }
+    DWORD expectedPid = 0;
+    FILETIME expectedCreation{};
+    {
+        std::lock_guard lock(stateMutex_);
+        expectedPid = activeAgentPid_, expectedCreation = activeAgentCreationTime_, verifiedEpochOut = activeAgentEpoch_;
+    }
+    const std::wstring exePath = ModulePath();
+    const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
+    AgentPeerIdentity peer;
+    if (expectedPid == 0 || verifiedEpochOut == 0 || exePath.empty() || !VerifyNamedPipePeerProcess(pipe, true, exePath, requireNonElevated, peer) ||
+        (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) || peer.pid != expectedPid ||
+        CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
+        return Log(L"desktop agent client: rejected Evt client pid=%lu (expected %lu)", peer.pid, expectedPid), false;
+    }
+    std::lock_guard lock(stateMutex_);
+    return activeAgentPid_ == expectedPid && activeAgentEpoch_ == verifiedEpochOut;
+}
+
 void DesktopAgentClient::ServeEvtPipe(HANDLE pipe)
 {
-    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!event)
+    const winrt::handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, connCancel{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    if (!event || !connCancel)
         return;
     OVERLAPPED ov{};
-    ov.hEvent = event;
-    if (!ConnectNamedPipeOverlapped(pipe, ov, quitEvent_)) {
-        CloseHandle(event);
+    ov.hEvent = event.get();
+    if (!ConnectNamedPipeOverlapped(pipe, ov, quitEvent_))
         return;
-    }
     {
         std::lock_guard pipeLock(activeEvtPipeMutex_);
-        activeEvtPipe_ = pipe;
+        if (shutdownCalled_.load() || (quitEvent_ && WaitForSingleObject(quitEvent_, 0) != WAIT_TIMEOUT))
+            return;
+        activeEvtPipe_ = pipe, activeEvtCancelEvent_ = connCancel.get();
     }
     bool verified = false;
     uint64_t verifiedEpoch = 0;
-    while (WaitForSingleObject(quitEvent_, 0) == WAIT_TIMEOUT) {
+    while (WaitForSingleObject(connCancel.get(), 0) == WAIT_TIMEOUT && WaitForSingleObject(quitEvent_, 0) == WAIT_TIMEOUT) {
         std::string raw;
         bool disconnected = false;
-        if (!ReadPipeMessageOverlapped(pipe, ov, quitEvent_, raw, disconnected))
+        if (!ReadPipeMessageOverlapped(pipe, ov, connCancel.get(), raw, disconnected))
             break;
         if (!verified) {
-            if (options_.allowUnboundTestEvtPeer) {
-                if (!VerifyNamedPipeClientSameUser(pipe)) {
-                    Log(L"desktop agent client: rejected Evt client with mismatched user SID");
-                    break;
-                }
-            } else {
-                DWORD expectedPid = 0;
-                FILETIME expectedCreation{};
-                {
-                    std::lock_guard lock(stateMutex_);
-                    expectedPid = activeAgentPid_, expectedCreation = activeAgentCreationTime_, verifiedEpoch = activeAgentEpoch_;
-                }
-                const std::wstring exePath = ModulePath();
-                const bool requireNonElevated = !options_.allowSameProcessPeer && options_.launchSupervisor && IsElevatedProcess();
-                AgentPeerIdentity peer;
-                if (expectedPid == 0 || verifiedEpoch == 0 || exePath.empty() || !VerifyNamedPipePeerProcess(pipe, true, exePath, requireNonElevated, peer) ||
-                    (!options_.allowSameProcessPeer && peer.pid == GetCurrentProcessId()) || peer.pid != expectedPid ||
-                    CompareFileTime(&peer.creationTime, &expectedCreation) != 0) {
-                    Log(L"desktop agent client: rejected Evt client pid=%lu (expected %lu)", peer.pid, expectedPid);
-                    break;
-                }
-            }
-            verified = true;
-        } else if (!options_.allowUnboundTestEvtPeer) {
-            std::lock_guard lock(stateMutex_);
-            if (activeAgentPid_ == 0 || activeAgentEpoch_ != verifiedEpoch)
+            if (!VerifyEvtPeer(pipe, verifiedEpoch))
                 break;
+            verified = true;
         }
         AgentEventMessage evt;
-        AgentEventReply reply;
-        if (!ValidateAndParseAgentEvent(raw, evt))
-            reply.ok = false, reply.error = L"invalid_event";
-        else
-            reply = HandleEvent(evt);
-        const std::string encoded = SerializeAgentEventReply(reply);
-        if (!WritePipeMessageOverlapped(pipe, ov, quitEvent_, encoded))
+        if (!ValidateAndParseAgentEvent(raw, evt)) {
+            if (!WritePipeMessageOverlapped(pipe, ov, connCancel.get(), SerializeAgentEventReply(AgentEventReply{false, false, {}, L"invalid_event"})))
+                break;
+            continue;
+        }
+        if (options_.onBeforeHandleEventForTest)
+            options_.onBeforeHandleEventForTest();
+        bool epochValid = true;
+        const AgentEventReply reply = HandleEvent(evt, verifiedEpoch, epochValid);
+        if (!epochValid || !WritePipeMessageOverlapped(pipe, ov, connCancel.get(), SerializeAgentEventReply(reply)))
             break;
     }
     {
         std::lock_guard pipeLock(activeEvtPipeMutex_);
         if (activeEvtPipe_ == pipe)
-            activeEvtPipe_ = INVALID_HANDLE_VALUE;
+            activeEvtPipe_ = INVALID_HANDLE_VALUE, activeEvtCancelEvent_ = nullptr;
     }
     DisconnectNamedPipe(pipe);
-    CloseHandle(event);
 }
 
-AgentEventReply DesktopAgentClient::HandleEvent(const AgentEventMessage& evt)
+bool DesktopAgentClient::ApplyTraySnapshot(const AgentTraySnapshot& snapshot, uint64_t verifiedEpoch, bool& yieldChangedOut)
 {
+    std::lock_guard lock(stateMutex_);
+    if (!IsEvtEpochValidLocked(verifiedEpoch))
+        return false;
+    yieldChangedOut = (yielded_ != snapshot.yielded) || (yieldReason_ != snapshot.yieldReason);
+    yielded_ = snapshot.yielded, yieldReason_ = snapshot.yieldReason;
+    std::map<uint64_t, std::shared_ptr<const IconImage>> nextCache;
+    std::vector<CachedIcon> nextIcons;
+    nextIcons.reserve(snapshot.icons.size());
+    for (const auto& dto : snapshot.icons) {
+        std::shared_ptr<const IconImage> cached;
+        if (dto.imageVersion != 0) {
+            if (const auto it = imageCache_.find(dto.imageVersion); it != imageCache_.end())
+                cached = it->second;
+        }
+        HostIcon hostIcon = ConvertDtoToHostIcon(dto, cached);
+        if (hostIcon.image && hostIcon.imageVersion != 0)
+            nextCache[hostIcon.imageVersion] = hostIcon.image;
+        nextIcons.push_back({std::move(hostIcon), dto.flashing});
+    }
+    std::ranges::sort(nextIcons, [](const CachedIcon& a, const CachedIcon& b) { return a.icon.added < b.icon.added; });
+    imageCache_ = std::move(nextCache), icons_ = std::move(nextIcons);
+    return true;
+}
+
+AgentEventReply DesktopAgentClient::HandleEvent(const AgentEventMessage& evt, uint64_t verifiedEpoch, bool& epochValidOut)
+{
+    epochValidOut = true;
     AgentEventReply reply;
     reply.ok = true;
     switch (evt.type) {
     case AgentEventType::TraySnapshot: {
         bool yieldChanged = false;
-        {
-            std::lock_guard lock(stateMutex_);
-            yieldChanged = (yielded_ != evt.snapshot.yielded) || (yieldReason_ != evt.snapshot.yieldReason);
-            yielded_ = evt.snapshot.yielded;
-            yieldReason_ = evt.snapshot.yieldReason;
-
-            std::map<uint64_t, std::shared_ptr<const IconImage>> nextCache;
-            std::vector<CachedIcon> nextIcons;
-            nextIcons.reserve(evt.snapshot.icons.size());
-            for (const auto& dto : evt.snapshot.icons) {
-                std::shared_ptr<const IconImage> cached;
-                if (dto.imageVersion != 0) {
-                    const auto it = imageCache_.find(dto.imageVersion);
-                    if (it != imageCache_.end())
-                        cached = it->second;
-                }
-                HostIcon hostIcon = ConvertDtoToHostIcon(dto, cached);
-                if (hostIcon.image && hostIcon.imageVersion != 0)
-                    nextCache[hostIcon.imageVersion] = hostIcon.image;
-                nextIcons.push_back({std::move(hostIcon), dto.flashing});
-            }
-            std::ranges::sort(nextIcons, [](const CachedIcon& a, const CachedIcon& b) { return a.icon.added < b.icon.added; });
-            imageCache_ = std::move(nextCache);
-            icons_ = std::move(nextIcons);
-        }
+        if (!ApplyTraySnapshot(evt.snapshot, verifiedEpoch, yieldChanged))
+            return epochValidOut = false, reply.ok = false, reply;
         if (callbacks_.onTrayChanged)
             callbacks_.onTrayChanged();
         if (yieldChanged && callbacks_.onYieldChanged)
@@ -502,42 +571,48 @@ AgentEventReply DesktopAgentClient::HandleEvent(const AgentEventMessage& evt)
         bool yieldChanged = false;
         {
             std::lock_guard lock(stateMutex_);
+            if (!IsEvtEpochValidLocked(verifiedEpoch))
+                return epochValidOut = false, reply.ok = false, reply;
             yieldChanged = (yielded_ != evt.yielded) || (yieldReason_ != evt.yieldReason);
-            yielded_ = evt.yielded;
-            yieldReason_ = evt.yieldReason;
+            yielded_ = evt.yielded, yieldReason_ = evt.yieldReason;
         }
         if (yieldChanged && callbacks_.onYieldChanged)
             callbacks_.onYieldChanged();
         return reply;
     }
     case AgentEventType::DragOver: {
+        {
+            std::lock_guard lock(stateMutex_);
+            if (!IsEvtEpochValidLocked(verifiedEpoch))
+                return epochValidOut = false, reply.ok = false, reply;
+        }
         if (callbacks_.onDragOver) {
             const AgentDragOverResult res = callbacks_.onDragOver(evt.pt);
-            reply.allow = res.allow;
-            reply.key = res.key;
+            reply.allow = res.allow, reply.key = res.key;
         }
         return reply;
     }
-    case AgentEventType::DragLeave:
+    case AgentEventType::DragLeave: {
+        {
+            std::lock_guard lock(stateMutex_);
+            if (!IsEvtEpochValidLocked(verifiedEpoch))
+                return epochValidOut = false, reply.ok = false, reply;
+        }
         if (callbacks_.onDragLeave)
             callbacks_.onDragLeave();
         return reply;
+    }
     case AgentEventType::Drop: {
-        if (evt.opId != 0) {
+        {
             std::lock_guard lock(stateMutex_);
-            if (!seenDropOps_.MarkSeenIfNew(evt.opId)) {
-                reply.allow = false;
-                return reply;
-            }
+            if (!IsEvtEpochValidLocked(verifiedEpoch))
+                return epochValidOut = false, reply.ok = false, reply;
+            if (evt.opId != 0 && !seenDropOps_.MarkSeenIfNew(evt.opId))
+                return reply.allow = false, reply;
         }
-        if (callbacks_.onDropFilesAccepted) {
-            reply.allow = callbacks_.onDropFilesAccepted(evt.key, evt.paths);
-        } else if (callbacks_.onDropFiles) {
-            callbacks_.onDropFiles(evt.key, evt.paths);
-            reply.allow = true;
-        } else {
-            reply.allow = false;
-        }
+        reply.allow = callbacks_.onDropFilesAccepted ? callbacks_.onDropFilesAccepted(evt.key, evt.paths) :
+                      callbacks_.onDropFiles         ? (callbacks_.onDropFiles(evt.key, evt.paths), true) :
+                                                       false;
         return reply;
     }
     }
@@ -629,31 +704,9 @@ bool DesktopAgentClient::SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut)
 
 void DesktopAgentClient::ReplayDesiredState()
 {
-    bool hosting = false;
-    bool hasAnchor = false;
-    RECT anchor{};
-    bool hasDropBars = false;
-    {
-        std::lock_guard lock(stateMutex_);
-        hosting = hosting_;
-        hasAnchor = hasAnchor_;
-        anchor = anchor_;
-        hasDropBars = !desiredDropBars_.empty();
-    }
-    if (hosting) {
-        AgentCommandMessage cmd;
-        cmd.type = AgentCommandType::SetTrayHosting;
-        cmd.hosting = true;
-        SendCommand(cmd, nullptr, kCmdTimeoutMs);
-    }
-    if (hasAnchor) {
-        AgentCommandMessage cmd;
-        cmd.type = AgentCommandType::SetTrayPlaces;
-        cmd.anchor = anchor;
-        SendCommand(cmd, nullptr, kFastCmdTimeoutMs);
-    }
-    if (hasDropBars)
-        FlushDropBars();
+    FlushTrayHosting();
+    FlushPlaces();
+    FlushDropBars();
 }
 
 void DesktopAgentClient::ClearAgentStateOnExit()
@@ -669,6 +722,10 @@ void DesktopAgentClient::ClearAgentStateOnExit()
         activeAgentPid_ = 0;
         activeAgentCreationTime_ = {};
         ++activeAgentEpoch_;
+        confirmedHostingSeq_ = 0;
+        confirmedHostingEpoch_ = 0;
+        confirmedAnchorSeq_ = 0;
+        confirmedAnchorEpoch_ = 0;
         confirmedDropBars_.clear();
         confirmedDropBarsSeq_ = 0;
         confirmedDropBarsEpoch_ = 0;
@@ -678,9 +735,9 @@ void DesktopAgentClient::ClearAgentStateOnExit()
         imageCache_.clear();
         yielded_ = false;
         yieldReason_ = TrayHostYieldReason::None;
-    }
-    {
         std::lock_guard evtLock(activeEvtPipeMutex_);
+        if (activeEvtCancelEvent_)
+            SetEvent(activeEvtCancelEvent_);
         if (activeEvtPipe_ != INVALID_HANDLE_VALUE)
             CancelIoEx(activeEvtPipe_, nullptr);
     }
