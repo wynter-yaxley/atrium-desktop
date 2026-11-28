@@ -19,9 +19,12 @@ struct DesktopAgentHostOptions {
     std::function<void(const AgentCommandMessage&)> onBeforeStaCommandForTest;
     bool failOverlaySyncForTest = false;
     std::function<void(std::function<void()> pushSnapshot, std::function<void()> pushYield)> onReadyForTest;
+    std::wstring nonce;
+    bool failOverlayShowForTest = false;
 };
 
-int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride = nullptr, const wchar_t* evtPipeOverride = nullptr);
+int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride = nullptr, const wchar_t* evtPipeOverride = nullptr,
+                    const wchar_t* nonceOverride = nullptr);
 int RunDesktopAgentWithOptions(DWORD corePid, uint64_t generation, HINSTANCE instance, const DesktopAgentHostOptions& options);
 
 } // namespace atrium

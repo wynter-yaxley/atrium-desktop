@@ -2,6 +2,7 @@
 #include "shell/shell_launch.h"
 
 #include "log.h"
+#include "shell/process_integrity.h"
 #include "shell/shell_taskbar.h"
 
 #include <objbase.h>
@@ -145,7 +146,62 @@ LaunchResult ExecuteDirect(const LaunchRequest& request, bool forceRunAs)
     return LaunchResult{LaunchOutcome::Succeeded, 0, request.captureProcess ? sei.hProcess : nullptr};
 }
 
-LaunchResult ExecuteExplorerComMedium(const LaunchRequest& request)
+LaunchResult LaunchViaExplorerToken(const LaunchRequest& request)
+{
+    if (request.target.empty() || request.kind != LaunchTargetKind::Executable || !request.verb.empty())
+        return LaunchResult{LaunchOutcome::Failed, ERROR_INVALID_PARAMETER, nullptr};
+
+    const HWND shellWindow = GetShellWindow();
+    DWORD shellPid = 0;
+    if (shellWindow)
+        GetWindowThreadProcessId(shellWindow, &shellPid);
+    if (!shellWindow || !shellPid || IsWindowElevatedOrProtected(shellWindow))
+        return LaunchResult{LaunchOutcome::Failed, ERROR_ACCESS_DENIED, nullptr};
+
+    const winrt::handle shellProc{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shellPid)};
+    if (!shellProc)
+        return LaunchResult{LaunchOutcome::Failed, GetLastError(), nullptr};
+
+    const ProcessSecurityContext& selfSec = SelfSecurityContext();
+    const ProcessSecurityContext shellSec = QueryProcessSecurityContext(shellProc.get());
+    if (!selfSec.valid || !shellSec.valid || shellSec.isElevated || shellSec.integrityRid != SECURITY_MANDATORY_MEDIUM_RID ||
+        shellSec.sessionId != selfSec.sessionId || _wcsicmp(shellSec.userSid.c_str(), selfSec.userSid.c_str()) != 0) {
+        return LaunchResult{LaunchOutcome::Failed, ERROR_ACCESS_DENIED, nullptr};
+    }
+
+    winrt::handle shellToken;
+    if (!OpenProcessToken(shellProc.get(), TOKEN_DUPLICATE, shellToken.put()))
+        return LaunchResult{LaunchOutcome::Failed, GetLastError(), nullptr};
+
+    winrt::handle primaryToken;
+    constexpr DWORD kTokenAccess = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID;
+    if (!DuplicateTokenEx(shellToken.get(), kTokenAccess, nullptr, SecurityImpersonation, TokenPrimary, primaryToken.put()))
+        return LaunchResult{LaunchOutcome::Failed, GetLastError(), nullptr};
+
+    std::wstring cmdLine = L"\"" + request.target + L"\"" + (request.parameters.empty() ? L"" : L" " + request.parameters);
+    cmdLine.push_back(L'\0');
+
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = static_cast<WORD>(request.show);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessWithTokenW(primaryToken.get(), 0, request.target.c_str(), cmdLine.data(), 0, nullptr,
+                                 request.workingDirectory.empty() ? nullptr : request.workingDirectory.c_str(), &si, &pi)) {
+        const DWORD err = GetLastError();
+        Log(L"launch: CreateProcessWithTokenW failed for '%s' (%lu); falling back to Explorer COM", request.target.c_str(), err);
+        return LaunchResult{LaunchOutcome::Failed, err, nullptr};
+    }
+
+    CloseHandle(pi.hThread);
+    HANDLE processOut = nullptr;
+    if (request.captureProcess)
+        processOut = pi.hProcess;
+    else
+        CloseHandle(pi.hProcess);
+    return LaunchResult{LaunchOutcome::Succeeded, 0, processOut};
+}
+
+LaunchResult ExecuteExplorerComDispatch(const LaunchRequest& request)
 {
     const HWND shellWindow = GetShellWindow();
     if (!shellWindow)
@@ -211,6 +267,16 @@ LaunchResult ExecuteExplorerComMedium(const LaunchRequest& request)
     if (hr == RPC_E_TIMEOUT || hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT))
         return LaunchResult{LaunchOutcome::TimedOutOrUnknown, ERROR_TIMEOUT, nullptr};
     return LaunchResult{LaunchOutcome::Failed, FAILED(hr) ? static_cast<DWORD>(hr) : ERROR_GEN_FAILURE, nullptr};
+}
+
+LaunchResult ExecuteExplorerComMedium(const LaunchRequest& request)
+{
+    if (request.captureProcess && request.kind == LaunchTargetKind::Executable && request.verb.empty()) {
+        const LaunchResult tokenRes = LaunchViaExplorerToken(request);
+        if (tokenRes.outcome == LaunchOutcome::Succeeded)
+            return tokenRes;
+    }
+    return ExecuteExplorerComDispatch(request);
 }
 
 struct LaunchWaitState {

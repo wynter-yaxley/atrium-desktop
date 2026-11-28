@@ -49,18 +49,25 @@ uint64_t ParseGuardGenerationFromCommandLine()
     return generation;
 }
 
-DWORD VerifiedAtriumWindowPid(HWND window)
+struct AtriumWindowInfo {
+    DWORD pid = 0;
+    std::wstring imagePath;
+};
+
+AtriumWindowInfo VerifiedAtriumWindowInfo(HWND window)
 {
     if (!window)
-        return 0;
+        return {};
     DWORD pid = 0;
     GetWindowThreadProcessId(window, &pid);
     if (!pid)
-        return 0;
+        return {};
     const std::wstring image = ProcessImagePath(pid);
     const size_t slash = image.find_last_of(L"\\/");
     const std::wstring base = slash == std::wstring::npos ? image : image.substr(slash + 1);
-    return (!image.empty() && FoldCase(base) == L"atrium.exe") ? pid : 0;
+    if (!image.empty() && FoldCase(base) == L"atrium.exe")
+        return {pid, image};
+    return {};
 }
 
 bool AdvanceGenerationOrRelease(HANDLE mutex, int& exitCode, const wchar_t* reason)
@@ -83,14 +90,17 @@ bool SignalOtherOpenSettings(HWND other)
         return false;
     const std::wstring selfExe = ModulePath();
     const bool sameOrUnknown = !other || SameExecutableWindow(other, selfExe);
-    const DWORD expectedPid = (other && sameOrUnknown) ? VerifiedAtriumWindowPid(other) : 0;
+    const AtriumWindowInfo otherInfo = VerifiedAtriumWindowInfo(other);
+    if (!sameOrUnknown && otherInfo.imagePath.empty())
+        return false;
     LifecycleReply reply;
-    return SendLifecycleCommand(L"open-settings", {}, &reply, {}, 2000, expectedPid, sameOrUnknown ? selfExe : L"") && reply.ok;
+    return SendLifecycleCommand(L"open-settings", {}, &reply, {}, 2000, otherInfo.pid, sameOrUnknown ? selfExe : otherInfo.imagePath) && reply.ok;
 }
 
 bool QuitOtherInstance(HWND other, DWORD timeoutMs, const std::wstring& expectedExePath = {})
 {
-    DWORD pid = VerifiedAtriumWindowPid(other);
+    const AtriumWindowInfo otherInfo = VerifiedAtriumWindowInfo(other);
+    DWORD pid = otherInfo.pid;
     if (!pid) {
         LifecycleReply ping;
         if (SendLifecycleCommand(L"ping", {}, &ping, {}, 2000, 0, expectedExePath) && ping.ok)
@@ -204,7 +214,8 @@ std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch, HINSTANC
     }
     if (launch.desktopAgent)
         return launch.desktopAgentCorePid ?
-                   RunDesktopAgent(launch.desktopAgentCorePid, launch.desktopAgentGeneration, instance ? instance : GetModuleHandleW(nullptr)) :
+                   RunDesktopAgent(launch.desktopAgentCorePid, launch.desktopAgentGeneration, instance ? instance : GetModuleHandleW(nullptr), nullptr, nullptr,
+                                   launch.desktopAgentNonce.empty() ? nullptr : launch.desktopAgentNonce.c_str()) :
                    1;
     if (launch.guard)
         return launch.guardPid ? RunGuard(launch.guardPid, kHostClass, ParseGuardGenerationFromCommandLine()) : 1;
@@ -215,6 +226,22 @@ std::optional<int> HandleLaunchCommand(const CoreLaunchOptions& launch, HINSTANC
     if (!other)
         return 0;
     return QuitOtherInstance(other, 10000, selfExe) ? 0 : 1;
+}
+
+bool ReplaceOtherInstanceIfConfirmed(HWND other, bool same, const std::wstring& selfExe)
+{
+    if (!same && other &&
+        MessageBoxW(nullptr, Tr(L"Atrium is running from another location. Quit it and use the version in this folder?"), L"Atrium",
+                    MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) != IDYES) {
+        return false;
+    }
+    if (same || !other)
+        return QuitOtherInstance(other, 15000, selfExe);
+    const AtriumWindowInfo otherInfo = VerifiedAtriumWindowInfo(other);
+    if (!otherInfo.imagePath.empty())
+        return QuitOtherInstance(other, 15000, otherInfo.imagePath);
+    Log(L"core: refusing to replace other instance because its executable path could not be verified");
+    return false;
 }
 
 HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
@@ -246,12 +273,7 @@ HANDLE AcquireInstanceMutex(int& exitCode, bool replace)
         exitCode = 0;
         return nullptr;
     }
-    bool replaced = false;
-    if ((other || replace || err == ERROR_ACCESS_DENIED) &&
-        (same || !other ||
-         MessageBoxW(nullptr, Tr(L"Atrium is running from another location. Quit it and use the version in this folder?"), L"Atrium",
-                     MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES))
-        replaced = QuitOtherInstance(other, 15000, (same || !other) ? selfExe : L"");
+    const bool replaced = (other || replace || err == ERROR_ACCESS_DENIED) && ReplaceOtherInstanceIfConfirmed(other, same, selfExe);
     if (!replaced && replace && mutex && err == ERROR_ALREADY_EXISTS) {
         const DWORD wait = WaitForSingleObject(mutex, 15000);
         if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {

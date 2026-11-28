@@ -5,13 +5,17 @@
 #include "shell/tray_host.h"
 
 #include <windows.h>
+#include <objbase.h>
 #include <unknwn.h>
 #include <winrt/base.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
+#include <ranges>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -25,9 +29,45 @@ inline constexpr size_t kMaxAgentDropPaths = 64;
 inline constexpr size_t kMaxAgentPathLength = 4096;
 inline constexpr size_t kMaxAgentDropBars = 64;
 
-std::wstring DesktopAgentCommandPipeName(DWORD sessionId, DWORD corePid, uint64_t generation);
-std::wstring DesktopAgentEventPipeName(DWORD sessionId, DWORD corePid, uint64_t generation);
-DWORD CurrentProcessSessionId();
+inline std::wstring DesktopAgentCommandPipeName(DWORD sessionId, DWORD corePid, uint64_t generation)
+{
+    return L"\\\\.\\pipe\\Atrium.DesktopAgent.Cmd." + std::to_wstring(sessionId) + L"." + std::to_wstring(corePid) + L"." + std::to_wstring(generation);
+}
+
+inline std::wstring DesktopAgentEventPipeName(DWORD sessionId, DWORD corePid, uint64_t generation)
+{
+    return L"\\\\.\\pipe\\Atrium.DesktopAgent.Evt." + std::to_wstring(sessionId) + L"." + std::to_wstring(corePid) + L"." + std::to_wstring(generation);
+}
+
+inline DWORD CurrentProcessSessionId()
+{
+    DWORD session = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    return session;
+}
+
+inline std::wstring GenerateAgentSpawnNonce()
+{
+    static constexpr wchar_t kHex[] = L"0123456789abcdef";
+    std::array<uint8_t, 16> bytes{};
+    GUID g{};
+    if (SUCCEEDED(CoCreateGuid(&g))) {
+        std::memcpy(bytes.data(), &g, bytes.size());
+    } else {
+        static std::atomic<uint64_t> fallbackCounter{1};
+        const uint64_t hi = GetTickCount64() ^ (static_cast<uint64_t>(GetCurrentProcessId()) << 32);
+        const uint64_t lo = fallbackCounter.fetch_add(1, std::memory_order_relaxed) * 0x9E3779B97F4A7C15ULL;
+        std::memcpy(bytes.data(), &hi, 8);
+        std::memcpy(bytes.data() + 8, &lo, 8);
+    }
+    std::wstring out;
+    out.reserve(32);
+    for (uint8_t b : bytes) {
+        out.push_back(kHex[(b >> 4) & 0xF]);
+        out.push_back(kHex[b & 0xF]);
+    }
+    return out;
+}
 
 struct AgentBarRect {
     uint64_t id = 0;
@@ -88,6 +128,7 @@ struct AgentCommandReply {
     HostSendStatus sendStatus = HostSendStatus::NotSent;
     bool higherIntegrity = false;
     std::wstring error;
+    std::wstring nonce;
 };
 
 enum class AgentEventType { TraySnapshot, TrayYield, DragOver, DragLeave, Drop };
@@ -110,8 +151,23 @@ struct AgentEventReply {
     std::wstring error;
 };
 
-bool IsValidAgentTrayIconDto(const AgentTrayIconDto& icon);
-bool IsValidAgentDropPayload(const std::wstring& key, const std::vector<std::wstring>& paths);
+inline bool IsValidAgentTrayIconDto(const AgentTrayIconDto& icon)
+{
+    if (icon.key.empty() || icon.key.size() > kMaxAgentPathLength || icon.tip.size() > kMaxAgentPathLength || icon.exe.size() > kMaxAgentPathLength)
+        return false;
+    if (icon.width == 0 && icon.height == 0)
+        return icon.pixels.empty();
+    if (icon.width <= 0 || icon.height <= 0 || icon.width > kMaxAgentIconDimension || icon.height > kMaxAgentIconDimension)
+        return false;
+    return icon.pixels.size() == static_cast<size_t>(icon.width) * static_cast<size_t>(icon.height) * 4;
+}
+
+inline bool IsValidAgentDropPayload(const std::wstring& key, const std::vector<std::wstring>& paths)
+{
+    if (key.empty() || key.size() > kMaxAgentPathLength || paths.empty() || paths.size() > kMaxAgentDropPaths)
+        return false;
+    return std::ranges::all_of(paths, [](const std::wstring& p) { return !p.empty() && p.size() <= kMaxAgentPathLength; });
+}
 
 std::string SerializeAgentCommand(const AgentCommandMessage& msg);
 bool ValidateAndParseAgentCommand(const std::string& raw, AgentCommandMessage& out);
@@ -303,7 +359,15 @@ HANDLE CreateSameUserNamedPipeServer(const std::wstring& pipeName, DWORD bufferS
 bool VerifyNamedPipeClientSameUser(HANDLE pipe);
 bool VerifyNamedPipePeerProcess(HANDLE pipe, bool isServerSide, const std::wstring& expectedImagePath, bool requireNonElevated, AgentPeerIdentity& out,
                                 winrt::handle* procOut = nullptr);
-bool VerifyLaunchedProcessMatchesPeer(HANDLE launchedProc, const AgentPeerIdentity& peer);
+inline bool VerifyLaunchedProcessMatchesPeer(HANDLE launchedProc, const AgentPeerIdentity& peer)
+{
+    if (!launchedProc || launchedProc == INVALID_HANDLE_VALUE || !peer.valid || peer.pid == 0)
+        return false;
+    const DWORD launchedPid = GetProcessId(launchedProc);
+    FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
+    return launchedPid != 0 && peer.pid == launchedPid && GetProcessTimes(launchedProc, &creation, &exitTime, &kernelTime, &userTime) &&
+           CompareFileTime(&peer.creationTime, &creation) == 0;
+}
 bool ConnectNamedPipeOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent);
 bool ReadPipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeoutMs, std::string& messageOut, bool& disconnectedOut);
 inline bool ReadPipeMessageOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, std::string& messageOut, bool& disconnectedOut)

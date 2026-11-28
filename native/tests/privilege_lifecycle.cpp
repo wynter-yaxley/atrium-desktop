@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace json = winrt::Windows::Data::Json;
@@ -383,30 +384,22 @@ void CheckLifecycleAndSettingsServers()
     Check(SendLifecycleCommand(L"ping", {}, &pingReply, lifecyclePipe, 2000, selfPid, selfExe) && pingReply.ok && pingReply.pong && pingReply.pid == selfPid &&
               pingReply.privilegeMode == L"standard" && !pingReply.canDeElevate,
           "LifecycleServer ping succeeds with SQOS + server identity verification while SettingsServer client is open");
-
     LifecycleReply exeOnlyReply;
     Check(SendLifecycleCommand(L"ping", {}, &exeOnlyReply, lifecyclePipe, 2000, 0, selfExe) && exeOnlyReply.ok && exeOnlyReply.pong,
           "LifecycleServer ping succeeds when verifying expectedExePath without explicit PID");
-
-    LifecycleReply badPidReply;
-    Check(!SendLifecycleCommand(L"ping", {}, &badPidReply, lifecyclePipe, 500, selfPid + 1, selfExe),
-          "SendLifecycleCommand rejects mismatched expectedPid before sending request");
-
-    LifecycleReply badExeReply;
-    Check(!SendLifecycleCommand(L"ping", {}, &badExeReply, lifecyclePipe, 500, 0, L"C:\\invalid\\NotAtrium.exe"),
-          "SendLifecycleCommand rejects mismatched expectedExePath before sending request");
-
-    LifecycleReply defaultExeReply;
-    Check(!SendLifecycleCommand(L"ping", {}, &defaultExeReply, lifecyclePipe, 500),
-          "SendLifecycleCommand rejects non-Atrium.exe server when expectedExePath defaults to Atrium.exe");
-
-    LifecycleReply pidWithBadExeReply;
-    Check(!SendLifecycleCommand(L"ping", {}, &pidWithBadExeReply, lifecyclePipe, 500, selfPid, L"C:\\invalid\\NotAtrium.exe"),
-          "SendLifecycleCommand rejects matching expectedPid when expectedExePath mismatches");
-
-    LifecycleReply pidWithDefaultExeReply;
-    Check(!SendLifecycleCommand(L"ping", {}, &pidWithDefaultExeReply, lifecyclePipe, 500, selfPid, L""),
-          "SendLifecycleCommand rejects matching expectedPid on non-Atrium.exe server when expectedExePath is empty");
+    const std::wstring otherDirSameExe = L"C:\\OtherDir\\" + fs::path(selfExe).filename().wstring();
+    for (const auto& [expPid, expPath, msg] : std::vector<std::tuple<DWORD, std::wstring, const char*>>{
+             {selfPid + 1, selfExe, "SendLifecycleCommand rejects mismatched expectedPid before sending request"},
+             {0, L"C:\\invalid\\NotAtrium.exe", "SendLifecycleCommand rejects mismatched expectedExePath before sending request"},
+             {0, L"", "SendLifecycleCommand rejects non-Atrium.exe server when expectedExePath defaults to Atrium.exe"},
+             {selfPid, L"C:\\invalid\\NotAtrium.exe", "SendLifecycleCommand rejects matching expectedPid when expectedExePath mismatches"},
+             {selfPid, L"", "SendLifecycleCommand rejects matching expectedPid on non-Atrium.exe server when expectedExePath is empty"},
+             {0, otherDirSameExe, "SendLifecycleCommand rejects different-directory path with matching basename when expectedPid=0"},
+             {selfPid, otherDirSameExe, "SendLifecycleCommand rejects different-directory path with matching basename even when expectedPid == selfPid"},
+         }) {
+        LifecycleReply rejected;
+        Check(!SendLifecycleCommand(L"ping", {}, &rejected, lifecyclePipe, 500, expPid, expPath), msg);
+    }
 
     LifecycleReply openReply;
     Check(SendLifecycleCommand(L"open-settings", L"widgets", &openReply, lifecyclePipe, 2000, selfPid, selfExe) && openReply.ok &&
@@ -600,6 +593,18 @@ void CheckDesktopAgentLaunchArgs()
         Check(badGen.desktopAgentGeneration == 0, "--agent-gen 99xyz leaves desktopAgentGeneration=0");
         Check(trailingGen.desktopAgentGeneration == 0, "trailing --agent-gen leaves desktopAgentGeneration=0");
         Check(guardGen.guard && guardGen.guardPid == 4242 && guardGen.guardGeneration == 77, "--guard-gen 77 parses guardGeneration");
+    }
+    {
+        const CoreLaunchOptions validNonce = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-nonce", L"0123456789abcdefABCDEF"});
+        const CoreLaunchOptions badHexNonce = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-nonce", L"01234567zzzz"});
+        const CoreLaunchOptions tooLongNonce = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-nonce", std::wstring(65, L'a')});
+        const CoreLaunchOptions emptyNonce = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-nonce", L""});
+        const CoreLaunchOptions trailingNonce = ParseCoreLaunchOptions({L"Atrium.exe", L"--agent-nonce"});
+        Check(validNonce.desktopAgentNonce == L"0123456789abcdefABCDEF", "--agent-nonce accepts valid ASCII hex token");
+        Check(badHexNonce.desktopAgentNonce.empty(), "--agent-nonce rejects non-hex characters");
+        Check(tooLongNonce.desktopAgentNonce.empty(), "--agent-nonce rejects tokens longer than 64 chars");
+        Check(emptyNonce.desktopAgentNonce.empty(), "--agent-nonce rejects empty token");
+        Check(trailingNonce.desktopAgentNonce.empty(), "trailing --agent-nonce leaves desktopAgentNonce empty");
     }
 }
 

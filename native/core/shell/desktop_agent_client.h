@@ -83,7 +83,10 @@ private:
 
     void SupervisorLoop();
     bool SpawnAndConnect(winrt::handle& procOut, DWORD& pidOut);
+    int TryAttachCmdPeer(HANDLE pipe, const std::wstring& exePath, const std::wstring& spawnNonce, const FILETIME& spawnFloor, HANDLE launchedHandle,
+                         DWORD launchedPid, const FILETIME& launchedCreation, bool requireNonElevated, winrt::handle& procOut, DWORD& pidOut);
     void ReplayDesiredState();
+    void FlushDropBars();
     void ClearAgentStateOnExit();
     SendCommandOutcome SendCommand(const AgentCommandMessage& cmd, AgentCommandReply* replyOut, DWORD timeoutMs);
     void CloseCmdPipeLocked();
@@ -111,12 +114,15 @@ private:
     RECT anchor_{};
     std::vector<AgentBarRect> desiredDropBars_;
     std::vector<AgentBarRect> confirmedDropBars_;
+    uint64_t desiredDropBarsSeq_ = 0;
+    uint64_t confirmedDropBarsSeq_ = 0;
     bool yielded_ = false;
     TrayHostYieldReason yieldReason_ = TrayHostYieldReason::None;
     std::vector<CachedIcon> icons_;
     std::map<uint64_t, std::shared_ptr<const IconImage>> imageCache_;
     RecentOpTracker seenDropOps_;
 
+    std::mutex dropBarsSendMutex_;
     std::mutex cmdPipeMutex_;
     HANDLE cmdPipe_ = INVALID_HANDLE_VALUE;
 

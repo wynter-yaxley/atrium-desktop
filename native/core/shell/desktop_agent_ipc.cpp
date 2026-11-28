@@ -331,8 +331,16 @@ bool WaitOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeout
     const DWORD wait = WaitForMultipleObjects(quitEvent ? 2U : 1U, handles, FALSE, timeoutMs);
     if (wait != WAIT_OBJECT_0) {
         CancelIoEx(pipe, &ov);
-        GetOverlappedResult(pipe, &ov, &bytes, TRUE);
-        error = (wait == WAIT_TIMEOUT) ? ERROR_TIMEOUT : ERROR_OPERATION_ABORTED;
+        if (GetOverlappedResult(pipe, &ov, &bytes, TRUE)) {
+            error = ERROR_SUCCESS;
+            return true;
+        }
+        const DWORD resErr = GetLastError();
+        if (resErr == ERROR_MORE_DATA) {
+            error = ERROR_MORE_DATA;
+            return true;
+        }
+        error = (resErr == ERROR_OPERATION_ABORTED) ? ((wait == WAIT_TIMEOUT) ? ERROR_TIMEOUT : ERROR_OPERATION_ABORTED) : resErr;
         return false;
     }
     error = GetOverlappedResult(pipe, &ov, &bytes, FALSE) ? ERROR_SUCCESS : GetLastError();
@@ -395,41 +403,7 @@ bool VerifyConnectedServerSameUser(HANDLE pipe)
     return true;
 }
 
-std::wstring MakePipeName(const wchar_t* kind, DWORD sessionId, DWORD corePid, uint64_t generation)
-{
-    return std::wstring(L"\\\\.\\pipe\\Atrium.DesktopAgent.") + kind + L"." + std::to_wstring(sessionId) + L"." + std::to_wstring(corePid) + L"." +
-           std::to_wstring(generation);
-}
-
 } // namespace
-
-DWORD CurrentProcessSessionId()
-{
-    DWORD session = 0;
-    return ProcessIdToSessionId(GetCurrentProcessId(), &session), session;
-}
-
-std::wstring DesktopAgentCommandPipeName(DWORD sessionId, DWORD corePid, uint64_t generation) { return MakePipeName(L"Cmd", sessionId, corePid, generation); }
-std::wstring DesktopAgentEventPipeName(DWORD sessionId, DWORD corePid, uint64_t generation) { return MakePipeName(L"Evt", sessionId, corePid, generation); }
-
-bool IsValidAgentTrayIconDto(const AgentTrayIconDto& icon)
-{
-    if (icon.key.empty() || icon.key.size() > kMaxAgentPathLength || icon.tip.size() > kMaxAgentPathLength || icon.exe.size() > kMaxAgentPathLength) {
-        return false;
-    }
-    if (icon.width == 0 && icon.height == 0)
-        return icon.pixels.empty();
-    if (icon.width <= 0 || icon.height <= 0 || icon.width > kMaxAgentIconDimension || icon.height > kMaxAgentIconDimension)
-        return false;
-    return icon.pixels.size() == static_cast<size_t>(icon.width) * static_cast<size_t>(icon.height) * 4;
-}
-
-bool IsValidAgentDropPayload(const std::wstring& key, const std::vector<std::wstring>& paths)
-{
-    if (key.empty() || key.size() > kMaxAgentPathLength || paths.empty() || paths.size() > kMaxAgentDropPaths)
-        return false;
-    return std::ranges::all_of(paths, [](const std::wstring& p) { return !p.empty() && p.size() <= kMaxAgentPathLength; });
-}
 
 std::string SerializeAgentCommand(const AgentCommandMessage& msg)
 {
@@ -503,6 +477,8 @@ std::string SerializeAgentCommandReply(const AgentCommandReply& reply)
         SetBool(o, L"higherIntegrity", true);
     if (!reply.error.empty())
         SetStr(o, L"error", reply.error);
+    if (!reply.nonce.empty())
+        SetStr(o, L"nonce", reply.nonce);
     return JsonStringify(o);
 }
 
@@ -517,7 +493,7 @@ bool ValidateAndParseAgentCommandReply(const std::string& raw, AgentCommandReply
     std::wstring statusText;
     if (!ReadBool(o, L"ok", out.ok) || !ReadInt(o, L"pid", out.pid, false) || !ReadUint64(o, L"generation", out.generation, false) ||
         !ReadBool(o, L"higherIntegrity", out.higherIntegrity, false) || !ReadString(o, L"error", out.error, kMaxAgentPathLength, false) ||
-        !ReadString(o, L"status", statusText, 64, false)) {
+        !ReadString(o, L"nonce", out.nonce, 128, false) || !ReadString(o, L"status", statusText, 64, false)) {
         return false;
     }
     return statusText.empty() || FromWire(kSendStatusMap, statusText, out.sendStatus);
@@ -670,16 +646,6 @@ bool VerifyNamedPipePeerProcess(HANDLE pipe, bool isServerSide, const std::wstri
     return true;
 }
 
-bool VerifyLaunchedProcessMatchesPeer(HANDLE launchedProc, const AgentPeerIdentity& peer)
-{
-    if (!launchedProc || launchedProc == INVALID_HANDLE_VALUE || !peer.valid || peer.pid == 0)
-        return false;
-    const DWORD launchedPid = GetProcessId(launchedProc);
-    FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
-    return launchedPid != 0 && peer.pid == launchedPid && GetProcessTimes(launchedProc, &creation, &exitTime, &kernelTime, &userTime) &&
-           CompareFileTime(&peer.creationTime, &creation) == 0;
-}
-
 bool ConnectNamedPipeOverlapped(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent)
 {
     ResetEvent(ov.hEvent);
@@ -716,17 +682,26 @@ bool ReadPipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD t
     return !messageOut.empty();
 }
 
-bool WritePipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeoutMs, const std::string& message)
+bool WritePipeMessageTimed(HANDLE pipe, OVERLAPPED& ov, HANDLE quitEvent, DWORD timeoutMs, const std::string& message, bool* writeMayHaveSentOut = nullptr)
 {
+    if (writeMayHaveSentOut)
+        *writeMayHaveSentOut = false;
     if (message.size() > kMaxAgentMessageBytes)
         return false;
     ResetEvent(ov.hEvent);
     DWORD bytes = 0;
     if (!WriteFile(pipe, message.data(), static_cast<DWORD>(message.size()), &bytes, &ov)) {
         DWORD error = GetLastError();
-        if (error != ERROR_IO_PENDING || !WaitOverlapped(pipe, ov, quitEvent, timeoutMs, bytes, error))
+        if (error != ERROR_IO_PENDING)
             return false;
+        if (!WaitOverlapped(pipe, ov, quitEvent, timeoutMs, bytes, error)) {
+            if (writeMayHaveSentOut)
+                *writeMayHaveSentOut = (bytes > 0 || (error != ERROR_TIMEOUT && error != ERROR_OPERATION_ABORTED));
+            return false;
+        }
     }
+    if (writeMayHaveSentOut)
+        *writeMayHaveSentOut = true;
     return bytes == message.size();
 }
 
@@ -776,13 +751,17 @@ bool SendPipeRequestOverlapped(HANDLE pipe, const std::string& request, std::str
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
     OVERLAPPED ov{};
     ov.hEvent = event.get();
-    if (!WritePipeMessageTimed(pipe, ov, quitEvent, RemainingTimeout(deadline, timeoutMs), request))
-        return false;
+    bool writeCompleted = false;
+    const bool writeOk = WritePipeMessageTimed(pipe, ov, quitEvent, RemainingTimeout(deadline, timeoutMs), request, &writeCompleted);
     if (writeCompletedOut)
-        *writeCompletedOut = true;
-    bool disconnected = false;
+        *writeCompletedOut = writeCompleted;
+    if (!writeOk)
+        return false;
     const DWORD remaining = RemainingTimeout(deadline, timeoutMs);
-    return ReadPipeMessageTimed(pipe, ov, quitEvent, remaining > 0 ? remaining : 1, replyOut, disconnected);
+    if (remaining == 0)
+        return false;
+    bool disconnected = false;
+    return ReadPipeMessageTimed(pipe, ov, quitEvent, remaining, replyOut, disconnected);
 }
 
 bool SendNamedPipeOneShot(const std::wstring& pipeName, const std::string& request, std::string& replyOut, DWORD timeoutMs, HANDLE quitEvent)

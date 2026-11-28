@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cwchar>
@@ -25,6 +26,7 @@ struct CoreLaunchOptions {
     bool desktopAgent = false;
     DWORD desktopAgentCorePid = 0;
     uint64_t desktopAgentGeneration = 0;
+    std::wstring desktopAgentNonce;
 };
 
 namespace detail {
@@ -59,6 +61,12 @@ inline bool TryParseUint64(const std::wstring& token, uint64_t& out)
     return false;
 }
 
+inline bool IsValidHexToken(std::wstring_view token)
+{
+    return !token.empty() && token.size() <= 64 &&
+           std::ranges::all_of(token, [](wchar_t ch) { return (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F'); });
+}
+
 inline bool TryParseValueOption(const std::vector<std::wstring>& args, size_t& i, CoreLaunchOptions& options)
 {
     const std::wstring& arg = args[i];
@@ -89,6 +97,15 @@ inline bool TryParseValueOption(const std::vector<std::wstring>& args, size_t& i
         genOut = 0;
         if (i + 1 < args.size() && TryParseUint64(args[i + 1], genOut))
             ++i;
+        return true;
+    }
+    if (arg == L"--agent-nonce") {
+        options.desktopAgentNonce.clear();
+        if (i + 1 < args.size()) {
+            const std::wstring& value = args[++i];
+            if (IsValidHexToken(value))
+                options.desktopAgentNonce = value;
+        }
         return true;
     }
     return false;

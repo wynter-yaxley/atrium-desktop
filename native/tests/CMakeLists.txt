@@ -246,3 +246,8 @@ add_executable(desktop_agent_tests desktop_agent.cpp)
 target_link_libraries(desktop_agent_tests PRIVATE atrium_core_lib)
 add_test(NAME desktop_agent COMMAND desktop_agent_tests)
 set_tests_properties(desktop_agent PROPERTIES TIMEOUT 30)
+
+add_executable(desktop_agent_e2e_tests desktop_agent_e2e.cpp)
+target_link_libraries(desktop_agent_e2e_tests PRIVATE atrium_core_lib)
+add_test(NAME desktop_agent_e2e COMMAND desktop_agent_e2e_tests)
+set_tests_properties(desktop_agent_e2e PROPERTIES TIMEOUT 30)

@@ -655,7 +655,7 @@ void TestHostOversizedIconAndReconnectResync()
         phase1Done{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, phase2Ready{CreateEventW(nullptr, TRUE, FALSE, nullptr)},
         resyncSeen{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, hostReady{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     std::atomic_int dropAttempts{0};
-    std::atomic_bool sawYield{false}, sawResyncSnapshot{false};
+    std::atomic_bool sawResyncSnapshot{false};
     std::thread mockEvt([&] {
         for (int i = 0; i < 2; ++i) {
             const winrt::handle srv{CreateSameUserNamedPipeServer(evtPipe)};
@@ -683,13 +683,11 @@ void TestHostOversizedIconAndReconnectResync()
             AgentEventMessage evt;
             if (!ReadPipeMessageOverlapped(srv.get(), ov, stopEvt.get(), raw, disc) || !ValidateAndParseAgentEvent(raw, evt))
                 break;
-            if (evt.type == AgentEventType::TrayYield)
-                sawYield.store(true);
-            else if (evt.type == AgentEventType::TraySnapshot)
+            if (evt.type == AgentEventType::TraySnapshot)
                 sawResyncSnapshot.store(true);
             if (!WritePipeMessageOverlapped(srv.get(), ov, stopEvt.get(), SerializeAgentEventReply(AgentEventReply{true})))
                 break;
-            if (sawYield.load() && sawResyncSnapshot.load()) {
+            if (sawResyncSnapshot.load()) {
                 SetEvent(resyncSeen.get());
                 break;
             }
@@ -697,10 +695,15 @@ void TestHostOversizedIconAndReconnectResync()
         DisconnectNamedPipe(srv.get());
     });
 
-    std::function<void()> pushSnap, pushYield;
-    DesktopAgentHostOptions hostOpts{UniquePipe(L"ResyncCmd", 80), evtPipe, 5000, stopEvt.get(), {}, false, [&](auto s, auto y) {
-                                         pushSnap = std::move(s), pushYield = std::move(y), SetEvent(hostReady.get());
-                                     }};
+    std::function<void()> pushSnap;
+    DesktopAgentHostOptions hostOpts{UniquePipe(L"ResyncCmd", 80),
+                                     evtPipe,
+                                     5000,
+                                     stopEvt.get(),
+                                     {},
+                                     false,
+                                     [&](auto s, const auto&) {
+                                         pushSnap = std::move(s), SetEvent(hostReady.get()); }};
     std::atomic<int> hostExit{-1};
     std::thread hostThread([&] { hostExit.store(RunDesktopAgentWithOptions(GetCurrentProcessId(), 800, GetModuleHandleW(nullptr), hostOpts)); });
     Check(WaitForSingleObject(hostReady.get(), 3000) == WAIT_OBJECT_0, "resync test host ready");
@@ -708,11 +711,8 @@ void TestHostOversizedIconAndReconnectResync()
         pushSnap();
     Check(WaitForSingleObject(phase1Done.get(), 5000) == WAIT_OBJECT_0 && dropAttempts.load() == 2, "initial TraySnapshot exhausted 2 failed Evt attempts");
     Check(WaitForSingleObject(phase2Ready.get(), 3000) == WAIT_OBJECT_0, "phase 2 healthy Evt server ready");
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    if (pushYield)
-        pushYield();
-    Check(WaitForSingleObject(resyncSeen.get(), 5000) == WAIT_OBJECT_0 && sawYield.load() && sawResyncSnapshot.load(),
-          "Evt reconnect resyncs pending TraySnapshot via resyncNeeded_");
+    Check(WaitForSingleObject(resyncSeen.get(), 4000) == WAIT_OBJECT_0 && sawResyncSnapshot.load(),
+          "EvtPushLoop autonomously reconnects and resyncs TraySnapshot while idle");
     SetEvent(stopEvt.get());
     if (mockEvt.joinable())
         mockEvt.join();

@@ -2,6 +2,7 @@
 
 #include "log.h"
 #include "settings.h"
+#include "shell/desktop_agent_drop.h"
 #include "shell/desktop_agent_ipc.h"
 #include "shell/process_integrity.h"
 #include "shell/tray_host.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cwchar>
 #include <deque>
@@ -62,31 +64,6 @@ uint64_t ReadGenerationFile()
     return (errno == 0 && end != text.c_str() && *end == L'\0') ? static_cast<uint64_t>(val) : 0;
 }
 
-class DesktopAgentHostApp;
-
-struct AgentDropTarget : winrt::implements<AgentDropTarget, IDropTarget> {
-    DesktopAgentHostApp* app = nullptr;
-    uint64_t barId = 0;
-    bool hasFiles = false;
-    bool inDrag = false;
-    std::wstring lastKey;
-
-    AgentDropTarget(DesktopAgentHostApp* owner, uint64_t id) : app(owner), barId(id) {}
-    void ResetDrag() { hasFiles = false, inDrag = false, lastKey.clear(); }
-    void EvalEffect(POINTL pt, DWORD* effect);
-    HRESULT __stdcall DragEnter(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override
-    {
-        if (!effect)
-            return E_INVALIDARG;
-        FORMATETC fe{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        hasFiles = data && data->QueryGetData(&fe) == S_OK, inDrag = true, EvalEffect(pt, effect);
-        return S_OK;
-    }
-    HRESULT __stdcall DragOver(DWORD, POINTL pt, DWORD* effect) override { return effect ? (EvalEffect(pt, effect), S_OK) : E_INVALIDARG; }
-    HRESULT __stdcall DragLeave() override;
-    HRESULT __stdcall Drop(IDataObject* data, DWORD grfKeyState, POINTL pt, DWORD* effect) override;
-};
-
 struct DropOverlay {
     uint64_t id = 0;
     RECT rect{};
@@ -105,7 +82,7 @@ struct StaTaskState {
     winrt::handle done{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
 };
 
-class DesktopAgentHostApp {
+class DesktopAgentHostApp final : public IAgentDropHost {
 public:
     DesktopAgentHostApp(DWORD corePid, uint64_t generation, HINSTANCE instance, DesktopAgentHostOptions options)
         : corePid_(corePid),
@@ -115,19 +92,19 @@ public:
           quitEvent_(CreateEventW(nullptr, TRUE, FALSE, nullptr))
     {
     }
-    ~DesktopAgentHostApp() { Cleanup(); }
+    ~DesktopAgentHostApp() override { Cleanup(); }
     DesktopAgentHostApp(const DesktopAgentHostApp&) = delete;
     DesktopAgentHostApp& operator=(const DesktopAgentHostApp&) = delete;
 
     int Run();
-    AgentDragOverResult QueryDragOver(POINT pt)
+    AgentDragOverResult QueryDragOver(POINT pt) override
     {
         AgentEventMessage msg;
         msg.type = AgentEventType::DragOver, msg.pt = pt;
         AgentEventReply reply;
         return SendEvent(msg, reply, kDragOverTimeoutMs) ? AgentDragOverResult{reply.allow, std::move(reply.key)} : AgentDragOverResult{};
     }
-    void NotifyDragLeave(uint64_t barId)
+    void NotifyDragLeave(uint64_t barId) override
     {
         SetOverlayTransparentById(barId, true);
         AgentEventMessage msg;
@@ -135,7 +112,7 @@ public:
         AgentEventReply reply;
         SendEvent(msg, reply, kDropEventTimeoutMs);
     }
-    bool NotifyDropFiles(uint64_t barId, const std::wstring& key, const std::vector<std::wstring>& paths)
+    bool NotifyDropFiles(uint64_t barId, const std::wstring& key, const std::vector<std::wstring>& paths) override
     {
         SetOverlayTransparentById(barId, true);
         if (!IsValidAgentDropPayload(key, paths))
@@ -206,7 +183,7 @@ private:
     {
         AgentCommandReply reply;
         if (cmd.type == AgentCommandType::Ping)
-            return reply.ok = true, reply.pid = GetCurrentProcessId(), reply.generation = generation_, reply;
+            return reply.ok = true, reply.pid = GetCurrentProcessId(), reply.generation = generation_, reply.nonce = options_.nonce, reply;
         if (cmd.type == AgentCommandType::Quit)
             return RequestQuit(), reply.ok = true, reply;
         return PostStaCommand(cmd);
@@ -215,6 +192,8 @@ private:
     AgentCommandReply ExecuteStaCommand(const AgentCommandMessage& cmd);
     void DrainStaTasks();
     void EvtPushLoop();
+    void HandleIdleEvtReconnect(DWORD& resyncBackoffMs);
+    void RecordSentSnapshotAck(uint64_t sessionUsed, const AgentEventMessage& msg, bool deferred);
     void QueueEvtPush(AgentEventMessage msg, bool isSnapshot, bool deferred = false)
     {
         {
@@ -380,55 +359,6 @@ private:
     AgentEventMessage queuedSnapshot_, queuedYield_;
     std::thread cmdThread_, evtPushThread_;
 };
-
-void AgentDropTarget::EvalEffect(POINTL pt, DWORD* effect)
-{
-    const AgentDragOverResult res = (hasFiles && app) ? app->QueryDragOver(POINT{pt.x, pt.y}) : AgentDragOverResult{};
-    lastKey = res.key;
-    *effect = (hasFiles && res.allow && !res.key.empty()) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
-}
-
-HRESULT __stdcall AgentDropTarget::DragLeave()
-{
-    ResetDrag();
-    if (app)
-        app->NotifyDragLeave(barId);
-    return S_OK;
-}
-
-HRESULT __stdcall AgentDropTarget::Drop(IDataObject* data, DWORD, POINTL pt, DWORD* effect)
-{
-    if (!effect)
-        return E_INVALIDARG;
-    const bool files = hasFiles;
-    ResetDrag();
-    if (!app)
-        return *effect = DROPEFFECT_NONE, S_OK;
-    const AgentDragOverResult res = files ? app->QueryDragOver(POINT{pt.x, pt.y}) : AgentDragOverResult{};
-    app->NotifyDragLeave(barId);
-    FORMATETC fe{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    STGMEDIUM sm{};
-    if (!files || !res.allow || res.key.empty() || !data || FAILED(data->GetData(&fe, &sm)))
-        return *effect = DROPEFFECT_NONE, S_OK;
-    std::vector<std::wstring> paths;
-    if (auto* drop = static_cast<HDROP>(GlobalLock(sm.hGlobal))) {
-        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-        for (UINT i = 0; i < count && paths.size() < kMaxAgentDropPaths; ++i) {
-            const UINT len = DragQueryFileW(drop, i, nullptr, 0);
-            std::wstring path(len > 0 && len <= kMaxAgentPathLength ? len + 1 : 0, L'\0');
-            if (!path.empty()) {
-                if (const UINT copied = DragQueryFileW(drop, i, path.data(), static_cast<UINT>(path.size())); copied > 0 && copied <= kMaxAgentPathLength)
-                    path.resize(copied), paths.push_back(std::move(path));
-            }
-        }
-        GlobalUnlock(sm.hGlobal);
-    }
-    ReleaseStgMedium(&sm);
-    if (paths.empty())
-        return *effect = DROPEFFECT_NONE, S_OK;
-    const bool accepted = app->NotifyDropFiles(barId, res.key, paths);
-    return *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE, S_OK;
-}
 
 int DesktopAgentHostApp::Run()
 {
@@ -626,35 +556,76 @@ bool DesktopAgentHostApp::SendEvent(const AgentEventMessage& msg, AgentEventRepl
     return false;
 }
 
+void DesktopAgentHostApp::HandleIdleEvtReconnect(DWORD& resyncBackoffMs)
+{
+    bool connected = false;
+    {
+        std::lock_guard pipeLock(evtPipeMutex_);
+        connected = EnsureEvtConnectedLocked(500);
+    }
+    if (!connected) {
+        resyncBackoffMs = (std::min)(DWORD(2000), resyncBackoffMs * 2);
+        return;
+    }
+    bool postResync = false;
+    {
+        std::lock_guard lock(evtPushMutex_);
+        if (resyncNeeded_)
+            resyncNeeded_ = false, postResync = true;
+    }
+    if (postResync && hostHwnd_)
+        PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
+    resyncBackoffMs = 250;
+}
+
+void DesktopAgentHostApp::RecordSentSnapshotAck(uint64_t sessionUsed, const AgentEventMessage& msg, bool deferred)
+{
+    bool needResend = deferred;
+    {
+        std::lock_guard lock(imageVersionsMutex_);
+        snapshotAckState_.RecordAck(sessionUsed, msg.snapshot, true);
+        needResend = needResend || snapshotAckState_.HasUnconfirmedWithEmptyPixels(sessionUsed, msg.snapshot);
+    }
+    if (needResend && hostHwnd_)
+        PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
+}
+
 void DesktopAgentHostApp::EvtPushLoop()
 {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    DWORD resyncBackoffMs = 250;
     for (;;) {
         AgentEventMessage msg;
         bool deferred = false;
+        bool tryIdleReconnect = false;
         {
             std::unique_lock lock(evtPushMutex_);
-            evtPushCv_.wait(lock, [&] { return quitRequested_.load() || pendingSnapshot_ || pendingYield_; });
+            const auto hasWork = [&] { return quitRequested_.load() || pendingSnapshot_ || pendingYield_; };
+            if (!hasWork() && resyncNeeded_)
+                evtPushCv_.wait_for(lock, std::chrono::milliseconds(resyncBackoffMs), hasWork);
+            else
+                evtPushCv_.wait(lock, hasWork);
             if (quitRequested_.load())
                 break;
             if (pendingSnapshot_)
                 msg = std::move(queuedSnapshot_), deferred = pendingSnapshotDeferred_, pendingSnapshot_ = false, pendingSnapshotDeferred_ = false;
-            else
+            else if (pendingYield_)
                 msg = std::move(queuedYield_), pendingYield_ = false;
+            else if (resyncNeeded_)
+                tryIdleReconnect = true;
+        }
+        if (tryIdleReconnect) {
+            HandleIdleEvtReconnect(resyncBackoffMs);
+            continue;
         }
         AgentEventReply reply;
         uint64_t sessionUsed = 0;
         const bool ok = SendEvent(msg, reply, kTrayEventTimeoutMs, &sessionUsed);
-        if (msg.type == AgentEventType::TraySnapshot && ok && reply.ok) {
-            bool needResend = deferred;
-            {
-                std::lock_guard lock(imageVersionsMutex_);
-                snapshotAckState_.RecordAck(sessionUsed, msg.snapshot, true);
-                needResend = needResend || snapshotAckState_.HasUnconfirmedWithEmptyPixels(sessionUsed, msg.snapshot);
-            }
-            if (needResend && hostHwnd_)
-                PostMessageW(hostHwnd_, kMsgTraySnapshot, 0, 0);
-        } else if (!ok || !reply.ok) {
+        if (ok && reply.ok) {
+            resyncBackoffMs = 250;
+            if (msg.type == AgentEventType::TraySnapshot)
+                RecordSentSnapshotAck(sessionUsed, msg, deferred);
+        } else {
             std::lock_guard lock(evtPushMutex_);
             resyncNeeded_ = true;
         }
@@ -725,7 +696,8 @@ bool DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
         const int w = bar.rect.right - bar.rect.left, h = bar.rect.bottom - bar.rect.top;
         if (auto it = overlays_.find(bar.id); it != overlays_.end()) {
             it->second.rect = bar.rect;
-            if (!SetWindowPos(it->second.hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE))
+            if (options_.failOverlayShowForTest ||
+                !SetWindowPos(it->second.hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW))
                 allOk = false;
             continue;
         }
@@ -741,8 +713,12 @@ bool DesktopAgentHostApp::SyncDropBars(const std::vector<AgentBarRect>& bars)
             allOk = false;
             continue;
         }
-        if (!SetWindowPos(hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW))
+        if (options_.failOverlayShowForTest || !SetWindowPos(hwnd, HWND_TOPMOST, bar.rect.left, bar.rect.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+            RevokeDragDrop(hwnd);
+            DestroyWindow(hwnd);
             allOk = false;
+            continue;
+        }
         overlays_.emplace(bar.id, DropOverlay{bar.id, bar.rect, hwnd, std::move(target), true});
     }
     for (auto it = overlays_.begin(); it != overlays_.end();)
@@ -789,9 +765,11 @@ int RunDesktopAgentWithOptions(DWORD corePid, uint64_t generation, HINSTANCE ins
     return DesktopAgentHostApp(corePid, generation, instance, std::move(resolved)).Run();
 }
 
-int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride, const wchar_t* evtPipeOverride)
+int RunDesktopAgent(DWORD corePid, uint64_t generation, HINSTANCE instance, const wchar_t* cmdPipeOverride, const wchar_t* evtPipeOverride,
+                    const wchar_t* nonceOverride)
 {
     DesktopAgentHostOptions opts{cmdPipeOverride ? cmdPipeOverride : L"", evtPipeOverride ? evtPipeOverride : L""};
+    opts.nonce = nonceOverride ? nonceOverride : L"";
     return RunDesktopAgentWithOptions(corePid, generation, instance, opts);
 }
 
