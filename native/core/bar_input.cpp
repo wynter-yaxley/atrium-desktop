@@ -2,6 +2,7 @@
 #include "bar_entries.h"
 #include "clock.h"
 #include "render/ui_font.h"
+#include "shell/task_rules.h"
 #include "ui/surface.h"
 
 #include <shellapi.h>
@@ -163,8 +164,12 @@ void Bar::HandleButtonUp(UINT m, WPARAM w, POINT pt)
         if (m == WM_LBUTTONUP)
             ClickEntry(key);
     } else if (launch ? bool(onLaunch) : bool(onActivate)) {
-        // Starting an app (or another instance) hops its icon, as in the macOS Dock.
         auto t = std::ranges::find_if(items_, [&](const TaskItem& i) { return i.key == key; });
+        // Several windows: the click always presents their picker (as the Windows taskbar), so the
+        // window is chosen there; only a card in it brings a window forward.
+        if (m == WM_LBUTTONUP && t != items_.end() && ClickOpensWindowPicker(t->windows.size()) && ShowPreviewFor(key))
+            return;
+        // Starting an app (or another instance) hops its icon, as in the macOS Dock.
         if (t != items_.end() && (launch || t->windows.empty()))
             Bounce(key);
         (launch ? onLaunch : onActivate)(key);
@@ -257,10 +262,17 @@ LRESULT Bar::OnInput(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_LBUTTONDOWN:
     case WM_MBUTTONDOWN:
-        HideTooltip();
-        if (onPreviewClose)
-            onPreviewClose(); // a press on the bar: the preview gives way
         pressed_ = HitTest(pt);
+        // A press drops the window picker — except on an app whose click presents it again (several
+        // windows): the click that lands there keeps it up instead of blinking it away and back.
+        if (m == WM_LBUTTONDOWN && ClickShowsWindowPicker(pressed_)) {
+            KillTimer(h, kTooltipTimer);
+            tooltip_->Hide(false);
+        } else {
+            HideTooltip();
+            if (onPreviewClose)
+                onPreviewClose(); // a press on the bar: the preview gives way
+        }
         pressedLeft_ = m == WM_LBUTTONDOWN;
         pressPt_ = pt;
         scene_.pressedKey = pressed_;
@@ -458,23 +470,42 @@ void Bar::UpdateNearWatch()
     }
 }
 
+// An app with several windows: a click on it presents them (the picker) instead of one window in turn.
+bool Bar::ClickShowsWindowPicker(const std::wstring& key) const
+{
+    if (IsEntry(key))
+        return false;
+    auto item = std::ranges::find_if(items_, [&](const TaskItem& t) { return t.key == key; });
+    return item != items_.end() && ClickOpensWindowPicker(item->windows.size());
+}
+
+// An app with windows: its windows, previewed, above its icon (as the Windows taskbar). The hover
+// shows them after a moment; a click on an app with several opens them at once.
+bool Bar::ShowPreviewFor(const std::wstring& key)
+{
+    if (!onPreview || IsEntry(key))
+        return false;
+    auto hit = std::ranges::find_if(hits_, [&](const Hit& h) { return h.key == key; });
+    auto item = std::ranges::find_if(items_, [&](const TaskItem& t) { return t.key == key; });
+    if (hit == hits_.end() || item == items_.end() || item->windows.empty())
+        return false;
+    const int rise = scene_.magnify > 1.001f ? rise_ : 0;
+    const POINT tip = EdgeFrame{edge_, window_}.ToArea(POINT{(hit->rect.left + hit->rect.right) / 2, int(scene_.bar.top) - rise});
+    tooltip_->Hide(false);
+    previewShown_ = true;
+    onPreview(key, item->windows, tip);
+    return true;
+}
+
 void Bar::ShowTooltip()
 {
     const std::wstring& key = scene_.hoverKey;
+    if (ShowPreviewFor(key))
+        return; // an app with windows: their preview stands in for the tooltip
     auto hit = std::ranges::find_if(hits_, [&](const Hit& h) { return h.key == key; });
     const int rise = scene_.magnify > 1.001f ? rise_ : 0;
     const POINT tip =
         hit != hits_.end() ? EdgeFrame{edge_, window_}.ToArea(POINT{(hit->rect.left + hit->rect.right) / 2, int(scene_.bar.top) - rise}) : POINT{};
-    // An app with windows: its windows, previewed, instead of the tooltip (as the Windows taskbar).
-    if (onPreview && hit != hits_.end() && !IsEntry(key)) {
-        auto item = std::ranges::find_if(items_, [&](const TaskItem& t) { return t.key == key; });
-        if (item != items_.end() && !item->windows.empty()) {
-            tooltip_->Hide(false);
-            previewShown_ = true;
-            onPreview(key, item->windows, tip);
-            return;
-        }
-    }
     if (previewShown_) { // its last window went: back to the tooltip
         previewShown_ = false;
         if (onPreviewClose)

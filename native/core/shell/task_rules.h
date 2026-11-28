@@ -323,6 +323,10 @@ inline bool OffscreenBelongsToMonitor(HMONITOR windowNearestMonitor, HMONITOR no
     return (normalNearestMonitor ? normalNearestMonitor : primaryMonitor) == targetMonitor;
 }
 
+// A left click on an app's taskbar button: with several windows it presents their picker, so the user
+// chooses the window there (as the Windows taskbar does), instead of one being brought forward in turn.
+inline bool ClickOpensWindowPicker(size_t windowCount) { return windowCount > 1; }
+
 inline void FilterWindowsToMonitor(std::vector<HWND>& windows, HMONITOR targetMonitor)
 {
     if (!targetMonitor)
