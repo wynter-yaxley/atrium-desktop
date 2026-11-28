@@ -36,14 +36,13 @@ void TestWeather(int& f)
     const std::string badArr = R"({"current":{"time":"2026-11-20T10:00"},"hourly":{"time":["2026-11-20T10:00"],"temperature_2m":null,"weather_code":[1],)"
                                R"("is_day":[1]},"daily":{"time":["2026-11-20"],"weather_code":[1],"temperature_2m_max":[20],"temperature_2m_min":[10]}})";
     Check(f, ParseWeatherForecastJson(ok, 32, 118, L"NJ", true, dst) && dst.ok && dst.hours.size() == 1, "valid forecast");
-    const std::string sunEvents =
-        R"({"current":{"time":"2026-11-20T06:00"},"hourly":{"time":["2026-11-20T06:00","2026-11-20T07:00","2026-11-20T08:00"],)"
-        R"("temperature_2m":[10,11,12],"weather_code":[1,1,1],"is_day":[0,1,0]},)"
-        R"("daily":{"time":["2026-11-20"],"weather_code":[1],"temperature_2m_max":[22],"temperature_2m_min":[10],)"
-        R"("sunrise":["2026-11-20T06:30"],"sunset":["2026-11-20T07:30"]}})";
+    const std::string sunEvents = R"({"current":{"time":"2026-11-20T06:00"},"hourly":{"time":["2026-11-20T06:00","2026-11-20T07:00","2026-11-20T08:00"],)"
+                                  R"("temperature_2m":[10,11,12],"weather_code":[1,1,1],"is_day":[0,1,0]},)"
+                                  R"("daily":{"time":["2026-11-20"],"weather_code":[1],"temperature_2m_max":[22],"temperature_2m_min":[10],)"
+                                  R"("sunrise":["2026-11-20T06:30"],"sunset":["2026-11-20T07:30"]}})";
     Check(f,
-          ParseWeatherForecastJson(sunEvents, 32, 118, L"NJ", true, dst) && dst.hours.size() == 5 && dst.hours[1].event == 1 &&
-              dst.hours[1].label == L"6:30" && dst.hours[3].event == 2 && dst.hours[3].label == L"7:30",
+          ParseWeatherForecastJson(sunEvents, 32, 118, L"NJ", true, dst) && dst.hours.size() == 5 && dst.hours[1].event == 1 && dst.hours[1].label == L"6:30" &&
+              dst.hours[3].event == 2 && dst.hours[3].label == L"7:30",
           "sunrise and sunset keep distinct event types in chronological order");
     Check(f, !ParseWeatherForecastJson(badArr, 32, 118, L"NJ", true, bad) && !ParseWeatherForecastJson("{", 32, 118, L"NJ", true, bad), "bad forecast");
 }
