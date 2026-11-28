@@ -1,5 +1,6 @@
 #include "shell/games.h"
 #include "shell/shell_taskbar.h"
+#include "shell/task_model.h"
 #include "shell/task_rules.h"
 #include <cstdio>
 #include <thread>
@@ -151,11 +152,92 @@ bool TestModalRestoreAndActivation()
     return true;
 }
 
+bool TestWebAppAndLauncherMatching()
+{
+    std::wstring exe, args;
+    const std::wstring cmd = L"\"C:\\Program Files\\Google\\Chrome\\Application\\chrome_proxy.exe\" --profile-directory=Default --app-id=hnpfj";
+    if (!atrium::SplitCommandLine(cmd, exe, args) || exe != L"C:\\Program Files\\Google\\Chrome\\Application\\chrome_proxy.exe" ||
+        args != L"--profile-directory=Default --app-id=hnpfj") {
+        std::fprintf(stderr, "FAIL: shell_taskbar SplitCommandLine quoted check failed\n");
+        return false;
+    }
+    if (!atrium::SplitCommandLine(L"C:\\Tools\\app.exe --flag=1", exe, args) || exe != L"C:\\Tools\\app.exe" || args != L"--flag=1" ||
+        !atrium::SplitCommandLine(L"  \"C:\\Path\\app.exe\"  ", exe, args) || exe != L"C:\\Path\\app.exe" || !args.empty() ||
+        atrium::SplitCommandLine(L"   ", exe, args) || !exe.empty() || !args.empty()) {
+        std::fprintf(stderr, "FAIL: shell_taskbar SplitCommandLine edge check failed\n");
+        return false;
+    }
+
+    std::wstring iconPath;
+    int iconIndex = -1;
+    if (!atrium::ParseIconResource(L"\"C:\\Users\\u\\Web Applications\\_crx_abc\\WhatsApp.ico\",0", iconPath, iconIndex) ||
+        iconPath != L"C:\\Users\\u\\Web Applications\\_crx_abc\\WhatsApp.ico" || iconIndex != 0 ||
+        !atrium::ParseIconResource(L"C:\\Windows\\System32\\imageres.dll,-101", iconPath, iconIndex) || iconPath != L"C:\\Windows\\System32\\imageres.dll" ||
+        iconIndex != -101 || !atrium::ParseIconResource(L"C:\\Icons\\app.ico", iconPath, iconIndex) || iconPath != L"C:\\Icons\\app.ico" || iconIndex != 0 ||
+        !atrium::ParseIconResource(L"C:\\Folder,With,Commas\\app.ico", iconPath, iconIndex) || iconPath != L"C:\\Folder,With,Commas\\app.ico" ||
+        iconIndex != 0) {
+        std::fprintf(stderr, "FAIL: shell_taskbar ParseIconResource check failed\n");
+        return false;
+    }
+
+    const std::wstring kso = L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\ksolaunch.exe";
+    const std::wstring wpsVer = L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.1234\\office6\\wps.exe";
+    const std::wstring wpsOfficeVer2 = L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.9999\\office6\\wpsoffice.exe";
+    const std::wstring etVer = L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.1234\\office6\\et.exe";
+    const std::wstring wppVer = L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.1234\\office6\\wpp.exe";
+    const std::wstring pdfVer = L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.1234\\office6\\wpspdf.exe";
+    if (!atrium::PinMatchesSubdirLauncherExe(kso, wpsVer) || !atrium::PinMatchesSubdirLauncherExe(kso, wpsOfficeVer2) ||
+        !atrium::PinMatchesSubdirLauncherExe(kso, etVer) || !atrium::PinMatchesSubdirLauncherExe(kso, wppVer) ||
+        !atrium::PinMatchesSubdirLauncherExe(kso, pdfVer) || !atrium::PinMatchesSubdirLauncherExe(wpsVer, wpsOfficeVer2)) {
+        std::fprintf(stderr, "FAIL: shell_taskbar PinMatchesSubdirLauncherExe positive check failed\n");
+        return false;
+    }
+    if (atrium::PinMatchesSubdirLauncherExe(kso, L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.1234\\cloud\\wpscloudsvr.exe") ||
+        atrium::PinMatchesSubdirLauncherExe(kso, L"C:\\Users\\u\\AppData\\Local\\Kingsoft\\WPS Office\\other.exe") ||
+        atrium::PinMatchesSubdirLauncherExe(kso, L"D:\\Other\\WPS Office\\12.1.0.1234\\office6\\wps.exe") ||
+        atrium::PinMatchesSubdirLauncherExe(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                                            L"C:\\Program Files\\Google\\Chrome\\Application\\chrome_proxy.exe")) {
+        std::fprintf(stderr, "FAIL: shell_taskbar PinMatchesSubdirLauncherExe negative check failed\n");
+        return false;
+    }
+
+    const std::wstring pwaCmd = L"\"C:\\Chrome\\chrome_proxy.exe\" --profile-directory=Default --app-id=hnpfj";
+    const auto unpinnedPlan = atrium::detail::BuildLaunchPlan(nullptr, L"Chrome._crx_hnpfj", L"C:\\Chrome\\chrome.exe", L"chrome._crx_hnpfj", pwaCmd);
+    if (!unpinnedPlan || unpinnedPlan->file != L"C:\\Chrome\\chrome_proxy.exe" || unpinnedPlan->args != L"--profile-directory=Default --app-id=hnpfj" ||
+        unpinnedPlan->dir != L"C:\\Chrome") {
+        std::fprintf(stderr, "FAIL: shell_taskbar unpinned PWA BuildLaunchPlan failed\n");
+        return false;
+    }
+    const atrium::PinnedApp savedWeb{L"WhatsApp", L"C:\\Chrome\\chrome_proxy.exe", L"--profile-directory=Default --app-id=hnpfj", L"Chrome._crx_hnpfj"};
+    const auto savedPlan = atrium::detail::BuildLaunchPlan(&savedWeb, {}, {}, L"chrome._crx_hnpfj");
+    if (!savedPlan || savedPlan->file != L"C:\\Chrome\\chrome_proxy.exe" || savedPlan->args != L"--profile-directory=Default --app-id=hnpfj") {
+        std::fprintf(stderr, "FAIL: shell_taskbar saved PWA BuildLaunchPlan failed\n");
+        return false;
+    }
+    const atrium::PinnedApp legacyBrokenPin{L"WhatsApp", L"C:\\Chrome\\chrome.exe", {}, L"Chrome._crx_hnpfj"};
+    const auto legacyRelaunchPlan = atrium::detail::BuildLaunchPlan(&legacyBrokenPin, {}, {}, L"chrome._crx_hnpfj", pwaCmd);
+    const auto legacyAppsFolderPlan = atrium::detail::BuildLaunchPlan(&legacyBrokenPin, {}, {}, L"chrome._crx_hnpfj");
+    if (!legacyRelaunchPlan || legacyRelaunchPlan->file != L"C:\\Chrome\\chrome_proxy.exe" ||
+        legacyRelaunchPlan->args != L"--profile-directory=Default --app-id=hnpfj" || !legacyAppsFolderPlan ||
+        legacyAppsFolderPlan->file != L"shell:AppsFolder\\Chrome._crx_hnpfj") {
+        std::fprintf(stderr, "FAIL: shell_taskbar legacy PWA BuildLaunchPlan fallback failed\n");
+        return false;
+    }
+    if (atrium::AllowsMultipleWindows(legacyBrokenPin) ||
+        atrium::AllowsMultipleWindows(atrium::PinnedApp{L"Web", L"C:\\Chrome\\chrome.exe", L"--app-id=abc", {}}) ||
+        !atrium::AllowsMultipleWindows(atrium::PinnedApp{L"Chrome", L"C:\\Chrome\\chrome.exe", {}, {}})) {
+        std::fprintf(stderr, "FAIL: shell_taskbar AllowsMultipleWindows PWA check failed\n");
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main()
 {
-    if (!TestWindowResponsive() || !TestGamePredicates() || !TestPendingRestoresAndHiddenWindows() || !TestModalRestoreAndActivation())
+    if (!TestWindowResponsive() || !TestGamePredicates() || !TestPendingRestoresAndHiddenWindows() || !TestModalRestoreAndActivation() ||
+        !TestWebAppAndLauncherMatching())
         return 1;
     std::printf("ok: shell_taskbar checks passed\n");
     return 0;

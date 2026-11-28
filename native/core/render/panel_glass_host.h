@@ -33,6 +33,13 @@ inline double BackupKeepIntervalMs(bool hasScreenPanel, double sinceMovedMs)
     return sinceMovedMs <= kBackupMovedWindowMs ? 0.0 : (hasScreenPanel ? kBackupActiveIntervalMs : kBackupIdleIntervalMs);
 }
 
+inline constexpr double kInkSettleMs = 250.0;
+
+inline bool ShouldDeferPanelInk(bool inkOwed, int postedInk, double nowMs, double lastChangeMs, double settleMs = kInkSettleMs)
+{
+    return inkOwed && postedInk >= 0 && (nowMs - lastChangeMs) < settleMs;
+}
+
 GlassParams ParamsFor(const Settings& s, float scale, float insetDip = 14.f);
 float GlassLuma(const Settings& s, float backdrop);
 void PanelParams(const Settings& s, float scale, const GlassPanel& p, std::vector<GlassParams>& out);
@@ -86,8 +93,8 @@ private:
         int ink = -1;         // ink last posted: 1 dark, 0 light, -1 none yet
         RECT window{};        // where it was last drawn: a moved panel is drawn again at once
         unsigned desktopVersion = 0; // a widget: the desktop picture its backdrop came from
-        double desktopMs = -1e9;     // and when a new one came
-        bool inkOwed = false;        // its ink waits for the desktop to settle
+        double inkSettleMs = -1e9;   // when the backdrop or luminance grid last changed
+        bool inkOwed = false;        // its ink waits for the backdrop to settle
         // Presents of an animation, logged when it ends (smoothness checks).
         double burstStart = 0, burstLast = 0, burstGap = 0;
         int burstFrames = 0;
@@ -113,7 +120,7 @@ private:
         bool partialCopy = false;
     };
 
-    StepResult SyncPanelCaptures(const std::vector<GlassPanel>& panels, bool barKeepsOwnWindowsOut);
+    StepResult SyncPanelCaptures(const std::vector<GlassPanel>& panels, bool barKeepsOwnWindowsOut, const std::wstring& widgetBackdrop);
     StepResult AcquirePanelCaptures(const std::vector<GlassPanel>& panels);
     void FlushIdleBursts(double now);
     StepResult RenderSinglePanel(const GlassPanel& p, const Settings& settings, RECT monitorRect, float barScale, ID3D11Texture2D* source, uint64_t tick,

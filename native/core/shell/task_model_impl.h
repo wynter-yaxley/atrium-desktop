@@ -22,6 +22,8 @@ namespace atrium {
 struct TaskMeta {
     detail::TaskIconSource source;
     std::vector<AppProcessIdentity> processTargets; // retained for pinned apps closed to the tray
+    std::wstring relaunchCommand;
+    bool webApp = false;
 };
 
 struct TaskScanRec {

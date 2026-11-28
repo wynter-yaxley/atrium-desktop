@@ -25,6 +25,12 @@ GlassHost* g_host = nullptr;
 bool g_capturable = false, g_captureVisible = false;
 std::vector<Surface*> g_all;
 
+bool HasPendingUserInput()
+{
+    MSG msg{};
+    return PeekMessageW(&msg, nullptr, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE) || PeekMessageW(&msg, nullptr, WM_MOUSEFIRST, WM_MOUSELAST, PM_NOREMOVE);
+}
+
 } // namespace
 
 // ---- Surface -----------------------------------------------------------------
@@ -316,8 +322,12 @@ LRESULT CALLBACK Surface::Proc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     case WM_SURFACE_FRAME:
-        if (self->visible_)
-            self->Paint();
+        if (self->visible_) {
+            if (HasPendingUserInput())
+                InvalidateRect(h, nullptr, FALSE);
+            else
+                self->Paint();
+        }
         return 0;
     case WM_GLASS_PRESENTED:
         if (self->presentPending_ && unsigned(w) >= self->presentGen_)
@@ -557,6 +567,8 @@ void Surface::SetInk(bool dark, const InkGrid& grid)
     double now = ClockMs();
     // Not on screen yet (or a new grid): the ink is just taken.
     bool snap = !visible_ || !glassReady_;
+    if (!snap && dark == darkInk_ && grid == inkGrid_)
+        return;
     darkInk_ = dark;
     if (snap)
         inkAll_ = InkFade{};
@@ -566,7 +578,12 @@ void Surface::SetInk(bool dark, const InkGrid& grid)
     inkGrid_ = grid;
     for (size_t i = 0; i < inkCells_.size(); ++i)
         inkCells_[i].Target(grid.dark[i] ? 1.f : 0.f, now);
-    Invalidate();
+    if (!visible_)
+        return;
+    if (HasPendingUserInput())
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    else
+        Invalidate();
 }
 
 void Surface::Invalidate()

@@ -48,21 +48,45 @@ std::wstring StoreAumid(IPropertyStore* store)
     return result;
 }
 
-// relaunch: the command the window asks to be started again with (a browser's web app names
-// itself there: --app-id).
-std::wstring WindowAumid(HWND h, std::wstring* relaunch = nullptr)
+struct WindowAppIdentity {
+    std::wstring aumid;
+    std::wstring relaunchCommand;
+    std::wstring relaunchIcon;
+    std::wstring relaunchName;
+};
+
+std::wstring StoreStringProp(IPropertyStore* store, const PROPERTYKEY& key)
 {
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    std::wstring result;
+    if (SUCCEEDED(store->GetValue(key, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
+        result = v.pwszVal;
+    PropVariantClear(&v);
+    return result;
+}
+
+std::wstring ResolveDisplayResource(const std::wstring& raw)
+{
+    if (raw.empty() || raw.front() != L'@')
+        return raw;
+    wchar_t buf[512] = {};
+    if (SUCCEEDED(SHLoadIndirectString(raw.c_str(), buf, ARRAYSIZE(buf), nullptr)) && buf[0])
+        return buf;
+    return {};
+}
+
+WindowAppIdentity ReadWindowAppIdentity(HWND h)
+{
+    WindowAppIdentity id;
     winrt::com_ptr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(store.put()))) || !store)
-        return {};
-    if (relaunch) {
-        PROPVARIANT v;
-        PropVariantInit(&v);
-        if (SUCCEEDED(store->GetValue(PKEY_AppUserModel_RelaunchCommand, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
-            *relaunch = v.pwszVal;
-        PropVariantClear(&v);
-    }
-    return StoreAumid(store.get());
+        return id;
+    id.aumid = StoreStringProp(store.get(), PKEY_AppUserModel_ID);
+    id.relaunchCommand = StoreStringProp(store.get(), PKEY_AppUserModel_RelaunchCommand);
+    id.relaunchIcon = StoreStringProp(store.get(), PKEY_AppUserModel_RelaunchIconResource);
+    id.relaunchName = ResolveDisplayResource(StoreStringProp(store.get(), PKEY_AppUserModel_RelaunchDisplayNameResource));
+    return id;
 }
 
 // UWP frame windows live in ApplicationFrameHost; the app itself owns a child
@@ -145,16 +169,24 @@ TaskWinInfo ComputeTaskWinInfo(HWND h, DWORD pid, const wchar_t* cls)
 {
     TaskWinInfo wi;
     wi.pid = pid;
-    std::wstring relaunch;
     bool frame = wcscmp(cls, L"ApplicationFrameWindow") == 0;
     winrt::handle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
     if (frame) {
         wi.aumid = HostedUwpAumid(h, pid);
-        if (wi.aumid.empty())
-            wi.aumid = WindowAumid(h);
+        if (wi.aumid.empty()) {
+            const WindowAppIdentity id = ReadWindowAppIdentity(h);
+            wi.aumid = id.aumid;
+            wi.relaunchCommand = id.relaunchCommand;
+            wi.relaunchIcon = id.relaunchIcon;
+            wi.relaunchName = id.relaunchName;
+        }
         // exePath stays empty: it would be ApplicationFrameHost.exe for every app.
     } else {
-        wi.aumid = WindowAumid(h, &relaunch);
+        const WindowAppIdentity id = ReadWindowAppIdentity(h);
+        wi.aumid = id.aumid;
+        wi.relaunchCommand = id.relaunchCommand;
+        wi.relaunchIcon = id.relaunchIcon;
+        wi.relaunchName = id.relaunchName;
         if (proc) {
             wi.exePath = TaskProcessImagePath(proc.get());
             if (wi.aumid.empty())
@@ -168,7 +200,7 @@ TaskWinInfo ComputeTaskWinInfo(HWND h, DWORD pid, const wchar_t* cls)
         if (GetProcessTimes(proc.get(), &c, &e, &k, &u))
             wi.created = (static_cast<ULONGLONG>(c.dwHighDateTime) << 32) | c.dwLowDateTime;
     }
-    wi.webApp = IsWebApp(wi.aumid, relaunch);
+    wi.webApp = IsWebApp(wi.aumid, wi.relaunchCommand);
     if (wi.aumid.empty() && proc && !wi.exePath.empty() && wi.created)
         wi.launcher = LauncherOf(proc.get(), pid, wi.created, wi.exePath);
     if (!wi.aumid.empty())
@@ -321,7 +353,8 @@ TaskPin ResolveTaskPin(const PinnedApp& app)
     }
     if (aumid.empty() && !target.empty() && IsPackagedPath(target))
         aumid = PackagedAumidForExe(target);
-    p.specific = IsWebApp(aumid, args) || Lower(args).find(L"--profile-directory") != std::wstring::npos;
+    p.webApp = IsWebApp(aumid, args);
+    p.specific = p.webApp || Lower(args).find(L"--profile-directory") != std::wstring::npos;
     p.exe = AppExecutable(target);
     p.aumid = aumid;
     if (Lower(aumid) == L"microsoft.windows.explorer" && p.exe.empty()) {
@@ -331,7 +364,7 @@ TaskPin ResolveTaskPin(const PinnedApp& app)
             target = p.exe;
         }
     }
-    p.multipleWindows = AllowsMultipleWindows(PinnedApp{app.name, p.exe, {}, aumid, app.multipleWindows});
+    p.multipleWindows = AllowsMultipleWindows(PinnedApp{app.name, p.exe, args, aumid, app.multipleWindows});
     p.target = Lower(target);
     if (!aumid.empty()) {
         p.key = Lower(aumid);

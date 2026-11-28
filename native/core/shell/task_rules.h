@@ -149,6 +149,139 @@ inline bool IsWebApp(const std::wstring& aumid, const std::wstring& command)
     return id.find(L"_crx_") != std::wstring::npos || cmd.find(L"--app-id=") != std::wstring::npos || cmd.find(L"--app=") != std::wstring::npos;
 }
 
+inline std::wstring TrimWs(std::wstring_view s)
+{
+    size_t start = 0;
+    while (start < s.size() && (s[start] == L' ' || s[start] == L'\t' || s[start] == L'\r' || s[start] == L'\n'))
+        ++start;
+    size_t end = s.size();
+    while (end > start && (s[end - 1] == L' ' || s[end - 1] == L'\t' || s[end - 1] == L'\r' || s[end - 1] == L'\n'))
+        --end;
+    return std::wstring(s.substr(start, end - start));
+}
+
+inline bool SplitCommandLine(const std::wstring& command, std::wstring& exe, std::wstring& args)
+{
+    exe.clear();
+    args.clear();
+    const std::wstring trimmed = TrimWs(command);
+    if (trimmed.empty())
+        return false;
+    if (trimmed.front() == L'"') {
+        const size_t close = trimmed.find(L'"', 1);
+        if (close == std::wstring::npos) {
+            exe = TrimWs(std::wstring_view(trimmed).substr(1));
+            return !exe.empty();
+        }
+        exe = TrimWs(std::wstring_view(trimmed).substr(1, close - 1));
+        args = TrimWs(std::wstring_view(trimmed).substr(close + 1));
+        return !exe.empty();
+    }
+    const size_t space = trimmed.find_first_of(L" \t");
+    if (space == std::wstring::npos) {
+        exe = trimmed;
+        return !exe.empty();
+    }
+    exe = trimmed.substr(0, space);
+    args = TrimWs(std::wstring_view(trimmed).substr(space + 1));
+    return !exe.empty();
+}
+
+inline bool ParseIconResource(const std::wstring& resource, std::wstring& path, int& index)
+{
+    path.clear();
+    index = 0;
+    std::wstring trimmed = TrimWs(resource);
+    if (trimmed.empty())
+        return false;
+    auto stripQuotes = [](std::wstring s) {
+        s = TrimWs(s);
+        if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"')
+            s = TrimWs(std::wstring_view(s).substr(1, s.size() - 2));
+        return s;
+    };
+    const size_t comma = trimmed.rfind(L',');
+    if (comma != std::wstring::npos && comma + 1 < trimmed.size()) {
+        const std::wstring tail = TrimWs(std::wstring_view(trimmed).substr(comma + 1));
+        if (!tail.empty()) {
+            size_t pos = (tail.front() == L'-') ? 1 : 0;
+            bool numeric = pos < tail.size();
+            for (; pos < tail.size(); ++pos) {
+                if (tail[pos] < L'0' || tail[pos] > L'9') {
+                    numeric = false;
+                    break;
+                }
+            }
+            if (numeric) {
+                long long parsed = 0;
+                const bool neg = tail.front() == L'-';
+                for (size_t i = neg ? 1 : 0; i < tail.size(); ++i)
+                    parsed = parsed * 10 + (tail[i] - L'0');
+                index = static_cast<int>(neg ? -parsed : parsed);
+                trimmed.resize(comma);
+            }
+        }
+    }
+    path = stripQuotes(std::move(trimmed));
+    return !path.empty();
+}
+
+inline std::wstring NormalizePathLower(std::wstring s)
+{
+    for (wchar_t& ch : s) {
+        if (ch == L'/')
+            ch = L'\\';
+    }
+    return Lower(std::move(s));
+}
+
+inline std::wstring WpsVersionRoot(const std::wstring& lowerPath, const std::wstring& stem)
+{
+    if (stem != L"wps" && stem != L"wpsoffice")
+        return {};
+    const size_t officePos = lowerPath.find(L"\\office6\\");
+    if (officePos == std::wstring::npos || officePos == 0)
+        return {};
+    const size_t verSlash = lowerPath.rfind(L'\\', officePos - 1);
+    if (verSlash == std::wstring::npos || verSlash == 0)
+        return {};
+    const std::wstring root = lowerPath.substr(0, verSlash);
+    size_t components = 0;
+    for (size_t i = 0; i < root.size();) {
+        while (i < root.size() && root[i] == L'\\')
+            ++i;
+        if (i >= root.size())
+            break;
+        ++components;
+        while (i < root.size() && root[i] != L'\\')
+            ++i;
+    }
+    return components >= 2 ? root : std::wstring{};
+}
+
+inline bool PinMatchesSubdirLauncherExe(const std::wstring& pinExePath, const std::wstring& winExePath)
+{
+    if (pinExePath.empty() || winExePath.empty())
+        return false;
+    const std::wstring pinLower = NormalizePathLower(pinExePath);
+    const std::wstring winLower = NormalizePathLower(winExePath);
+    const std::wstring pinStem = FileStem(pinLower);
+    const std::wstring winStem = FileStem(winLower);
+    const size_t pinSlash = pinLower.find_last_of(L'\\');
+    if (pinSlash != std::wstring::npos) {
+        const std::wstring pinDir = pinLower.substr(0, pinSlash + 1);
+        if (winLower.starts_with(pinDir) && winLower.find(L'\\', pinDir.size()) != std::wstring::npos) {
+            if (pinStem == L"ksolaunch" && (winStem == L"wps" || winStem == L"wpsoffice" || winStem == L"et" || winStem == L"wpp" || winStem == L"wpspdf"))
+                return true;
+            if (pinStem.size() >= 4 && winStem.starts_with(pinStem))
+                return true;
+        }
+    }
+    const std::wstring pinRoot = WpsVersionRoot(pinLower, pinStem);
+    const std::wstring winRoot = WpsVersionRoot(winLower, winStem);
+    return !pinRoot.empty() && pinRoot == winRoot;
+}
+
 inline bool IsTaskbarWindowCandidate(LONG_PTR style, LONG_PTR exStyle, bool hasOwner, bool iconic, LONG width, LONG height)
 {
     if ((exStyle & WS_EX_TRANSPARENT) && (exStyle & WS_EX_LAYERED))

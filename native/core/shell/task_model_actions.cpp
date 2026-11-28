@@ -87,14 +87,15 @@ std::optional<detail::LaunchPlan> TaskModel::Impl::PlanFor(const std::wstring& k
         for (size_t i = 0; i < pins.size(); ++i)
             if (pins[i].key == key)
                 pinIndex = i;
-    if (pinIndex < pins.size())
-        return detail::BuildLaunchPlan(&pins[pinIndex].app, {}, {}, key);
     auto mit = meta.find(key);
+    const std::wstring relaunch = mit != meta.end() ? mit->second.relaunchCommand : std::wstring{};
+    if (pinIndex < pins.size())
+        return detail::BuildLaunchPlan(&pins[pinIndex].app, {}, {}, key, relaunch);
     if (mit == meta.end()) {
         Log(L"tasks: launch of unknown item %s", key.c_str());
         return std::nullopt;
     }
-    return detail::BuildLaunchPlan(nullptr, mit->second.source.aumid, mit->second.source.exePath, key);
+    return detail::BuildLaunchPlan(nullptr, mit->second.source.aumid, mit->second.source.exePath, key, relaunch);
 }
 
 void TaskModel::Impl::Minimize(HWND h)
@@ -191,7 +192,14 @@ PinnedApp TaskModel::Impl::PinFor(const std::wstring& key) const
 {
     const TaskItem* t = Find(key);
     auto m = meta.find(key);
-    return (!t || m == meta.end()) ? PinnedApp{} : PinnedApp{t->name, m->second.source.exePath, {}, m->second.source.aumid};
+    if (!t || m == meta.end())
+        return {};
+    if (!m->second.relaunchCommand.empty()) {
+        std::wstring path, args;
+        if (SplitCommandLine(m->second.relaunchCommand, path, args))
+            return PinnedApp{t->name, path, args, m->second.source.aumid};
+    }
+    return PinnedApp{t->name, m->second.source.exePath, {}, m->second.source.aumid};
 }
 
 // Exe that starts the item, unless it is a packaged app (those are only
@@ -244,6 +252,8 @@ bool AllowsMultipleWindows(const PinnedApp& app)
 {
     if (app.multipleWindows)
         return *app.multipleWindows;
+    if (IsWebApp(app.aumid, app.args))
+        return false;
     std::wstring exe = Lower(FileStem(app.path));
     return exe == L"explorer" || Lower(app.aumid) == L"microsoft.windows.explorer" || exe == L"chrome" || exe == L"msedge" || exe == L"firefox" ||
            exe == L"brave" || exe == L"opera" || exe == L"vivaldi" || exe == L"chromium";

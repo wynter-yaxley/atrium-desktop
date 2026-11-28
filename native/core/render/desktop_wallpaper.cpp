@@ -314,9 +314,22 @@ void DesktopBackdrop::WallpaperLoop(Wallpaper& work)
     CoUninitialize();
 }
 
+void WallpaperCapture::SetPaused(bool paused)
+{
+    if (paused == paused_)
+        return;
+    paused_ = paused;
+    if (paused_) {
+        wallpaper_.Update(L"off");
+        version_ = 0;
+    }
+}
+
 ID3D11Texture2D* WallpaperCapture::Acquire()
 {
-    wallpaper_.Update(L"wallpaper");
+    if (paused_)
+        return nullptr;
+    wallpaper_.Update(mode_);
     ID3D11Texture2D* picture = wallpaper_.Texture();
     if (!picture || wallpaper_.Version() == version_)
         return nullptr;

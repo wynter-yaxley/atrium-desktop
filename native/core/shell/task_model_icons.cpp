@@ -50,7 +50,8 @@ struct Job {
     bool name = false; // false: icon
     std::wstring key;
     int size = 0;
-    std::wstring sig, aumid, pinPath, exePath;
+    std::wstring sig, aumid, pinPath, exePath, relaunchIcon, relaunchName;
+    bool webApp = false;
     std::vector<HWND> hwnds;
 };
 
@@ -128,9 +129,10 @@ bool TryExeOrWindowDiffIcon(const Job& job, IconImage& out)
     IconImage exeImg;
     if (!LoadShellImage(job.exePath, job.size, exeImg))
         return false;
-    if (!job.hwnds.empty() && job.pinPath.empty()) {
+    if (!job.hwnds.empty() && (job.pinPath.empty() || job.webApp)) {
         IconImage rawWin;
-        if (TaskWindowDirectIcon(job.hwnds[0], job.size, rawWin) && rawWin.width >= 24 && rawWin.height >= 24) {
+        const int minSide = job.webApp ? 16 : 24;
+        if (TaskWindowDirectIcon(job.hwnds[0], job.size, rawWin) && rawWin.width >= minSide && rawWin.height >= minSide) {
             IconImage winImg = ApplySquircleMaskIfFullBleed(FitToSquare(rawWin, job.size));
             if (ImagesVisuallyDifferent(winImg, exeImg)) {
                 out = std::move(winImg);
@@ -146,12 +148,23 @@ bool LoadIconForJob(const Job& job, IconImage& img)
 {
     if (LoadAtriumIcon(job.exePath, job.size, img))
         return true;
+    if (!job.relaunchIcon.empty()) {
+        std::wstring iconPath;
+        int iconIndex = 0;
+        if (ParseIconResource(job.relaunchIcon, iconPath, iconIndex) && LoadIconResourceImage(iconPath, iconIndex, job.size, img))
+            return true;
+    }
     // Shortcuts (.lnk) and non-exe pin targets may carry custom icons; bare .exe pins wait for AUMID first.
     if (!job.pinPath.empty() && !IsExePath(job.pinPath) && PinPathHasUsableIcon(job.pinPath) && LoadShellImage(job.pinPath, job.size, img))
         return true;
     const std::wstring effectiveAumid = !job.aumid.empty() ? job.aumid : PackagedAumidForExe(job.exePath);
     if (!effectiveAumid.empty() && LoadShellImage(AppsFolderPath(effectiveAumid), job.size, img))
         return true;
+    if (job.webApp && !effectiveAumid.empty()) {
+        const std::wstring webCatalogTarget = AppCatalog::IconTargetFor(effectiveAumid, L"", L"");
+        if (!webCatalogTarget.empty() && PinPathHasUsableIcon(webCatalogTarget) && LoadShellImage(webCatalogTarget, job.size, img))
+            return true;
+    }
     const bool exeIcon = HasEmbeddedExeIcon(job.exePath);
     if (exeIcon && TryExeOrWindowDiffIcon(job, img))
         return true;
@@ -171,8 +184,8 @@ bool LoadIconForJob(const Job& job, IconImage& img)
 
 std::wstring TaskIconSource::Signature() const
 {
-    std::wstring sig = aumid + L"|" + pinPath + L"|" + exePath;
-    if (pinPath.empty() && !hwnds.empty())
+    std::wstring sig = aumid + L"|" + pinPath + L"|" + exePath + L"|" + relaunchIcon + (webApp ? L"|web" : L"");
+    if ((pinPath.empty() || webApp) && !hwnds.empty())
         sig += L"|" + std::to_wstring(reinterpret_cast<uintptr_t>(*std::ranges::min_element(hwnds)));
     return sig;
 }
@@ -214,7 +227,8 @@ public:
             e.requested = e.loading = true;
             e.sig = sig;
             e.lastSource = source;
-            jobs_.push_back(Job{false, key, px, sig, source.aumid, source.pinPath, source.exePath, source.hwnds});
+            jobs_.push_back(
+                Job{false, key, px, sig, source.aumid, source.pinPath, source.exePath, source.relaunchIcon, source.relaunchName, source.webApp, source.hwnds});
             cv_.notify_one();
         }
         return e.have ? e.image : IconImage{};
@@ -228,6 +242,8 @@ public:
         j.aumid = source.aumid;
         j.exePath = source.exePath;
         j.pinPath = source.pinPath;
+        j.relaunchName = source.relaunchName;
+        j.webApp = source.webApp;
         {
             std::lock_guard g(mutex_);
             jobs_.push_back(std::move(j));
@@ -253,8 +269,8 @@ public:
                     continue;
                 e.failedAt = 0;
                 e.loading = true;
-                jobs_.push_back(
-                    Job{false, iconKey.key, iconKey.size, e.sig, e.lastSource->aumid, e.lastSource->pinPath, e.lastSource->exePath, e.lastSource->hwnds});
+                jobs_.push_back(Job{false, iconKey.key, iconKey.size, e.sig, e.lastSource->aumid, e.lastSource->pinPath, e.lastSource->exePath,
+                                    e.lastSource->relaunchIcon, e.lastSource->relaunchName, e.lastSource->webApp, e.lastSource->hwnds});
                 woke = true;
             }
         }
@@ -338,6 +354,8 @@ private:
         std::wstring name;
         if (!job.aumid.empty())
             name = TaskShellDisplayName(AppsFolderPath(job.aumid));
+        if (name.empty() && !job.relaunchName.empty())
+            name = job.relaunchName;
         if (name.empty() && !job.exePath.empty())
             name = TaskFileDescription(job.exePath);
         if (name.empty() && !job.pinPath.empty() && IsLink(job.pinPath))

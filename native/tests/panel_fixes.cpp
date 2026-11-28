@@ -120,6 +120,49 @@ void CheckClickThroughAndPeek(auto& check)
     });
     check(showHideStats.timerTicks >= 4 && showHideStats.messages < 400,
           "click-through layered Surface after Show/Hide does not spin WM_PAINT or starve WM_TIMER");
+
+    // #223: pending keyboard/mouse input yields deferred Surface frames instead of starving input.
+    Surface yielding(inst, L"Atrium Yielding Test", false, 0);
+    std::vector<int> order; // 1 = key, 2 = paint
+    bool armed = false;
+    yielding.paint = [&](Canvas&) {
+        if (armed)
+            order.push_back(2);
+    };
+    yielding.message = [&](UINT m, WPARAM w, LPARAM, LRESULT& r) {
+        if (armed && m == WM_KEYDOWN && w == VK_ESCAPE) {
+            order.push_back(1);
+            r = 0;
+            return true;
+        }
+        return false;
+    };
+    yielding.Show(RECT{-4000, -4000, -3760, -3840}, false, POINT{-4000, -4000}, false);
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    armed = true;
+    order.clear();
+    PostMessageW(yielding.Hwnd(), WM_SURFACE_FRAME, 0, 0);
+    PostMessageW(yielding.Hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
+    const ULONGLONG yieldDeadline = GetTickCount64() + 1000;
+    while (GetTickCount64() < yieldDeadline && (std::ranges::find(order, 1) == order.end() || std::ranges::find(order, 2) == order.end())) {
+        if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        } else {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= yieldDeadline)
+                break;
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(std::min<ULONGLONG>(50, yieldDeadline - now)), QS_ALLINPUT);
+        }
+    }
+    auto keyIt = std::ranges::find(order, 1);
+    auto paintIt = std::ranges::find(order, 2);
+    check(keyIt != order.end() && paintIt != order.end() && keyIt < paintIt, "WM_SURFACE_FRAME yields to queued user input before running deferred WM_PAINT");
+    yielding.Hide(false);
 }
 
 bool RectEq(const RECT& a, const RECT& b) { return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom; }
@@ -227,6 +270,10 @@ int main()
     check(BackupKeepIntervalMs(true, 2000.0) == kBackupActiveIntervalMs, "visible screen panels on the capture monitor use the 100 ms backup tier");
     check(BackupKeepIntervalMs(false, 500.0) == 0.0 && BackupKeepIntervalMs(true, 1000.0) == 0.0,
           "recent screen panel movement keeps every frame up to 1000 ms");
+    check(!ShouldDeferPanelInk(true, -1, 100.0, 90.0), "initial panel ink (postedInk == -1) is never deferred");
+    check(ShouldDeferPanelInk(true, 0, 200.0, 100.0), "subsequent panel ink defers while backdrop animates within 250 ms");
+    check(!ShouldDeferPanelInk(true, 0, 350.0, 100.0), "deferred panel ink flushes at >= 250 ms");
+    check(!ShouldDeferPanelInk(false, 1, 200.0, 100.0), "panel ink does not defer when !inkOwed");
     CheckOffscreenRestorePlan(check);
     CheckClickThroughAndPeek(check);
     if (fail)

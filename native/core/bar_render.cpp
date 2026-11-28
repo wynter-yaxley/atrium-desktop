@@ -166,7 +166,9 @@ GlassParams BarFrameParams(const Settings& settings, float scale, const BarFrame
     return params;
 }
 
-DWORD WaitNextRenderTick(bool paced, bool readback, bool paused, bool pollCapture, bool showClock, bool showClockSeconds, bool& pendingSnap,
+std::wstring RemoteBackdropMode(const Settings& s) { return s.widgetBackdrop == L"wallpaper" ? L"wallpaper" : L"desktop"; }
+
+DWORD WaitNextRenderTick(bool paced, bool readback, bool paused, bool pollCapture, bool inkDue, bool showClock, bool showClockSeconds, bool& pendingSnap,
                          const HANDLE* handles, uint64_t& tick)
 {
     const DWORD hc = 3 - DWORD(paused);
@@ -194,6 +196,8 @@ DWORD WaitNextRenderTick(bool paced, bool readback, bool paused, bool pollCaptur
     }
     if (!paused && pollCapture)
         idle = std::min<DWORD>(idle, 16);
+    if (inkDue)
+        idle = std::min<DWORD>(idle, 250);
     const DWORD w = WaitForMultipleObjects(hc, handles, FALSE, paced ? 6 : readback ? 3 : idle);
     ++tick;
     return w;
@@ -277,8 +281,8 @@ struct BarRender {
         blackOut = !remote && initial == CapturePolicy::InitialSource::Wallpaper;
         std::unique_ptr<BackdropSource> capture;
         if (initial == CapturePolicy::InitialSource::Wallpaper) {
-            capture = std::make_unique<WallpaperCapture>(gpu, snap.hmonitor, bar.frame_);
-            Log(remote ? L"render: remote-control mode, the glass shows the wallpaper" : L"render: the glass shows the wallpaper for now");
+            capture = std::make_unique<WallpaperCapture>(gpu, snap.hmonitor, bar.frame_, remote ? remoteBackdropMode : std::wstring(L"wallpaper"));
+            Log(remote ? L"render: remote-control mode, the glass shows %s" : L"render: the glass shows the wallpaper for now", remoteBackdropMode.c_str());
         } else if (initial == CapturePolicy::InitialSource::Duplication) {
             HRESULT why = S_OK;
             bool elsewhere = false;
@@ -487,7 +491,7 @@ struct BarRender {
                 stats.workMs.push_back(ElapsedMs(t0));
             return true;
         }
-        const bool panelsOwed = panelHost.InkDue() || panelHost.AnyOwed();
+        const bool panelsOwed = panelHost.AnyOwed();
         if (anim.MusicOnly() && !panelsMoving && !panelsOwed && !backdropDirty && !genieBarDirty && snap.generation == drawnGeneration &&
             textKey == drawnText && dark == drawnDark && darkIcons == drawnDarkIcons && !wasBody && !wasGlass && !barOwed &&
             ShouldThrottleMusicOnlyFrame(nowMs - lastPresentMs)) {
@@ -565,15 +569,21 @@ struct BarRender {
         return true;
     }
 
+    bool CaptureSourceChanged() const
+    {
+        return snap.hmonitor != captureMonitor || snap.displayGeneration != captureGeneration || RemoteVisible() != remote ||
+               (remote && RemoteBackdropMode(snap.settings) != remoteBackdropMode);
+    }
+
     bool StepFrame(const Gpu& gpu, BackdropSource& capture, GlassRenderer& renderer, BarPainter& painter, PanelGlassHost& panelHost,
                    GenieRenderer& genieRenderer, const HANDLE* handles, bool& pendingSnap, Bar::SessionEnd& stop)
     {
-        const bool owed = barOwed || owedBody || owedMusic || panelHost.InkDue() || panelHost.AnyOwed();
+        const bool owed = barOwed || owedBody || owedMusic || panelHost.AnyOwed();
         const bool paced = animating || panelsMoving || owed || genieActive;
         const bool readback = renderer.ReadbackPending() || panelHost.AnyReadbackPending();
         const bool pollCapture = (!paused && capture.RequiresPolling()) || panelHost.AnyCaptureRequiresPolling();
-        if (WaitNextRenderTick(paced, readback, anyScreenPaused, pollCapture, snap.settings.showClock, snap.settings.showClockSeconds, pendingSnap, handles,
-                               tick) == WAIT_OBJECT_0) {
+        if (WaitNextRenderTick(paced, readback, anyScreenPaused, pollCapture, panelHost.InkDue(), snap.settings.showClock, snap.settings.showClockSeconds,
+                               pendingSnap, handles, tick) == WAIT_OBJECT_0) {
             stop = Bar::SessionEnd::Exit;
             return false;
         }
@@ -582,7 +592,7 @@ struct BarRender {
         LARGE_INTEGER t0;
         QueryPerformanceCounter(&t0);
         CopyLatestSnapshot();
-        if (snap.hmonitor != captureMonitor || snap.displayGeneration != captureGeneration || RemoteVisible() != remote) {
+        if (CaptureSourceChanged()) {
             stop = Bar::SessionEnd::Switch; // selected display or its capture source changed
             return false;
         }
@@ -668,6 +678,7 @@ struct BarRender {
         captureMonitor = snap.hmonitor;
         captureGeneration = snap.displayGeneration;
         remote = RemoteVisible();
+        remoteBackdropMode = RemoteBackdropMode(snap.settings);
         Bar::SessionEnd stop = Bar::SessionEnd::Switch;
         std::unique_ptr<BackdropSource> capture = SelectInitialCapture(gpu, stop);
         if (!capture)
@@ -696,6 +707,7 @@ struct BarRender {
     HMONITOR captureMonitor = nullptr;
     unsigned captureGeneration = 0;
     bool remote = false;
+    std::wstring remoteBackdropMode = L"desktop";
     bool blackOut = false;
     bool freeze = false;
 

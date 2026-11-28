@@ -334,24 +334,50 @@ bool ProcessRuns(const std::wstring& exe)
     return found;
 }
 
-std::optional<LaunchPlan> BuildLaunchPlan(const PinnedApp* pin, const std::wstring& aumid, const std::wstring& exePath, const std::wstring& key)
+namespace {
+
+std::wstring ParentDirOf(const std::wstring& path)
 {
-    if (pin) {
-        if (!pin->path.empty() && IsPackagedPath(pin->path) && !IsLink(pin->path)) {
-            const std::wstring id = !pin->aumid.empty() ? pin->aumid : PackagedAumidForExe(pin->path);
-            if (!id.empty())
-                return LaunchPlan{AppsFolderPath(id), {}, {}};
-            Log(L"tasks: pin %s is a packaged program without an app id", pin->name.c_str());
-        }
-        if (!pin->path.empty()) {
-            const bool link = IsLink(pin->path);
-            const size_t slash = link ? std::wstring::npos : pin->path.find_last_of(L"\\/");
-            return LaunchPlan{pin->path, link ? std::wstring() : pin->args, slash == std::wstring::npos ? std::wstring() : pin->path.substr(0, slash)};
-        }
-        if (!pin->aumid.empty())
-            return LaunchPlan{AppsFolderPath(pin->aumid), {}, {}};
-        Log(L"tasks: pin %s has nothing to launch", pin->name.c_str());
-        return std::nullopt;
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring{} : path.substr(0, slash);
+}
+
+std::optional<LaunchPlan> BuildPinnedLaunchPlan(const PinnedApp& pin, const std::wstring& relaunchCommand)
+{
+    if (!pin.path.empty() && IsPackagedPath(pin.path) && !IsLink(pin.path)) {
+        const std::wstring id = !pin.aumid.empty() ? pin.aumid : PackagedAumidForExe(pin.path);
+        if (!id.empty())
+            return LaunchPlan{AppsFolderPath(id), {}, {}};
+        Log(L"tasks: pin %s is a packaged program without an app id", pin.name.c_str());
+    }
+    if (!pin.path.empty() && !IsLink(pin.path) && pin.args.empty() && IsWebApp(pin.aumid, pin.args)) {
+        std::wstring relaunchExe, relaunchArgs;
+        if (!relaunchCommand.empty() && SplitCommandLine(relaunchCommand, relaunchExe, relaunchArgs))
+            return LaunchPlan{relaunchExe, relaunchArgs, ParentDirOf(relaunchExe)};
+        if (!pin.aumid.empty())
+            return LaunchPlan{AppsFolderPath(pin.aumid), {}, {}};
+    }
+    if (!pin.path.empty()) {
+        const bool link = IsLink(pin.path);
+        return LaunchPlan{pin.path, link ? std::wstring() : pin.args, link ? std::wstring() : ParentDirOf(pin.path)};
+    }
+    if (!pin.aumid.empty())
+        return LaunchPlan{AppsFolderPath(pin.aumid), {}, {}};
+    Log(L"tasks: pin %s has nothing to launch", pin.name.c_str());
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<LaunchPlan> BuildLaunchPlan(const PinnedApp* pin, const std::wstring& aumid, const std::wstring& exePath, const std::wstring& key,
+                                          const std::wstring& relaunchCommand)
+{
+    if (pin)
+        return BuildPinnedLaunchPlan(*pin, relaunchCommand);
+    if (!relaunchCommand.empty() && IsWebApp(aumid, relaunchCommand)) {
+        std::wstring relaunchExe, relaunchArgs;
+        if (SplitCommandLine(relaunchCommand, relaunchExe, relaunchArgs))
+            return LaunchPlan{relaunchExe, relaunchArgs, ParentDirOf(relaunchExe)};
     }
     const bool packaged = IsPackagedPath(exePath);
     if (!exePath.empty() && !packaged)

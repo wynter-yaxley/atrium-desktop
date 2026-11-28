@@ -434,6 +434,30 @@ IconImage ApplySquircleMaskIfFullBleed(const IconImage& img)
     return IconImage::FromBgra(side, side, std::move(px));
 }
 
+bool LoadIconResourceImage(const std::wstring& path, int index, int sizePx, IconImage& out)
+{
+    if (path.empty() || sizePx <= 0)
+        return false;
+    std::wstring expanded = path;
+    if (path.find(L'%') != std::wstring::npos) {
+        wchar_t buf[MAX_PATH * 2]{};
+        const DWORD n = ExpandEnvironmentStringsW(path.c_str(), buf, ARRAYSIZE(buf));
+        if (n > 0 && n <= ARRAYSIZE(buf))
+            expanded = buf;
+    }
+    HICON icon = nullptr;
+    if (SHDefExtractIconW(expanded.c_str(), index, 0, &icon, nullptr, MAKELONG(sizePx, 0)) == S_OK && icon) {
+        IconImage raw;
+        const bool ok = HIconToImage(icon, raw);
+        DestroyIcon(icon);
+        if (ok) {
+            out = ApplySquircleMaskIfFullBleed(FitToSquare(raw, sizePx));
+            return true;
+        }
+    }
+    return index == 0 && LoadShellImage(expanded, sizePx, out);
+}
+
 bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail)
 {
     if (!thumbnail) {

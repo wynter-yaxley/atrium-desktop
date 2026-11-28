@@ -233,13 +233,15 @@ bool PanelGlassHost::AnyReadbackPending() const
     return std::ranges::any_of(panels_, [](const auto& e) { return e.second.renderer && e.second.renderer->ReadbackPending(); });
 }
 
-PanelGlassHost::StepResult PanelGlassHost::SyncPanelCaptures(const std::vector<GlassPanel>& panels, bool barKeepsOwnWindowsOut)
+PanelGlassHost::StepResult PanelGlassHost::SyncPanelCaptures(const std::vector<GlassPanel>& panels, bool barKeepsOwnWindowsOut,
+                                                             const std::wstring& widgetBackdrop)
 {
     // A menu or Stage Manager can remain on a different display from the Dock.
     std::erase_if(panelCaptures_, [&](const auto& entry) {
         return std::none_of(panels.begin(), panels.end(),
                             [&](const GlassPanel& p) { return !p.desktop && MonitorFromRect(&p.window, MONITOR_DEFAULTTONEAREST) == entry.first; });
     });
+    const std::wstring remoteMode = widgetBackdrop == L"wallpaper" ? L"wallpaper" : L"desktop";
     for (const GlassPanel& p : panels) {
         HMONITOR monitor = MonitorFromRect(&p.window, MONITOR_DEFAULTTONEAREST);
         if (p.desktop || monitor == captureMonitor_ || panelCaptures_.contains(monitor))
@@ -252,7 +254,7 @@ PanelGlassHost::StepResult PanelGlassHost::SyncPanelCaptures(const std::vector<G
         HRESULT why = S_OK;
         bool elsewhere = false;
         if (remote_)
-            extra.source = std::make_unique<WallpaperCapture>(gpu_, monitor, frameEvent_);
+            extra.source = std::make_unique<WallpaperCapture>(gpu_, monitor, frameEvent_, remoteMode);
         else
             extra.source = DuplicationCapture::Create(gpu_, monitor, why, elsewhere);
         if (!extra.source) {
@@ -373,7 +375,7 @@ void PanelGlassHost::UpdatePanelBackdrop(PanelState& ps, const GlassPanel& p, ID
             newDesktop = fresh;
             ps.desktopVersion = desktop_.Version();
             if (fresh)
-                ps.desktopMs = now;
+                ps.inkSettleMs = now;
         }
         return;
     }
@@ -408,12 +410,14 @@ void PanelGlassHost::UpdatePanelInk(PanelState& ps, HWND hwnd, const Settings& s
     if (auto rb = ps.renderer->Poll()) {
         changed |= rb->changed;
         under = rb->changed;
+        if (rb->changed)
+            ps.inkSettleMs = now;
         // The ink region by region (cells of about 20 DIP), from what
         // the glass shows there, each cell with the bar's hysteresis;
         // the popup's own ink is what most of it needs.
         UpdatePanelInkGrid(*rb, settings, panelScale, w, h, ps.grid, ps.dark, ps.inkOwed);
     }
-    if (ps.inkOwed && ps.ink >= 0 && now - ps.desktopMs < kDesktopSettleMs) {
+    if (ShouldDeferPanelInk(ps.inkOwed, ps.ink, now, ps.inkSettleMs, kDesktopSettleMs)) {
         inkDue_ = true;
     } else if (ps.inkOwed) {
         ps.inkOwed = false;
@@ -485,6 +489,9 @@ PanelGlassHost::StepResult PanelGlassHost::RenderSinglePanel(const GlassPanel& p
         // its glass, which is drawn and announced anew; else a plain panel stands in.
         ps.shown = p.shown;
         ps.ready = false;
+        ps.ink = -1;
+        ps.inkOwed = false;
+        ps.inkSettleMs = -1e9;
         changed = true;
     }
     bool newDesktop = false, under = false;
@@ -564,7 +571,7 @@ PanelGlassHost::RenderResult PanelGlassHost::Render(const std::vector<GlassPanel
                                                     ID3D11Texture2D* source, uint64_t tick, bool barKeepsOwnWindowsOut)
 {
     inkDue_ = false;
-    if (const StepResult cap = SyncPanelCaptures(panels, barKeepsOwnWindowsOut); cap != StepResult::Ok)
+    if (const StepResult cap = SyncPanelCaptures(panels, barKeepsOwnWindowsOut, settings.widgetBackdrop); cap != StepResult::Ok)
         return {cap, false, false};
     for (auto it = panels_.begin(); it != panels_.end();) {
         const bool listed = std::ranges::any_of(panels, [&](const GlassPanel& p) { return p.hwnd == it->first; });

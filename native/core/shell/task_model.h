@@ -131,7 +131,8 @@ std::wstring PackagedAumidForExe(const std::wstring& exe);
 std::wstring TaskProcessImagePath(HANDLE process);
 bool ExecTaskLaunch(const std::wstring& file, const std::wstring& args, const std::wstring& dir, bool noAsync = false);
 bool ProcessRuns(const std::wstring& exe);
-std::optional<LaunchPlan> BuildLaunchPlan(const PinnedApp* pin, const std::wstring& aumid, const std::wstring& exePath, const std::wstring& key);
+std::optional<LaunchPlan> BuildLaunchPlan(const PinnedApp* pin, const std::wstring& aumid, const std::wstring& exePath, const std::wstring& key,
+                                          const std::wstring& relaunchCommand = {});
 bool OpenFilesWithTaskApp(const std::wstring& desktopExe, const std::wstring& aumid, const std::vector<std::wstring>& files);
 bool SendTaskSysCommand(HWND h, WPARAM command);
 void RaiseTaskWindow(HWND h, HWND ui, UINT restoreMsg, const std::function<void(HWND)>& deferActivate, const std::function<bool(HWND)>& isPending);
@@ -145,6 +146,9 @@ struct TaskWinInfo {
     ULONGLONG created = 0;
     bool webApp = false;
     std::wstring launcher;
+    std::wstring relaunchCommand;
+    std::wstring relaunchIcon;
+    std::wstring relaunchName;
 };
 
 struct TaskPin {
@@ -152,6 +156,7 @@ struct TaskPin {
     std::wstring key, target, exe, aumid;
     bool multipleWindows = false;
     bool specific = false;
+    bool webApp = false;
 };
 
 std::wstring TaskHwndKey(HWND h);
@@ -167,6 +172,8 @@ TaskPin ResolveTaskPin(const PinnedApp& app);
 // Background icon and display-name worker (task_model_icons.cpp).
 struct TaskIconSource {
     std::wstring aumid, pinPath, exePath;
+    std::wstring relaunchIcon, relaunchName;
+    bool webApp = false;
     std::vector<HWND> hwnds;
     std::wstring Signature() const;
 };

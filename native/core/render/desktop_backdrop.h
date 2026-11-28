@@ -155,21 +155,30 @@ private:
     std::vector<std::shared_ptr<Wallpaper>> retired_;
 };
 
-// The glass's backdrop in remote-control mode (setting remoteVisible): the wallpaper under one
-// monitor, never the screen. Nothing reads the screen, so Atrium's windows may show in every
-// capture, a remote-control app's Desktop Duplication included.
+// The glass's backdrop in remote-control mode (setting remoteVisible): captures Explorer's
+// desktop window (or the static wallpaper when chosen), never reading screen pixels, so
+// Atrium's windows may show in every capture, a remote-control app's Desktop Duplication included.
 class WallpaperCapture : public BackdropSource {
 public:
-    WallpaperCapture(const Gpu& gpu, HMONITOR monitor, HANDLE frameEvent) : gpu_(gpu), monitor_(monitor), wallpaper_(gpu, frameEvent) {}
+    WallpaperCapture(const Gpu& gpu, HMONITOR monitor, HANDLE frameEvent, const std::wstring& mode = L"desktop")
+        : gpu_(gpu),
+          monitor_(monitor),
+          mode_(mode == L"wallpaper" ? L"wallpaper" : L"desktop"),
+          wallpaper_(gpu, frameEvent)
+    {
+    }
     ID3D11Texture2D* Acquire() override;
     void Release() override {}
     ID3D11Texture2D* Again() override { return version_ ? texture_.get() : nullptr; }
     bool CanReplay() const override { return true; }
     bool KeepsOwnWindowsOut() const override { return true; }
+    void SetPaused(bool paused) override;
 
 private:
     const Gpu& gpu_;
     HMONITOR monitor_;
+    std::wstring mode_;
+    bool paused_ = false;
     DesktopBackdrop wallpaper_;
     unsigned version_ = 0;
     winrt::com_ptr<ID3D11Texture2D> texture_; // the monitor's part of the picture

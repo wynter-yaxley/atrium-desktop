@@ -293,6 +293,21 @@ int TaskModel::Impl::MatchPin(const detail::TaskWinInfo& info) const
         if (jt != pinByTarget.end() && jt->second < pins.size())
             return static_cast<int>(jt->second);
     }
+    // Versioned subfolder executables opened directly (e.g. WPS opening a .docx bypasses ksolaunch.exe).
+    if (!info.exePath.empty() && !info.webApp) {
+        int matched = -1;
+        for (size_t i = 0; i < pins.size(); ++i) {
+            if (pins[i].specific)
+                continue;
+            if (PinMatchesSubdirLauncherExe(pins[i].exe, info.exePath) || PinMatchesSubdirLauncherExe(pins[i].target, info.exePath)) {
+                if (matched >= 0)
+                    return -1; // ambiguous across multiple pins
+                matched = static_cast<int>(i);
+            }
+        }
+        if (matched >= 0)
+            return matched;
+    }
     return -1;
 }
 
@@ -321,13 +336,16 @@ void TaskModel::Impl::FinalizeItemMetadata(std::vector<TaskItem>& result, const 
     for (TaskItem& t : result) {
         const TaskMeta& m = newMeta.at(t.key);
         if (!t.pinned)
-            t.multipleWindows = AllowsMultipleWindows(PinnedApp{t.name, m.source.exePath, {}, m.source.aumid});
+            t.multipleWindows = !m.webApp && AllowsMultipleWindows(PinnedApp{t.name, m.source.exePath, {}, m.source.aumid});
         if (t.name.empty()) {
             auto n = names.find(t.key);
             if (n != names.end()) {
                 t.name = n->second;
             } else {
-                t.name = !m.source.exePath.empty() ? FileStem(m.source.exePath) : !m.source.pinPath.empty() ? FileStem(m.source.pinPath) : firstTitle.at(t.key);
+                t.name = !m.source.relaunchName.empty() ? m.source.relaunchName :
+                         !m.source.exePath.empty()      ? FileStem(m.source.exePath) :
+                         !m.source.pinPath.empty()      ? FileStem(m.source.pinPath) :
+                                                          firstTitle.at(t.key);
                 if (t.name.empty())
                     t.name = m.source.aumid;
             }
@@ -354,9 +372,11 @@ void TaskModel::Impl::SeedPinnedItems(std::vector<TaskItem>& out, std::unordered
         at[p.key] = out.size();
         out.push_back(std::move(t));
         TaskMeta& m = newMeta[p.key];
+        m.webApp = p.webApp;
         m.source.aumid = p.aumid;
         m.source.pinPath = p.app.path;
         m.source.exePath = p.exe;
+        m.source.webApp = p.webApp;
     }
 }
 
@@ -401,10 +421,20 @@ void TaskModel::Impl::RecordWindowInGroup(const TaskScanRec& r, size_t pinCount,
         t.attention = true;
     t.badge = std::max(t.badge, ParseTitleBadge(r.title, r.info.webApp, r.info.exePath, r.info.aumid));
     TaskMeta& m = newMeta[key];
+    if (r.info.webApp) {
+        m.webApp = true;
+        m.source.webApp = true;
+    }
     if (m.source.exePath.empty())
         m.source.exePath = r.info.exePath;
     if (m.source.aumid.empty())
         m.source.aumid = r.info.aumid;
+    if (m.relaunchCommand.empty() && !r.info.relaunchCommand.empty())
+        m.relaunchCommand = r.info.relaunchCommand;
+    if (m.source.relaunchIcon.empty() && !r.info.relaunchIcon.empty())
+        m.source.relaunchIcon = r.info.relaunchIcon;
+    if (m.source.relaunchName.empty() && !r.info.relaunchName.empty())
+        m.source.relaunchName = r.info.relaunchName;
     m.source.hwnds.push_back(r.hwnd);
     if (std::ranges::none_of(m.processTargets,
                              [&](const AppProcessIdentity& target) { return target.exePath == r.info.exePath && target.aumid == r.info.aumid; }))
