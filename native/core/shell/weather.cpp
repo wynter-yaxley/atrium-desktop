@@ -16,6 +16,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -683,7 +684,7 @@ void AddSunEvents(const json::JsonObject& daily, int64_t now, std::vector<HourIt
             wchar_t label[16];
             swprintf_s(label, L"%d:%02d", h, m);
             x.label = label;
-            x.event = key[4] == L'r' ? 1 : 2;
+            x.event = std::wstring_view(key) == L"sunrise" ? 1 : 2;
             items.push_back({at, x});
         }
     }
