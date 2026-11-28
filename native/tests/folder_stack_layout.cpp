@@ -88,6 +88,15 @@ int main()
     const auto tall = FanPlacement(kBar, entry, kWork, 1.f, BarEdge::Bottom, many);
     Require(tall.items.size() < many.size() && tall.window.top >= kWork.top, "a fan taller than the display ends at its top");
 
+    // On a short, scaled display, the slanted long names need more height than the icons.
+    const std::vector<float> longNames(8, 240.f);
+    const auto shortBottom = FanPlacement(RECT{300, 630, 1100, 720}, RECT{670, 640, 730, 710}, RECT{0, 0, 1366, 630}, 1.5f, BarEdge::Bottom, longNames);
+    Require(shortBottom.items.size() == 7 && shortBottom.window.top >= 0 && shortBottom.window.bottom == 612,
+            "long names on a short scaled bottom bar fit within the work area");
+    const auto shortTop = FanPlacement(RECT{300, 0, 1100, 90}, RECT{670, 10, 730, 80}, RECT{0, 90, 1366, 720}, 1.5f, BarEdge::Top, longNames);
+    Require(shortTop.items.size() == 7 && shortTop.window.bottom <= 720 && shortTop.window.top == 108,
+            "long names on a short scaled top bar fit within the work area");
+
     const auto tight = FanPlacement(RECT{300, 100, 1620, 160}, RECT{1400, 105, 1450, 155}, RECT{0, 60, 1920, 160}, 1.f, BarEdge::Bottom, names);
     Require(tight.fan && tight.items.size() == 1, "tight room still keeps at least one fan item");
     CheckFan(tight, 1.f, "single tight-room fan item lies inside its window");
