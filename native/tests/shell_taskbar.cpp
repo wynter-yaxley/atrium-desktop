@@ -116,9 +116,14 @@ bool TestPendingRestoresAndHiddenWindows()
 bool TestModalRestoreAndActivation()
 {
     using atrium::ActivationCandidate;
+    using atrium::ClickOpensWindowPicker;
     using atrium::DecideWindowRestoreMethod;
     using atrium::SelectActivationTarget;
     using atrium::WindowRestoreMethod;
+    if (ClickOpensWindowPicker(0) || ClickOpensWindowPicker(1) || !ClickOpensWindowPicker(2) || !ClickOpensWindowPicker(3)) {
+        std::fprintf(stderr, "FAIL: shell_taskbar ClickOpensWindowPicker check failed\n");
+        return false;
+    }
     if (DecideWindowRestoreMethod(false, true, false, false) != WindowRestoreMethod::None ||
         DecideWindowRestoreMethod(false, false, true, true) != WindowRestoreMethod::None ||
         DecideWindowRestoreMethod(true, true, false, false) != WindowRestoreMethod::SysCommand ||

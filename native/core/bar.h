@@ -157,8 +157,9 @@ public:
     std::function<void()> onCloseRequest; // WM_CLOSE on a bar window (taskkill, logoff)
     // True while a popup opened from the bar is open: an auto-hidden bar stays up.
     std::function<bool()> keepShown;
-    // The pointer rests on an app with windows: preview them above `anchor` (screen px: the icon's
-    // centre, the top of the magnified icons); onPreviewLeave when it moves off, onPreviewClose on a press.
+    // The pointer rests on an app with windows, or its icon is clicked while it has several: preview
+    // them above `anchor` (screen px: the icon's centre, the top of the magnified icons);
+    // onPreviewLeave when it moves off, onPreviewClose on a press.
     std::function<void(const std::wstring& key, const std::vector<HWND>& windows, POINT anchor)> onPreview;
     std::function<void()> onPreviewLeave;
     std::function<void()> onPreviewClose;
@@ -237,6 +238,8 @@ private:
     void UpdateTooltips();   // refreshes the text of a visible tooltip
     void HideTooltip();
     void ShowTooltip();      // above the hovered item, after a short delay
+    bool ClickShowsWindowPicker(const std::wstring& key) const; // several windows: its click presents them
+    bool ShowPreviewFor(const std::wstring& key); // the app's windows above its icon; false when it has none
     std::wstring TooltipText(const std::wstring& key) const;
     void ClickEntry(const std::wstring& key);
     // The right-hand group (Relayout): each entry from the bar's end leftwards, and the metrics they share.
