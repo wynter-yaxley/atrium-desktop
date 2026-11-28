@@ -315,7 +315,7 @@ int main()
     alerts.Noticed(Messenger::WeCom, 31000);
     require(alerts.Due(34000).empty(), "a card with the text follows: no plain card");
     alerts.Noticed(Messenger::QQ, 50000);
-    require(alerts.Flash(Messenger::QQ, 52000), "a QQ burst");
+    require(!alerts.Flash(Messenger::QQ, 52000), "QQ flashes do not synthesize textless notification cards");
     require(alerts.Due(56000).empty(), "a card just before the flash counts too");
     bool waiting = false;
     require(alerts.Flash(Messenger::WeChat, 60000) && alerts.Due(61000, &waiting).empty() && waiting, "still waiting");
@@ -323,13 +323,18 @@ int main()
     require(alerts.Due(65000, &waiting).empty() && !waiting, "cancelled burst produces no plain card");
     require(alerts.Flash(Messenger::WeChat, 66000), "flash after cancel begins a new burst");
 
-    // Multi-instance isolation (two WeChat/QQ PIDs).
+    // Multi-instance isolation for apps that still use flash-only fallback cards.
     MessengerAlerts multi;
-    require(multi.Flash(Messenger::QQ, 1000, 101) && multi.Flash(Messenger::QQ, 1100, 202), "two QQ PIDs begin independent flash bursts");
-    multi.Noticed(Messenger::QQ, 1200, 101);
+    require(multi.Flash(Messenger::WeCom, 1000, 101) && multi.Flash(Messenger::WeCom, 1100, 202), "two WeCom PIDs begin independent flash bursts");
+    multi.Noticed(Messenger::WeCom, 1200, 101);
     multi.Cancel(Messenger::WeChat, 303);
     const auto dueMulti = multi.DueInstances(5000);
-    require(dueMulti.size() == 1 && dueMulti[0] == (MessengerAlerts::DueAlert{Messenger::QQ, 202}), "noticed/cancel on PID 101 does not suppress PID 202");
+    require(dueMulti.size() == 1 && dueMulti[0] == (MessengerAlerts::DueAlert{Messenger::WeCom, 202}), "noticed/cancel on PID 101 does not suppress PID 202");
+    MessengerAlerts qqFlashes;
+    for (ULONGLONG now : {1000ull, 1500ull, 12000ull, 30000ull}) {
+        require(!qqFlashes.Flash(Messenger::QQ, now, 101) && !qqFlashes.Flash(Messenger::QQ, now, 202), "flashing QQ accounts do not arm fallback cards");
+        require(qqFlashes.DueInstances(now + 4000).empty(), "repeated unread QQ flashes never create blank reminder cards");
+    }
     require(multi.Flash(Messenger::WeChat, 10000, 111) && multi.Flash(Messenger::WeChat, 10100, 222), "two WeChat PIDs begin independent flash bursts");
     multi.Cancel(Messenger::WeChat, 111);
     const auto dueWeChat = multi.DueInstances(14000);

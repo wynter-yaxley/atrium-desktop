@@ -6,7 +6,8 @@
 // in the tray) or its tray icon. Where its text is read (WeChat's chat list, Feishu's popup, QQ's
 // Windows notification) a card follows within moments. A flash no card followed (WeCom and
 // DingTalk publish nothing readable; WeChat in the tray before its window was ever opened) still
-// gets one: "WeChat · New message", as the reference notifiers do.
+// gets one: "WeChat · New message", as the reference notifiers do. QQ is excluded:
+// its continuing unread-icon flashes are not evidence of new messages; use actual Windows notices.
 #pragma once
 
 #include <windows.h>
@@ -96,7 +97,7 @@ public:
     // True when this flash begins a burst (check Due/DueInstances after kWaitMs).
     bool Flash(Messenger m, ULONGLONG now, DWORD pid = 0)
     {
-        if (m == Messenger::None)
+        if (m == Messenger::None || m == Messenger::QQ)
             return false;
         State& s = state_[{m, pid}];
         const bool begins = !s.pending && (s.last == 0 || now - s.last >= kQuietMs);
