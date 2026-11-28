@@ -542,6 +542,46 @@ void TestCoverReadyNotifyInvariants()
     Require(!pourDoneDup.notify && !pourDoneDup.pourDone, "duplicate pourFinished must not re-notify");
 }
 
+void TestGenieCutoutPack()
+{
+    const RECT surf{100, 100, 1900, 1080};
+
+    // 1. Disjoint rect produces zero cutouts.
+    const std::array<RECT, 1> disjoint{{{0, 0, 90, 90}}};
+    const atrium::GenieCutoutPack emptyPack = atrium::BuildGenieCutoutPack(disjoint, surf);
+    Require(emptyPack.count == 0, "disjoint rect must yield empty cutout pack");
+
+    // 2. Partial bottom-bar overlap translates exact surface-local bounds.
+    const std::array<RECT, 1> bottomBar{{{400, 1000, 1500, 1120}}};
+    const atrium::GenieCutoutPack single = atrium::BuildGenieCutoutPack(bottomBar, surf);
+    Require(single.count == 1 && single.rects[0] == std::array<float, 4>{300.0f, 900.0f, 1400.0f, 980.0f},
+            "overlapping bar rect must translate cleanly to surface-local pixel coordinates");
+
+    // 3. Multi-monitor: 1 overlapping + 1 disjoint + empty/inverted ignored -> 1 cutout.
+    const std::array<RECT, 4> mixed{{
+        {3000, 900, 3800, 1000},
+        {500, 500, 500, 600},
+        {800, 700, 700, 800},
+        {50, 950, 300, 1020},
+    }};
+    const atrium::GenieCutoutPack filtered = atrium::BuildGenieCutoutPack(mixed, surf);
+    Require(filtered.count == 1 && filtered.rects[0] == std::array<float, 4>{0.0f, 850.0f, 200.0f, 920.0f},
+            "disjoint and empty/inverted rects must be skipped");
+
+    // 4. More than kMaxGenieCutouts intersecting rects cap at kMaxGenieCutouts.
+    const std::array<RECT, 6> many{{
+        {110, 110, 200, 200},
+        {210, 110, 300, 200},
+        {310, 110, 400, 200},
+        {410, 110, 500, 200},
+        {510, 110, 600, 200},
+        {610, 110, 700, 200},
+    }};
+    const atrium::GenieCutoutPack capped = atrium::BuildGenieCutoutPack(many, surf);
+    Require(capped.count == static_cast<int>(atrium::kMaxGenieCutouts) && capped.rects[3] == std::array<float, 4>{310.0f, 10.0f, 400.0f, 100.0f},
+            "cutout pack must cap at kMaxGenieCutouts");
+}
+
 } // namespace
 
 int main()
@@ -555,6 +595,7 @@ int main()
     TestSnapshotMatchesLiveIdentity();
     TestHardwareFlightLaunchFallback();
     TestCoverReadyNotifyInvariants();
+    TestGenieCutoutPack();
     if (g_failures > 0)
         return 1;
     std::printf("genie mesh: all checks passed\n");

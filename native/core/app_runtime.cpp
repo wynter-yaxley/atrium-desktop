@@ -487,6 +487,18 @@ void InitializeSubsystems(HINSTANCE instance, Settings& settings)
     };
     g_app.genie = std::make_unique<GenieMinimize>(instance, GenieIconTarget, [](HWND window) { return g_app.stage && g_app.stage->OwnsMinimize(window); });
     g_app.genie->SetHardwareHost(g_app.bar.get());
+    g_app.bar->onGenieScene = [](const GenieSceneSnapshot& scene, std::vector<RECT>& cutouts) {
+        for (const auto& sec : g_app.secondaryBars) {
+            if (!sec)
+                continue;
+            if (sec->ShownOnScreen())
+                cutouts.push_back(sec->WindowRect());
+            GenieSceneSnapshot secScene = scene;
+            secScene.overlayHwnd = nullptr;
+            secScene.cutoutRects.clear();
+            sec->SubmitBarGenieOverlay(std::move(secScene));
+        }
+    };
     TaskModel::SetWindowSteps([](HWND w, std::function<void()> step) { return g_app.genie && g_app.genie->Minimize(w, std::move(step)); },
                               [](HWND w, std::function<void()> step) { return g_app.genie && g_app.genie->Restore(w, std::move(step)); });
     g_app.status = std::make_unique<SystemStatusReader>(g_app.host, WM_STATUS, WM_VOLUME);

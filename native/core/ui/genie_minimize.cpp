@@ -561,9 +561,11 @@ void GenieMinimize::PublishHardwareFlights()
             SetTimer(hwOverlay_, kHwIdleTimer, kIdleMs, nullptr);
         return;
     }
-    if (hwOverlay_)
-        SetWindowPos(hwOverlay_, HWND_TOPMOST, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (hwOverlay_) {
+        HWND zAnchor = hardwareHost_->OverlayAnchorHwnd();
+        SetWindowPos(hwOverlay_, (zAnchor && IsWindowVisible(zAnchor)) ? zAnchor : HWND_TOPMOST, bounds.left, bounds.top, bounds.right - bounds.left,
+                     bounds.bottom - bounds.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
 
     const std::vector<GenieFlightFrame> frames = stateMachine_.ActiveFrames();
     GenieSceneSnapshot scene{0, hardwareEpoch_, hwOverlay_, bounds, {}};

@@ -16,9 +16,11 @@ namespace {
 
 struct GenieParamsCb {
     float opacity = 1.0f;
-    float pad[3]{};
+    float cutoutCount = 0.0f;
+    float pad[2]{};
+    float cutouts[kMaxGenieCutouts][4]{};
 };
-static_assert(sizeof(GenieParamsCb) == 16);
+static_assert(sizeof(GenieParamsCb) == 80);
 
 bool IsDeviceRemovedHr(HRESULT hr) { return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG; }
 
@@ -52,6 +54,7 @@ void GenieRenderer::ReleaseSurfaceResources()
     swapW_ = 0;
     swapH_ = 0;
     textures_.clear();
+    presentedCutouts_ = {};
     hasPresentedNonEmpty_ = false;
 }
 
@@ -335,6 +338,7 @@ GenieRenderer::RenderResult GenieRenderer::RenderIdle(const GenieSceneSnapshot& 
             return {RenderStatus::DeviceLost, false};
         hasPresentedNonEmpty_ = false;
         presentedSeq_ = scene.seq;
+        presentedCutouts_ = {};
         idleSinceMs_ = nowMs;
     }
     if ((swap_ || !textures_.empty()) &&
@@ -344,12 +348,13 @@ GenieRenderer::RenderResult GenieRenderer::RenderIdle(const GenieSceneSnapshot& 
     return {RenderStatus::Ok, false};
 }
 
-void GenieRenderer::BindFramePipeline(int width, int height)
+void GenieRenderer::BindFramePipeline(ID3D11RenderTargetView* rtv, int width, int height, bool clearTarget)
 {
     auto* ctx = gpu_.context.get();
-    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    ctx->ClearRenderTargetView(rtv_.get(), clear);
-    ID3D11RenderTargetView* rtv = rtv_.get();
+    if (clearTarget) {
+        const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        ctx->ClearRenderTargetView(rtv, clear);
+    }
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     ctx->OMSetBlendState(blend_.get(), nullptr, 0xFFFFFFFF);
     const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
@@ -365,7 +370,8 @@ void GenieRenderer::BindFramePipeline(int width, int height)
     ctx->PSSetConstantBuffers(0, 1, &cb);
 }
 
-bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, bool& drewFlight, bool& deviceLost)
+bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, const GenieCutoutPack& cutouts, bool& drewFlight,
+                               bool& deviceLost)
 {
     drewFlight = false;
     deviceLost = false;
@@ -411,7 +417,10 @@ bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& 
     std::memcpy(mapped.pData, mesh.vertices.data(), mesh.vertices.size() * sizeof(GenieVertex));
     ctx->Unmap(vb_.get(), 0);
 
-    const GenieParamsCb params{ev.opacity, {}};
+    GenieParamsCb params{};
+    params.opacity = ev.opacity;
+    params.cutoutCount = static_cast<float>(cutouts.count);
+    std::memcpy(params.cutouts, cutouts.rects.data(), sizeof(params.cutouts));
     ctx->UpdateSubresource(cb_.get(), 0, nullptr, &params, 0, 0);
 
     const UINT stride = sizeof(GenieVertex);
@@ -425,7 +434,64 @@ bool GenieRenderer::DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& 
     return true;
 }
 
-GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scene, double nowMs, const FrameNotifyFn& onFramePresented)
+bool GenieRenderer::DrawIntoTarget(const GenieSceneSnapshot& scene, double nowMs, ID3D11RenderTargetView* targetRtv, const RECT& targetBounds, bool& deviceLost)
+{
+    deviceLost = false;
+    if (scene.flights.empty())
+        return true;
+
+    const int width = static_cast<int>(targetBounds.right - targetBounds.left);
+    const int height = static_cast<int>(targetBounds.bottom - targetBounds.top);
+    if (!targetRtv || width <= 0 || height <= 0)
+        return true;
+
+    struct PendingFlight {
+        const GenieFlightDraw* flight = nullptr;
+        GenieFlightEval eval;
+    };
+    std::vector<PendingFlight> intersecting;
+    intersecting.reserve(scene.flights.size());
+    for (const GenieFlightDraw& f : scene.flights) {
+        const GenieFlightEval ev = EvaluateGenieFlightAt(f, nowMs);
+        if (!f.image || f.image->Empty() || ev.opacity <= 0.002f)
+            continue;
+        const RECT flightBounds{std::min(f.fromRect.left, f.toRect.left), std::min(f.fromRect.top, f.toRect.top), std::max(f.fromRect.right, f.toRect.right),
+                                std::max(f.fromRect.bottom, f.toRect.bottom)};
+        RECT ix{};
+        if (IntersectRect(&ix, &flightBounds, &targetBounds))
+            intersecting.push_back({&f, ev});
+    }
+    if (intersecting.empty())
+        return true;
+
+    if (!EnsurePipeline()) {
+        deviceLost = IsDeviceRemoved(S_OK);
+        return false;
+    }
+
+    const GenieCutoutPack emptyCutouts{};
+    BindFramePipeline(targetRtv, width, height, false);
+    auto* ctx = gpu_.context.get();
+    for (const PendingFlight& item : intersecting) {
+        bool drew = false;
+        if (!DrawFlight(*item.flight, item.eval, targetBounds, emptyCutouts, drew, deviceLost)) {
+            ID3D11ShaderResourceView* nullSrv = nullptr;
+            ctx->PSSetShaderResources(0, 1, &nullSrv);
+            ctx->RSSetState(nullptr);
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    ctx->PSSetShaderResources(0, 1, &nullSrv);
+    ctx->RSSetState(nullptr);
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
+GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scene, double nowMs, const FrameNotifyFn& onFramePresented,
+                                                  std::span<const RECT> extraCutouts)
 {
     if (scene.flights.empty())
         return RenderIdle(scene, nowMs);
@@ -433,11 +499,6 @@ GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scen
     idleSinceMs_ = 0.0;
     PruneFlightTracking(scene);
     PruneUnusedTextures(scene);
-
-    const int width = static_cast<int>(scene.overlayBounds.right - scene.overlayBounds.left);
-    const int height = static_cast<int>(scene.overlayBounds.bottom - scene.overlayBounds.top);
-    if (!scene.overlayHwnd || !IsWindow(scene.overlayHwnd) || width <= 0 || height <= 0)
-        return {RenderStatus::Ok, false};
 
     std::vector<GenieFlightEval> evals;
     evals.reserve(scene.flights.size());
@@ -450,7 +511,18 @@ GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scen
         evals.push_back(ev);
     }
 
-    if (scene.seq == presentedSeq_ && !anyAnimating && !anyPendingNotify)
+    const int width = static_cast<int>(scene.overlayBounds.right - scene.overlayBounds.left);
+    const int height = static_cast<int>(scene.overlayBounds.bottom - scene.overlayBounds.top);
+    if (!scene.overlayHwnd || !IsWindow(scene.overlayHwnd) || width <= 0 || height <= 0)
+        return {RenderStatus::Ok, anyAnimating};
+
+    std::vector<RECT> allCutouts;
+    allCutouts.reserve(scene.cutoutRects.size() + extraCutouts.size());
+    allCutouts.insert(allCutouts.end(), scene.cutoutRects.begin(), scene.cutoutRects.end());
+    allCutouts.insert(allCutouts.end(), extraCutouts.begin(), extraCutouts.end());
+    const GenieCutoutPack cutouts = BuildGenieCutoutPack(allCutouts, scene.overlayBounds);
+
+    if (scene.seq == presentedSeq_ && cutouts == presentedCutouts_ && !anyAnimating && !anyPendingNotify)
         return {RenderStatus::Ok, false};
 
     if (!EnsurePipeline())
@@ -461,11 +533,11 @@ GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scen
         return {surfaceLost ? RenderStatus::DeviceLost : RenderStatus::Ok, false};
 
     std::vector<bool> drewFlights(scene.flights.size(), false);
-    BindFramePipeline(width, height);
+    BindFramePipeline(rtv_.get(), width, height, true);
     for (size_t i = 0; i < scene.flights.size(); ++i) {
         bool drew = false;
         bool deviceLost = false;
-        if (!DrawFlight(scene.flights[i], evals[i], scene.overlayBounds, drew, deviceLost))
+        if (!DrawFlight(scene.flights[i], evals[i], scene.overlayBounds, cutouts, drew, deviceLost))
             return {deviceLost ? RenderStatus::DeviceLost : RenderStatus::Ok, false};
         drewFlights[i] = drew;
     }
@@ -489,6 +561,7 @@ GenieRenderer::RenderResult GenieRenderer::Render(const GenieSceneSnapshot& scen
     }
 
     presentedSeq_ = scene.seq;
+    presentedCutouts_ = cutouts;
     hasPresentedNonEmpty_ = true;
 
     for (size_t i = 0; i < scene.flights.size(); ++i) {

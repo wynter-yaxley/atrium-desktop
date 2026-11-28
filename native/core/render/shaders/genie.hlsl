@@ -3,7 +3,9 @@
 cbuffer GenieParams : register(b0)
 {
     float Opacity;
-    float3 Pad;
+    float CutoutCount;
+    float2 Pad;
+    float4 Cutouts[4];
 };
 
 Texture2D Pic : register(t0);
@@ -40,5 +42,10 @@ float4 PS(VSOut input) : SV_Target
     float2 fw = max(fwidth(input.edgeUv), 1e-5);
     float2 edgeCov = saturate(d / fw + 0.5);
     float edgeAa = min(edgeCov.x, edgeCov.y);
+    [unroll] for (int i = 0; i < 4; ++i)
+    {
+        if (i < (int)CutoutCount && input.pos.x >= Cutouts[i].x && input.pos.x < Cutouts[i].z && input.pos.y >= Cutouts[i].y && input.pos.y < Cutouts[i].w)
+            discard;
+    }
     return col * saturate(Opacity * edgeAa);
 }

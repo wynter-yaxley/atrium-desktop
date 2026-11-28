@@ -97,6 +97,7 @@ public:
     RECT EntryRect(const std::wstring& key) const;
     // Screen rectangle of the glass shape.
     RECT BarRect() const;
+    RECT WindowRect() const { return window_; }
     uint64_t DropBarId() const { return dropId_; }
     RECT DropBarRect() const;
     bool ApplyRemoteFileDragOver(POINT screen, std::wstring& keyOut);
@@ -109,9 +110,12 @@ public:
     // Glass layers of popup windows (GlassHost).
     void SetPanel(const GlassPanel& panel) override;
     // Hardware Genie overlay (UI thread).
+    HWND OverlayAnchorHwnd() const override { return visual_; }
     void SetGenieOverlay(HWND hwnd, uint64_t epoch) override;
     void SubmitGenieFlights(GenieSceneSnapshot scene) override;
+    void SubmitBarGenieOverlay(GenieSceneSnapshot scene);
     void ClearGenieFlights() override;
+    std::function<void(const GenieSceneSnapshot&, std::vector<RECT>&)> onGenieScene;
     // Signals the render thread to stop without waiting.
     void SignalStopRendering();
     // Waits (at most `timeoutMs`) for a signaled render thread while pumping UI messages.

@@ -597,17 +597,20 @@ bool GlassRenderer::DrawOverlay(const std::function<void(ID2D1DeviceContext2*)>&
     return true;
 }
 
-bool GlassRenderer::Present(const GlassParams& params, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty)
+bool GlassRenderer::Present(const GlassParams& params, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty,
+                            const std::function<bool(ID3D11RenderTargetView*, int, int)>& midLayer)
 {
-    return PresentSpan(std::span<const GlassParams>(&params, 1), overlay, backdropDirty);
+    return PresentSpan(std::span<const GlassParams>(&params, 1), overlay, backdropDirty, midLayer);
 }
 
-bool GlassRenderer::Present(const std::vector<GlassParams>& shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty)
+bool GlassRenderer::Present(const std::vector<GlassParams>& shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty,
+                            const std::function<bool(ID3D11RenderTargetView*, int, int)>& midLayer)
 {
-    return PresentSpan(shapes, overlay, backdropDirty);
+    return PresentSpan(shapes, overlay, backdropDirty, midLayer);
 }
 
-bool GlassRenderer::PresentSpan(std::span<const GlassParams> shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty)
+bool GlassRenderer::PresentSpan(std::span<const GlassParams> shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty,
+                                const std::function<bool(ID3D11RenderTargetView*, int, int)>& midLayer)
 {
     lastPresentBusy_ = false;
     bool recordPresented = false;
@@ -631,6 +634,8 @@ bool GlassRenderer::PresentSpan(std::span<const GlassParams> shapes, const std::
         winrt::com_ptr<ID3D11Resource> back;
         rtv_->GetResource(back.put());
         ctx->CopyResource(back.get(), glassCache_.get());
+        if (midLayer && !midLayer(rtv_.get(), w_, h_))
+            return false;
         if (!DrawOverlay(overlay))
             return false;
     } else {

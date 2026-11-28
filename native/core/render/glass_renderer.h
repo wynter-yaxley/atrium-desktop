@@ -121,11 +121,12 @@ public:
     std::optional<Readback> Poll();
     bool ReadbackPending() const { return (comparisonPending_ && hasPresented_) || !inFlight_.empty(); }
 
-    // Draws the glass, then `overlay` with D2D on the same back buffer, and
-    // presents. Returns false if the device was lost.
-    bool Present(const GlassParams& params, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty = true);
-    // Several shapes, back to front (each with its own shadow), then the overlay.
-    bool Present(const std::vector<GlassParams>& shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty = true);
+    // Draws the glass, optional mid-layer pass on the swapchain back buffer, then `overlay` with D2D, and presents.
+    bool Present(const GlassParams& params, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty = true,
+                 const std::function<bool(ID3D11RenderTargetView*, int, int)>& midLayer = {});
+    // Several shapes, back to front (each with its own shadow), optional mid-layer, then the overlay.
+    bool Present(const std::vector<GlassParams>& shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty = true,
+                 const std::function<bool(ID3D11RenderTargetView*, int, int)>& midLayer = {});
     bool LastPresentDrewGlass() const { return lastGlassDrawn_; }
     bool LastPresentBusy() const { return lastPresentBusy_; }
 
@@ -146,7 +147,8 @@ private:
     void NormalizeShapes(std::span<const GlassParams> shapes);
     void RenderGlassShapes(ID3D11RenderTargetView* target, std::span<const GlassParams> shapes);
     bool DrawOverlay(const std::function<void(ID2D1DeviceContext2*)>& overlay);
-    bool PresentSpan(std::span<const GlassParams> shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty);
+    bool PresentSpan(std::span<const GlassParams> shapes, const std::function<void(ID2D1DeviceContext2*)>& overlay, bool backdropDirty,
+                     const std::function<bool(ID3D11RenderTargetView*, int, int)>& midLayer);
 
     Gpu gpu_;
     int w_, h_;

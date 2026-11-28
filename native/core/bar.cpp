@@ -503,6 +503,8 @@ void Bar::SetGenieOverlay(HWND hwnd, uint64_t epoch)
 
 void Bar::SubmitGenieFlights(GenieSceneSnapshot scene)
 {
+    if (onGenieScene)
+        onGenieScene(scene, scene.cutoutRects);
     {
         std::lock_guard g(genieLock_);
         scene.seq = genieScene_.seq + 1;
@@ -516,11 +518,28 @@ void Bar::SubmitGenieFlights(GenieSceneSnapshot scene)
     WakeRender();
 }
 
+void Bar::SubmitBarGenieOverlay(GenieSceneSnapshot scene)
+{
+    scene.overlayHwnd = nullptr;
+    {
+        std::lock_guard g(genieLock_);
+        scene.seq = genieScene_.seq + 1;
+        genieScene_ = std::move(scene);
+        genieSeq_.store(genieScene_.seq, std::memory_order_release);
+    }
+    WakeRender();
+}
+
 void Bar::ClearGenieFlights()
 {
+    if (onGenieScene) {
+        std::vector<RECT> unusedCutouts;
+        onGenieScene(GenieSceneSnapshot{}, unusedCutouts);
+    }
     {
         std::lock_guard g(genieLock_);
         genieScene_.flights.clear();
+        genieScene_.cutoutRects.clear();
         genieScene_.overlayBounds = {};
         genieScene_.overlayHwnd = nullptr;
         ++genieScene_.seq;

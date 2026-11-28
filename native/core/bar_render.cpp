@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -235,15 +236,19 @@ struct BarRender {
         seenGenieSeq = genieSnap.seq;
     }
 
-    bool RenderGenieStep(GenieRenderer& genieRenderer, Bar::SessionEnd& stop)
+    bool RenderGenieStep(GenieRenderer& genieRenderer, double nowMs, bool barVisible, Bar::SessionEnd& stop)
     {
         CopyLatestGenieScene();
-        const GenieRenderer::RenderResult gr = genieRenderer.Render(genieSnap, ClockMs(), [&](uint64_t flightId, double /*nowMs*/, bool pourFinished) {
-            if (genieSnap.overlayHwnd) {
-                const LPARAM lParam = static_cast<LPARAM>((genieSnap.epoch << 1) | (pourFinished ? 1ULL : 0ULL));
-                PostMessageW(genieSnap.overlayHwnd, WM_GENIE_FRAME_PRESENTED, static_cast<WPARAM>(flightId), lParam);
-            }
-        });
+        const std::span<const RECT> barCutout = barVisible ? std::span<const RECT>(&snap.window, 1) : std::span<const RECT>{};
+        const GenieRenderer::RenderResult gr = genieRenderer.Render(
+            genieSnap, nowMs,
+            [&](uint64_t flightId, double /*nowMs*/, bool pourFinished) {
+                if (genieSnap.overlayHwnd) {
+                    const LPARAM lParam = static_cast<LPARAM>((genieSnap.epoch << 1) | (pourFinished ? 1ULL : 0ULL));
+                    PostMessageW(genieSnap.overlayHwnd, WM_GENIE_FRAME_PRESENTED, static_cast<WPARAM>(flightId), lParam);
+                }
+            },
+            barCutout);
         genieActive = gr.active;
         if (gr.status == GenieRenderer::RenderStatus::DeviceLost) {
             stop = Bar::SessionEnd::Retry;
@@ -402,7 +407,8 @@ struct BarRender {
             stop = ToSessionEnd(pr.status);
             return false;
         }
-        if (!RenderGenieStep(genieRenderer, stop))
+        barHadGenie = false;
+        if (!RenderGenieStep(genieRenderer, ClockMs(), false, stop))
             return false;
         if (DeviceLost(gpu, L"hidden")) {
             stop = Bar::SessionEnd::Retry;
@@ -441,7 +447,8 @@ struct BarRender {
         return source;
     }
 
-    bool DrawBarFrame(GlassRenderer& renderer, BarPainter& painter, const PanelGlassHost& panelHost, bool forceGlass, bool hadBackdrop, LARGE_INTEGER t0)
+    bool DrawBarFrame(GlassRenderer& renderer, BarPainter& painter, const PanelGlassHost& panelHost, GenieRenderer& genieRenderer, double frameNowMs,
+                      bool forceGlass, bool hadBackdrop, LARGE_INTEGER t0)
     {
         bool changed = !renderer.HasPresented();
         if (auto rb = renderer.Poll()) {
@@ -458,7 +465,7 @@ struct BarRender {
         if (snap.settings.showClock)
             Bar::ClockStrings(time, date, snap.settings.showClockSeconds);
         const std::wstring textKey = time + L"|" + date;
-        const double nowMs = ClockMs();
+        const double nowMs = frameNowMs;
         BarAnimation anim = painter.Animate(snap.scene, nowMs);
         clockInk.Target(dark ? 1.f : 0.f, nowMs);
         appsInk.Target(darkIcons ? 1.f : 0.f, nowMs);
@@ -467,10 +474,12 @@ struct BarRender {
         animating = anim.Any();
         const Ink inks{clockInk.Value(nowMs), appsInk.Value(nowMs)};
         const ULONGLONG now = GetTickCount64();
+        const bool hasGenieFlights = !genieSnap.flights.empty();
+        const bool genieBarDirty = hasGenieFlights || barHadGenie;
         const bool backdropDirty = forceGlass || changed || pendingBackdropDirty;
         const bool needPresent = backdropDirty || snap.generation != drawnGeneration || textKey != drawnText || dark != drawnDark ||
                                  darkIcons != drawnDarkIcons || anim.Any() || wasGlass || wasBody || wasMusic || barOwed || owedBody || owedMusic ||
-                                 now - lastPresent > kStaleMs;
+                                 genieBarDirty || now - lastPresent > kStaleMs;
         if (!needPresent) {
             readyStalledSinceMs = 0;
             ++stats.skipped; // echo of our own present, or nothing new under the glass
@@ -479,8 +488,9 @@ struct BarRender {
             return true;
         }
         const bool panelsOwed = panelHost.InkDue() || panelHost.AnyOwed();
-        if (anim.MusicOnly() && !panelsMoving && !panelsOwed && !backdropDirty && snap.generation == drawnGeneration && textKey == drawnText &&
-            dark == drawnDark && darkIcons == drawnDarkIcons && !wasBody && !wasGlass && !barOwed && ShouldThrottleMusicOnlyFrame(nowMs - lastPresentMs)) {
+        if (anim.MusicOnly() && !panelsMoving && !panelsOwed && !backdropDirty && !genieBarDirty && snap.generation == drawnGeneration &&
+            textKey == drawnText && dark == drawnDark && darkIcons == drawnDarkIcons && !wasBody && !wasGlass && !barOwed &&
+            ShouldThrottleMusicOnlyFrame(nowMs - lastPresentMs)) {
             owedMusic |= anim.music;
             barOwed = false;
             if (hadBackdrop)
@@ -511,10 +521,16 @@ struct BarRender {
         BarAnimation drawAnim = anim;
         drawAnim.music = anim.music || wasMusic || owedMusic;
         const std::wstring contentKey = std::to_wstring(snap.generation) + textKey + (dark ? L"d" : L"l") + (darkIcons ? L"d" : L"l");
+        bool genieMidLost = false;
+        const auto midLayer = hasGenieFlights ? std::function<bool(ID3D11RenderTargetView*, int, int)>([&](ID3D11RenderTargetView* rtv, int, int) {
+            return genieRenderer.DrawIntoTarget(genieSnap, frameNowMs, rtv, snap.window, genieMidLost);
+        }) :
+                                                std::function<bool(ID3D11RenderTargetView*, int, int)>{};
         const bool ok = renderer.Present(
-            params, [&](ID2D1DeviceContext2* d2d) { painter.Draw(d2d, snap.scene, inks, time, date, contentKey, drawAnim, forceBody); }, backdropDirty);
+            params, [&](ID2D1DeviceContext2* d2d) { painter.Draw(d2d, snap.scene, inks, time, date, contentKey, drawAnim, forceBody); }, backdropDirty,
+            midLayer);
         if (!ok) {
-            Log(L"render: device lost");
+            Log(genieMidLost ? L"render: genie mid-layer device lost" : L"render: device lost");
             return false;
         }
         if (renderer.LastPresentBusy()) {
@@ -528,6 +544,7 @@ struct BarRender {
             return true;
         }
         readyStalledSinceMs = 0;
+        barHadGenie = hasGenieFlights;
         if (renderer.LastPresentDrewGlass())
             ++stats.glassDraws;
         ++stats.presents;
@@ -631,11 +648,13 @@ struct BarRender {
             stop = ToSessionEnd(pr.status);
             return false;
         }
-        if (CheckBlackBackdrop(renderer) || !DrawBarFrame(renderer, painter, panelHost, forceGlass, hadBackdrop, t0)) {
+        CopyLatestGenieScene();
+        const double frameNowMs = ClockMs();
+        if (CheckBlackBackdrop(renderer) || !DrawBarFrame(renderer, painter, panelHost, genieRenderer, frameNowMs, forceGlass, hadBackdrop, t0)) {
             stop = Bar::SessionEnd::Retry;
             return false;
         }
-        if (!RenderGenieStep(genieRenderer, stop))
+        if (!RenderGenieStep(genieRenderer, frameNowMs, true, stop))
             return false;
         return true;
     }
@@ -693,6 +712,7 @@ struct BarRender {
     bool missedFrame = false;
     bool panelsMoving = false, barOwed = false, paused = false, anyScreenPaused = false, wasHidden = false;
     bool genieActive = false;
+    bool barHadGenie = false;
     GenieSceneSnapshot genieSnap;
     uint64_t seenGenieSeq = 0;
     bool wasGlass = false, wasBody = false, wasMusic = false;

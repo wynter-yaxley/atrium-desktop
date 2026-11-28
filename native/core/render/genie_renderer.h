@@ -12,9 +12,11 @@
 #include <winrt/base.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -39,11 +41,36 @@ struct GenieFlightDraw {
     bool inferDirection = true;
 };
 
+inline constexpr size_t kMaxGenieCutouts = 4;
+
+struct GenieCutoutPack {
+    int count = 0;
+    std::array<std::array<float, 4>, kMaxGenieCutouts> rects{};
+    bool operator==(const GenieCutoutPack&) const = default;
+};
+
+// Converts visible screen-space bar rects into surface-local pixel cutouts capped at kMaxGenieCutouts.
+inline GenieCutoutPack BuildGenieCutoutPack(std::span<const RECT> screenCutouts, const RECT& surfaceBounds)
+{
+    GenieCutoutPack pack;
+    for (const RECT& r : screenCutouts) {
+        if (pack.count >= static_cast<int>(kMaxGenieCutouts))
+            break;
+        RECT ix{};
+        if (!IntersectRect(&ix, &r, &surfaceBounds) || IsRectEmpty(&ix))
+            continue;
+        pack.rects[static_cast<size_t>(pack.count++)] = {static_cast<float>(ix.left - surfaceBounds.left), static_cast<float>(ix.top - surfaceBounds.top),
+                                                         static_cast<float>(ix.right - surfaceBounds.left), static_cast<float>(ix.bottom - surfaceBounds.top)};
+    }
+    return pack;
+}
+
 struct GenieSceneSnapshot {
     uint64_t seq = 0;
     uint64_t epoch = 0;
     HWND overlayHwnd = nullptr;
     RECT overlayBounds{};
+    std::vector<RECT> cutoutRects;
     std::vector<GenieFlightDraw> flights;
 };
 
@@ -59,6 +86,7 @@ public:
     GenieHost& operator=(const GenieHost&) = delete;
     GenieHost(GenieHost&&) = delete;
     GenieHost& operator=(GenieHost&&) = delete;
+    virtual HWND OverlayAnchorHwnd() const { return nullptr; }
     virtual void SetGenieOverlay(HWND hwnd, uint64_t epoch) = 0;
     virtual void SubmitGenieFlights(GenieSceneSnapshot scene) = 0;
     virtual void ClearGenieFlights() = 0;
@@ -129,7 +157,8 @@ public:
     GenieRenderer(const GenieRenderer&) = delete;
     GenieRenderer& operator=(const GenieRenderer&) = delete;
 
-    RenderResult Render(const GenieSceneSnapshot& scene, double nowMs, const FrameNotifyFn& onFramePresented);
+    RenderResult Render(const GenieSceneSnapshot& scene, double nowMs, const FrameNotifyFn& onFramePresented, std::span<const RECT> extraCutouts = {});
+    bool DrawIntoTarget(const GenieSceneSnapshot& scene, double nowMs, ID3D11RenderTargetView* targetRtv, const RECT& targetBounds, bool& deviceLost);
     void ReleaseSurfaceResources();
 
 private:
@@ -144,8 +173,9 @@ private:
     bool EnsureSurface(HWND overlayHwnd, int width, int height, bool& surfaceLost);
     ID3D11ShaderResourceView* LookupOrUploadTexture(uint64_t pictureId, const IconImage& image);
     RenderResult RenderIdle(const GenieSceneSnapshot& scene, double nowMs);
-    void BindFramePipeline(int width, int height);
-    bool DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, bool& drewFlight, bool& deviceLost);
+    void BindFramePipeline(ID3D11RenderTargetView* rtv, int width, int height, bool clearTarget);
+    bool DrawFlight(const GenieFlightDraw& f, const GenieFlightEval& ev, const RECT& overlayBounds, const GenieCutoutPack& cutouts, bool& drewFlight,
+                    bool& deviceLost);
     void PruneUnusedTextures(const GenieSceneSnapshot& scene);
     void PruneFlightTracking(const GenieSceneSnapshot& scene);
     bool IsDeviceRemoved(HRESULT hr) const;
@@ -182,6 +212,7 @@ private:
     std::unordered_set<uint64_t> reportedPourDone_;
 
     uint64_t presentedSeq_ = 0;
+    GenieCutoutPack presentedCutouts_;
     bool hasPresentedNonEmpty_ = false;
     double idleSinceMs_ = 0.0;
 };
