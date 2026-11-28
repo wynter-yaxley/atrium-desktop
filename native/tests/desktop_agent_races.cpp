@@ -1,6 +1,7 @@
 #include "shell/desktop_agent_client.h"
 #include "shell/desktop_agent_host.h"
 #include "shell/desktop_agent_ipc.h"
+#include "shell/tray_model.h"
 #include "win32_path.h"
 
 #include <windows.h>
@@ -504,7 +505,7 @@ void TestFailedTrayHostStartReturnsNotOkAndRetries()
     const DWORD selfPid = GetCurrentProcessId();
     constexpr uint64_t kGen = 507;
     const winrt::handle mStop{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, mEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    std::atomic_int hostingCalls{0};
+    std::atomic_int hostingOnCalls{0}, hostingOffCalls{0};
     std::thread mockSrv([&] {
         const winrt::handle srv{CreateSameUserNamedPipeServer(mCmd)};
         OVERLAPPED ov{};
@@ -518,8 +519,12 @@ void TestFailedTrayHostStartReturnsNotOkAndRetries()
             if (!ReadPipeMessageOverlapped(srv.get(), ov, mStop.get(), raw, disc) || !ValidateAndParseAgentCommand(raw, cmd))
                 break;
             AgentCommandReply r{true, selfPid, kGen};
-            if (cmd.type == AgentCommandType::SetTrayHosting && hostingCalls.fetch_add(1) == 0)
-                r.ok = false, r.error = L"tray_host_start_failed";
+            if (cmd.type == AgentCommandType::SetTrayHosting) {
+                if (cmd.hosting && hostingOnCalls.fetch_add(1) == 0)
+                    r.ok = false, r.error = L"tray_host_start_failed";
+                else if (!cmd.hosting && hostingOffCalls.fetch_add(1) == 0)
+                    r.ok = false, r.error = L"tray_host_stop_failed";
+            }
             if (!WritePipeMessageOverlapped(srv.get(), ov, mStop.get(), SerializeAgentCommandReply(r)) || cmd.type == AgentCommandType::Quit)
                 break;
         }
@@ -530,10 +535,29 @@ void TestFailedTrayHostStartReturnsNotOkAndRetries()
                                     3000};
     {
         DesktopAgentClient client({}, cOpts);
+        TrayModel tray(nullptr, 0);
+        tray.SetDesktopAgent(&client);
         Check(WaitUntil([&] { return client.Running(); }, 4000), "retry-hosting client connected");
-        client.SetTrayHosting(true);
-        client.SetTrayHosting(true);
-        Check(hostingCalls.load() == 2, "failed SetTrayHosting reply does not mark confirmed and retries on next call");
+
+        Check(ApplyTrayHostSetting(&tray, true), "first ApplyTrayHostSetting(true) sends command");
+        Check(hostingOnCalls.load() == 1 && !tray.Hosting() && !tray.HostingSynced(true) && !client.Hosting(),
+              "failed start leaves tray hosting unconfirmed and Hosting() false");
+
+        Check(ApplyTrayHostSetting(&tray, true), "re-applying identical trayHost=true retries after failure");
+        Check(hostingOnCalls.load() == 2 && tray.Hosting() && tray.HostingSynced(true) && client.Hosting(),
+              "retry via ApplyTrayHostSetting succeeds and confirms hosting");
+
+        Check(!ApplyTrayHostSetting(&tray, true) && hostingOnCalls.load() == 2, "confirmed trayHost=true skips duplicate ApplyTrayHostSetting");
+
+        Check(ApplyTrayHostSetting(&tray, false), "first ApplyTrayHostSetting(false) sends disable");
+        Check(hostingOffCalls.load() == 1 && !tray.Hosting() && !tray.HostingSynced(false), "failed disable stays unconfirmed");
+
+        Check(ApplyTrayHostSetting(&tray, false), "re-applying identical trayHost=false retries after failure");
+        Check(hostingOffCalls.load() == 2 && !tray.Hosting() && tray.HostingSynced(false), "retry disable confirms");
+
+        Check(!ApplyTrayHostSetting(&tray, false) && hostingOffCalls.load() == 2, "confirmed trayHost=false skips duplicate ApplyTrayHostSetting");
+
+        tray.SetDesktopAgent(nullptr);
         SetEvent(mStop.get());
         client.Shutdown();
     }

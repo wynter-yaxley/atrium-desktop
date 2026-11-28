@@ -5,6 +5,7 @@
 #include <unknwn.h>
 
 #include "icon_image.h"
+#include "log.h"
 #include "pinned_app.h"
 #include "shell/desktop_agent_client.h"
 #include "shell/tray_click.h"
@@ -150,6 +151,13 @@ public:
             return agent->Hosting();
         return host_ != nullptr;
     }
+    bool HostingSynced(bool on) const
+    {
+        if (DesktopAgentClient* agent = desktopAgent_.load())
+            return agent->HostingSynced(on);
+        std::lock_guard g(mutex_);
+        return on == (host_ != nullptr);
+    }
     bool HostYielded() const
     {
         if (DesktopAgentClient* agent = desktopAgent_.load())
@@ -233,5 +241,16 @@ private:
     tray::ShellSession lastReconcileSession_; // worker: what the last "reconcile" line said
     size_t lastReconcileRecords_ = 0, lastReconcileLive_ = 0;
 };
+
+// Syncs the `trayHost` setting against the active epoch's confirmed state so a failed
+// start or stop is retried even if the same boolean setting is applied again.
+inline bool ApplyTrayHostSetting(TrayModel* tray, bool enabled)
+{
+    if (!tray || tray->HostingSynced(enabled))
+        return false;
+    tray->SetHosting(enabled);
+    Log(L"core: tray host %s", tray->Hosting() ? L"on" : enabled ? L"failed to start" : L"off");
+    return true;
+}
 
 } // namespace atrium

@@ -131,34 +131,27 @@ void DesktopAgentClient::Shutdown()
     }
 }
 
-uint64_t DesktopAgentClient::ActiveAgentEpoch() const
-{
-    std::lock_guard lock(stateMutex_);
-    return activeAgentPid_ != 0 ? activeAgentEpoch_ : 0;
-}
-
-bool DesktopAgentClient::IsActiveEpoch(uint64_t epoch) const
-{
-    std::lock_guard lock(stateMutex_);
-    return epoch != 0 && activeAgentPid_ != 0 && activeAgentEpoch_ == epoch;
-}
-
 bool DesktopAgentClient::Hosting() const
 {
     std::lock_guard lock(stateMutex_);
-    return hosting_;
+    return hosting_ && activeAgentPid_ != 0 && activeAgentEpoch_ != 0 && desiredHostingSeq_ == confirmedHostingSeq_ &&
+           confirmedHostingEpoch_ == activeAgentEpoch_;
 }
 
-bool DesktopAgentClient::Yielded() const
+bool DesktopAgentClient::HostingSynced(bool on) const
 {
     std::lock_guard lock(stateMutex_);
-    return yielded_;
-}
-
-TrayHostYieldReason DesktopAgentClient::YieldReason() const
-{
-    std::lock_guard lock(stateMutex_);
-    return yieldReason_;
+    if (on) {
+        return hosting_ && activeAgentPid_ != 0 && activeAgentEpoch_ != 0 && desiredHostingSeq_ == confirmedHostingSeq_ &&
+               confirmedHostingEpoch_ == activeAgentEpoch_;
+    }
+    if (hosting_)
+        return false;
+    if (activeAgentPid_ == 0 || activeAgentEpoch_ == 0)
+        return true;
+    if (confirmedHostingEpoch_ != activeAgentEpoch_ && attemptedHostingEpoch_ != activeAgentEpoch_)
+        return true;
+    return confirmedHostingEpoch_ == activeAgentEpoch_ && desiredHostingSeq_ == confirmedHostingSeq_;
 }
 
 std::vector<HostIcon> DesktopAgentClient::Icons() const

@@ -56,8 +56,16 @@ public:
 
     bool EvtServerReady() const { return evtReady_.load(); }
     DWORD AgentPid() const { return agentPid_.load(); }
-    uint64_t ActiveAgentEpoch() const;
-    bool IsActiveEpoch(uint64_t epoch) const;
+    uint64_t ActiveAgentEpoch() const
+    {
+        std::lock_guard lock(stateMutex_);
+        return activeAgentPid_ != 0 ? activeAgentEpoch_ : 0;
+    }
+    bool IsActiveEpoch(uint64_t epoch) const
+    {
+        std::lock_guard lock(stateMutex_);
+        return epoch != 0 && activeAgentPid_ != 0 && activeAgentEpoch_ == epoch;
+    }
     template<class Fn> bool RunIfActiveEpoch(uint64_t epoch, Fn&& fn) const
     {
         std::shared_lock actionLock(epochActionMutex_);
@@ -71,8 +79,17 @@ public:
 
     void SetTrayHosting(bool on);
     bool Hosting() const;
-    bool Yielded() const;
-    TrayHostYieldReason YieldReason() const;
+    bool HostingSynced(bool on) const;
+    bool Yielded() const
+    {
+        std::lock_guard lock(stateMutex_);
+        return yielded_;
+    }
+    TrayHostYieldReason YieldReason() const
+    {
+        std::lock_guard lock(stateMutex_);
+        return yieldReason_;
+    }
     std::vector<HostIcon> Icons() const;
     std::vector<std::wstring> Flashing() const;
     std::vector<FlashingTrayIcon> FlashingIcons() const;

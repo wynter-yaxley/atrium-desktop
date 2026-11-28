@@ -119,10 +119,7 @@ void ApplyDesktopAndSystemSettings(const Settings& s)
         g_app.winKeyStart = keyStart;
         g_app.winNumbers = keyNumbers;
     }
-    if (g_app.tray && s.trayHost != g_app.tray->Hosting()) {
-        g_app.tray->SetHosting(s.trayHost);
-        Log(L"core: tray host %s", g_app.tray->Hosting() ? L"on" : s.trayHost ? L"failed to start" : L"off");
-    }
+    ApplyTrayHostSetting(g_app.tray.get(), s.trayHost);
     if (s.remoteVisible != RemoteVisible()) {
         SetRemoteVisible(s.remoteVisible);
         RefreshCaptureExclusion();
