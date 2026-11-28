@@ -454,6 +454,7 @@ void Launchpad::SetPage(int page)
     const int next = std::clamp(page, 0, Pages() - 1);
     if (next != page_) {
         page_ = next;
+        sel_ = SelectionOnPage(sel_, Shown().size(), page_, grid_.perPage);
         UpdatePageTargets(true);
     }
     surface_.Invalidate();
