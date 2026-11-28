@@ -96,6 +96,8 @@ void TestSelectionOnPage()
     int page = 0;
     const int sel = MoveSelection(13, 1, 0, 50, 7, 5, page);
     Check(page == 1 && SelectionOnPage(sel, 50, page, 35) == 42, "arrow navigation preserves selection on the destination page");
+    const int back = MoveSelection(sel, -1, 0, 50, 7, 5, page);
+    Check(page == 0 && SelectionOnPage(back, 50, page, 35) == 13, "backward arrow navigation preserves selection on the destination page");
 
     page = 1;
     const int cleared = SelectionOnPage(3, 50, page, 35);
