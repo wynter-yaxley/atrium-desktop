@@ -260,6 +260,8 @@
   "Menu size": "Размер меню",
   "Icon size": "Размер значков",
   "Icon spacing": "Интервал между значками",
+  "Click opens window picker": "Открывать выбор окон по клику",
+  "Left-clicking a multi-window app icon opens its window previews instead of cycling through windows.": "Клик левой кнопкой по значку приложения с несколькими окнами открывает предпросмотр окон вместо их переключения.",
   "Huge": "Огромный",
   "Network": "Сеть",
   "No network available": "Сеть недоступна",

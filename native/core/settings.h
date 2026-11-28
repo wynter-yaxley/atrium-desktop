@@ -100,6 +100,8 @@ struct Settings {
     // An icon's right-click menu lists the app's own jump list entries (recent
     // places, tasks) and the system's ("run as administrator", "properties").
     bool windowsContextMenu = true;
+    // Left-clicking a multi-window taskbar icon opens its window picker instead of cycling windows.
+    bool clickWindowPicker = false;
     // Notifications (Atrium's own cards above the bell).
     double notifyTimeout = 6;        // seconds a popup stays (3..30)
     bool notifyAlways = false;       // popups stay until dismissed (ignores notifyTimeout)

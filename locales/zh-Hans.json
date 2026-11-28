@@ -260,6 +260,8 @@
   "Menu size": "菜单大小",
   "Icon size": "图标大小",
   "Icon spacing": "图标间隔",
+  "Click opens window picker": "点击多窗口图标展开窗口预览",
+  "Left-clicking a multi-window app icon opens its window previews instead of cycling through windows.": "左键点击拥有多个窗口的应用图标时直接展开窗口预览，而不是依次切换窗口。",
   "Huge": "极大",
   "Network": "网络",
   "No network available": "没有可用的网络",

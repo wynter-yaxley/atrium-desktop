@@ -391,6 +391,7 @@ public sealed partial class MainWindow : Window, IDisposable
         MagnifyNearSwitch.IsOn = CurrentSettings.MagnifyNear;
         UpdateRiseNearDependent();
         RunningSwitch.IsOn = CurrentSettings.ShowRunning;
+        ClickWindowPickerSwitch.IsOn = CurrentSettings.ClickWindowPicker;
         HideBodySwitch.IsOn = CurrentSettings.NotifyHideBody;
         NotifyFullscreenSwitch.IsOn = CurrentSettings.NotifyFullscreen;
         ImeStatusSwitch.IsOn = CurrentSettings.ImeStatus;
@@ -562,6 +563,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private void OnRiseNearToggled(object s, RoutedEventArgs e) => Set(x => x.RiseNear = RiseNearSwitch.IsOn);
     private void OnMagnifyNearToggled(object s, RoutedEventArgs e) => Set(x => x.MagnifyNear = MagnifyNearSwitch.IsOn);
     private void OnRunningToggled(object s, RoutedEventArgs e) => Set(x => x.ShowRunning = RunningSwitch.IsOn);
+    private void OnClickWindowPickerToggled(object s, RoutedEventArgs e) => Set(x => x.ClickWindowPicker = ClickWindowPickerSwitch.IsOn);
     private void OnImeBubbleToggled(object s, RoutedEventArgs e) => Set(x => x.ImeBubble = ImeBubbleSwitch.IsOn);
     private void OnBarDodgeToggled(object s, RoutedEventArgs e) => Set(x => x.BarDodge = BarDodgeSwitch.IsOn);
     private void OnBarReserveToggled(object s, RoutedEventArgs e) => Set(x => x.BarReserve = BarReserveSwitch.IsOn);

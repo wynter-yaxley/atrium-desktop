@@ -359,6 +359,7 @@ void WriteSystemJson(const json::JsonObject& o, const Settings& s)
     str(L"taskbarApps", s.taskbarApps);
     flag(L"taskbarRightPrimaryOnly", s.taskbarRightPrimaryOnly);
     flag(L"windowsContextMenu", s.windowsContextMenu);
+    flag(L"clickWindowPicker", s.clickWindowPicker);
     num(L"notifyTimeout", s.notifyTimeout);
     flag(L"notifyAlways", s.notifyAlways);
     num(L"nearEnter", s.nearEnter);
@@ -561,6 +562,7 @@ bool Settings::FromJson(const std::wstring& text, const Settings& base, Settings
     display(L"taskbarApps", s.taskbarApps);
     flag(L"taskbarRightPrimaryOnly", s.taskbarRightPrimaryOnly);
     flag(L"windowsContextMenu", s.windowsContextMenu);
+    flag(L"clickWindowPicker", s.clickWindowPicker);
     display(L"notifyPlacement", s.notifyPlacement);
     display(L"startupMode", s.startupMode);
     ReadPinsJson(o, s);

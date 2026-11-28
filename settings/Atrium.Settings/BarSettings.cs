@@ -94,6 +94,7 @@ internal sealed class BarSettings
     // An icon's right-click menu lists the app's own jump list entries and the
     // system's ("run as administrator", "properties").
     public bool WindowsContextMenu { get; set; } = true;
+    public bool ClickWindowPicker { get; set; }
     public double NotifyTimeout { get; set; } = 6;    // seconds a popup stays
     public bool NotifyAlways { get; set; }            // popups stay until dismissed
     public string NotifyPlacement { get; set; } = "dock"; // dock (default) | topLeft | topRight | bottomLeft | bottomRight
@@ -249,6 +250,7 @@ internal sealed class BarSettings
             ["taskbarApps"] = TaskbarApps,
             ["taskbarRightPrimaryOnly"] = TaskbarRightPrimaryOnly,
             ["windowsContextMenu"] = WindowsContextMenu,
+            ["clickWindowPicker"] = ClickWindowPicker,
             ["notifyTimeout"] = NotifyTimeout,
             ["notifyAlways"] = NotifyAlways,
             ["notifyPlacement"] = NotifyPlacement,
@@ -428,6 +430,7 @@ internal sealed class BarSettings
         s.TaskbarApps = apps is "primaryAndWindow" or "window" ? apps : "all";
         s.TaskbarRightPrimaryOnly = Flag("taskbarRightPrimaryOnly", f.TaskbarRightPrimaryOnly);
         s.WindowsContextMenu = Flag("windowsContextMenu", f.WindowsContextMenu);
+        s.ClickWindowPicker = Flag("clickWindowPicker", f.ClickWindowPicker);
         string placement = Str("notifyPlacement", f.NotifyPlacement);
         s.NotifyPlacement = NotifyCorners.Contains(placement) ? placement : "dock";
         string textColor = Str("textColor", f.TextColor);
@@ -590,7 +593,7 @@ internal sealed class BarSettings
         StartOnLogin == o.StartOnLogin && StartupMode == o.StartupMode && AutoUpdate == o.AutoUpdate &&
         DockDisplayMode == o.DockDisplayMode && DockDisplayDelay == o.DockDisplayDelay && DockDisplay == o.DockDisplay && DesktopDisplay == o.DesktopDisplay &&
         TaskbarApps == o.TaskbarApps && TaskbarRightPrimaryOnly == o.TaskbarRightPrimaryOnly &&
-        WindowsContextMenu == o.WindowsContextMenu &&
+        WindowsContextMenu == o.WindowsContextMenu && ClickWindowPicker == o.ClickWindowPicker &&
         NotifyPlacement == o.NotifyPlacement &&
         (Pins == o.Pins || (Pins != null && o.Pins != null && Pins.SequenceEqual(o.Pins)));
 

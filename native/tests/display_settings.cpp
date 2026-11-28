@@ -143,6 +143,13 @@ void CheckSettings()
     Require(Settings::FromJson(LR"({})", settings, parsed) && parsed.notifyFullscreen, "partial updates retain notifyFullscreen");
     Require(Settings::FromJson(LR"({"notifyFullscreen":"bad"})", settings, parsed) && parsed.notifyFullscreen,
             "malformed notifyFullscreen retains the current value");
+    Require(!Settings{}.clickWindowPicker && Settings::FromJson(LR"({})", Settings{}, parsed) && !parsed.clickWindowPicker,
+            "clickWindowPicker defaults to false");
+    settings.clickWindowPicker = true;
+    Require(Settings::FromJson(settings.ToJson(), Settings{}, parsed) && parsed.clickWindowPicker, "clickWindowPicker survives saving");
+    Require(Settings::FromJson(LR"({})", settings, parsed) && parsed.clickWindowPicker, "partial updates retain clickWindowPicker");
+    Require(Settings::FromJson(LR"({"clickWindowPicker":"bad"})", settings, parsed) && parsed.clickWindowPicker,
+            "malformed clickWindowPicker retains the current value");
 }
 
 void CheckStageDragMerge()

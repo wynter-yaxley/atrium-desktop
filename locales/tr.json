@@ -260,6 +260,8 @@
   "Menu size": "Menü boyutu",
   "Icon size": "Simge boyutu",
   "Icon spacing": "Simge aralığı",
+  "Click opens window picker": "Tıklama pencere seçiciyi açar",
+  "Left-clicking a multi-window app icon opens its window previews instead of cycling through windows.": "Birden fazla penceresi olan uygulama simgesine sol tıklamak, pencereler arasında geçiş yapmak yerine pencere önizlemelerini açar.",
   "Huge": "Çok büyük",
   "Network": "Ağ",
   "No network available": "Kullanılabilir ağ yok",

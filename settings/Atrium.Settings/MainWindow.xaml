@@ -551,6 +551,9 @@
                                 <TextBlock Text="Show on the bar" Style="{StaticResource SectionStyle}" />
                                 <local:ToggleTile x:Name="RunningSwitch" Title="Running apps" SwitchName="Show running apps" Toggled="OnRunningToggled"
                                                   Flat="True" Note="After pinned apps, other running apps appear with a small dot below." />
+                                <local:ToggleTile x:Name="ClickWindowPickerSwitch" Title="Click opens window picker"
+                                                  SwitchName="Click opens window picker" Toggled="OnClickWindowPickerToggled" Flat="True"
+                                                  Note="Left-clicking a multi-window app icon opens its window previews instead of cycling through windows." />
                                 <StackPanel Style="{StaticResource FlatRowStyle}">
                                     <TextBlock Text="Text color" Style="{StaticResource RowTitleStyle}" />
                                     <local:SegmentTrack>

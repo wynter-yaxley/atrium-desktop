@@ -165,9 +165,10 @@ void Bar::HandleButtonUp(UINT m, WPARAM w, POINT pt)
             ClickEntry(key);
     } else if (launch ? bool(onLaunch) : bool(onActivate)) {
         auto t = std::ranges::find_if(items_, [&](const TaskItem& i) { return i.key == key; });
-        // Several windows: the click always presents their picker (as the Windows taskbar), so the
-        // window is chosen there; only a card in it brings a window forward.
-        if (m == WM_LBUTTONUP && t != items_.end() && ClickOpensWindowPicker(t->windows.size()) && ShowPreviewFor(key))
+        // Several windows: when enabled, left click (without Shift) presents the picker (as on the Windows
+        // taskbar), so the window is chosen there; only a card in it brings a window forward.
+        if (m == WM_LBUTTONUP && !launch && settings_.clickWindowPicker && t != items_.end() && ClickOpensWindowPicker(t->windows.size()) &&
+            ShowPreviewFor(key))
             return;
         // Starting an app (or another instance) hops its icon, as in the macOS Dock.
         if (t != items_.end() && (launch || t->windows.empty()))
@@ -264,8 +265,8 @@ LRESULT Bar::OnInput(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_MBUTTONDOWN:
         pressed_ = HitTest(pt);
         // A press drops the window picker — except on an app whose click presents it again (several
-        // windows): the click that lands there keeps it up instead of blinking it away and back.
-        if (m == WM_LBUTTONDOWN && ClickShowsWindowPicker(pressed_)) {
+        // windows, without Shift): the click that lands there keeps it up instead of blinking it away and back.
+        if (m == WM_LBUTTONDOWN && !(w & MK_SHIFT) && ClickShowsWindowPicker(pressed_)) {
             KillTimer(h, kTooltipTimer);
             tooltip_->Hide(false);
         } else {
@@ -305,6 +306,9 @@ void Bar::BeginDrag(POINT pt)
     const auto& plate = scene_.items[size_t(from)].plate;
     dragging_ = true;
     dragKey_ = pressed_;
+    HideTooltip();
+    if (onPreviewClose)
+        onPreviewClose();
     dragInsert_ = from;
     grabDx_ = pressPt_.x - int((plate.left + plate.right) / 2);
     dragX_ = pt.x;
@@ -473,7 +477,7 @@ void Bar::UpdateNearWatch()
 // An app with several windows: a click on it presents them (the picker) instead of one window in turn.
 bool Bar::ClickShowsWindowPicker(const std::wstring& key) const
 {
-    if (IsEntry(key))
+    if (!settings_.clickWindowPicker || IsEntry(key))
         return false;
     auto item = std::ranges::find_if(items_, [&](const TaskItem& t) { return t.key == key; });
     return item != items_.end() && ClickOpensWindowPicker(item->windows.size());

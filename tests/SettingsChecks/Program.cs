@@ -217,6 +217,13 @@ Require(!menuOff.WindowsContextMenu && BarSettings.FromJson(menuOff.ToJson(), ne
 Require(new BarSettings().WindowsContextMenu && BarSettings.FromJson([], new()).WindowsContextMenu,
     "The Windows-style context menu is on by default, also for files written before it existed.");
 Require(!new BarSettings().SameAs(menuOff), "The Windows-style context menu must participate in the Save/Revert dirty state.");
+var pickerOn = BarSettings.FromJson(JsonNode.Parse("""{"clickWindowPicker":true}""")!.AsObject(), new());
+Require(!new BarSettings().ClickWindowPicker && !BarSettings.FromJson([], new()).ClickWindowPicker &&
+        pickerOn.ClickWindowPicker && BarSettings.FromJson(pickerOn.ToJson(), new()).SameAs(pickerOn) &&
+        BarSettings.FromJson([], pickerOn).ClickWindowPicker &&
+        BarSettings.FromJson(JsonNode.Parse("""{"clickWindowPicker":"bad"}""")!.AsObject(), pickerOn).ClickWindowPicker &&
+        !new BarSettings().SameAs(pickerOn),
+    "ClickWindowPicker must default false and survive round trips, partial updates, malformed input, and dirty tracking.");
 Require(!new BarSettings().NotifyFullscreen && !BarSettings.FromJson([], new()).NotifyFullscreen,
     "Fullscreen notification popups are off by default.");
 parsed = BarSettings.FromJson(JsonNode.Parse("""{"notifyFullscreen":true}""")!.AsObject(), new());
