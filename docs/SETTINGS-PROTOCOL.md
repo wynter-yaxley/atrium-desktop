@@ -57,6 +57,7 @@
 | `showLaunchpad` | bool | | true | 开始徽标旁的启动台入口 |
 | `launchpadMaterial` | string | `bar` / `tint` | `bar` | 启动台的材质：跟随任务栏的玻璃，或玻璃上加一层黑色蒙版（原色） |
 | `launchpadLayout` | string | `window` / `fullscreen` | `window` | 启动台的样子：屏幕中间的一个窗口；或像 macOS 那样铺满整个屏幕（跟随任务栏时是一层模糊桌面的玻璃，原色时再加黑色蒙版），图标更大 |
+| `launchpadIcon` | string | 图片文件路径，或空字符串 | `""` | 任务栏上启动台入口自己的图标：选一张图片（PNG、JPEG、ICO 等，整张等比缩放后占满入口的图标位置，和旁边的应用图标一样大，不裁切；路径里的 `%VAR%` 会展开），空字符串用内置的四方块标记；文件读不到时也用内置标记 |
 | `showNowPlaying` | bool | | true | 任务栏正在播放媒体入口（仅在存在媒体会话时出现） |
 | `nowPlayingShowPaused` | bool | | true | 媒体会话暂停时是否在任务栏保留正在播放入口 |
 | `nowPlayingMotion` | string | `off` / `subtle` / `normal` / `vivid` | `normal` | 正在播放入口五根竖杠的波形动效幅度 |

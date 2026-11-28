@@ -275,7 +275,14 @@ void BarPainter::DrawItem(ID2D1DeviceContext2* d2d, const BarScene& scene, const
         d2d->SetTransform(D2D1::Matrix3x2F::Identity());
         return;
     }
-    if (extras_.Draw(it.key, d2d, iconArea, brush, ink, m.appear, music_)) {
+    // Launchpad with the user's own picture: the entry's icon, not the built-in mark.
+    const bool launchpadPicture = it.key == L"#launchpad" && it.image;
+    if (launchpadPicture) {
+        if (ID2D1Bitmap1* bmp = BitmapFor(d2d, it)) {
+            usedBitmaps_.push_back(it.imageId);
+            BarExtrasPainter::DrawLaunchpadImage(d2d, iconArea, bmp, m.appear);
+        }
+    } else if (extras_.Draw(it.key, d2d, iconArea, brush, ink, m.appear, music_)) {
     } else if (!it.glyph.empty()) {
         if (IDWriteTextFormat* f = Format(size * 0.62f, DWRITE_FONT_WEIGHT_NORMAL, IconFontFamily())) {
             brush->SetColor(ink);

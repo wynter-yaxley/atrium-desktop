@@ -587,7 +587,7 @@ public sealed partial class MainWindow
             }
             SetBarClock();
             // No pointer on the bar: no magnification, no hover plate.
-            Face.Layout(bar, _barDark, bar.N, running, 2, 1, 0, 0, BarStatus());
+            Face.Layout(bar, _barDark, bar.N, running, 2, 1, 0, 0, BarStatus(), M.CurrentSettings.LaunchpadIcon);
         }
 
         protected void SetBarClock()

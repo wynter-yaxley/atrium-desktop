@@ -269,7 +269,8 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
         "Folder stack files must deduplicate paths case-insensitively.");
     var extrasDefault = new BarSettings();
     Require(extrasDefault.ShowLaunchpad && extrasDefault.LaunchpadMaterial == "bar" &&
-            extrasDefault.LaunchpadLayout == "window" && extrasDefault.ShowNowPlaying && extrasDefault.NowPlayingShowPaused &&
+            extrasDefault.LaunchpadLayout == "window" && extrasDefault.LaunchpadIcon == "" && extrasDefault.ShowNowPlaying &&
+            extrasDefault.NowPlayingShowPaused &&
             extrasDefault.NowPlayingMotion == "normal" && extrasDefault.NowPlayingRhythm == "live" && extrasDefault.NowPlayingAppMode == "all" &&
             extrasDefault.NowPlayingApps.Count == 0 &&
             !extrasDefault.ShowFolderStacks && extrasDefault.FolderStackLayout == "fan" &&
@@ -280,6 +281,7 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
         ShowLaunchpad = false,
         LaunchpadMaterial = "tint",
         LaunchpadLayout = "fullscreen",
+        LaunchpadIcon = @"C:\Users\Demo\Pictures\launchpad.png",
         ShowNowPlaying = false,
         NowPlayingShowPaused = false,
         NowPlayingMotion = "vivid",
@@ -294,9 +296,15 @@ Require(new PinnedApp("Explorer", "", "", "Microsoft.Windows.Explorer").AllowsMu
     };
     Require(BarSettings.FromJson(extrasCustom.ToJson(), new()).SameAs(extrasCustom),
         "Extras settings must survive a round trip.");
+    var trimmedIcon = BarSettings.FromJson(JsonNode.Parse("""{"launchpadIcon":" \tC:\\Icons\\orb.png\r\n "}""")!.AsObject(), new());
+    Require(trimmedIcon.LaunchpadIcon == @"C:\Icons\orb.png" &&
+            BarSettings.FromJson([], extrasCustom).LaunchpadIcon == extrasCustom.LaunchpadIcon &&
+            BarSettings.FromJson(JsonNode.Parse("""{"launchpadIcon":false}""")!.AsObject(), extrasCustom).LaunchpadIcon == extrasCustom.LaunchpadIcon,
+        "The Launchpad icon must trim ASCII whitespace, keep partial updates, and keep the fallback for malformed input.");
     foreach (var edit in new Action<BarSettings>[]
     {
         s => s.ShowLaunchpad = false, s => s.LaunchpadMaterial = "tint", s => s.LaunchpadLayout = "fullscreen",
+        s => s.LaunchpadIcon = @"D:\Icons\orb.png",
         s => s.ShowNowPlaying = false, s => s.NowPlayingShowPaused = false,
         s => s.NowPlayingMotion = "subtle", s => s.NowPlayingRhythm = "loop", s => s.NowPlayingAppMode = "allow",
         s => s.NowPlayingApps = ["a.exe"],
@@ -1529,6 +1537,19 @@ finally
             "Folder preset must pick existing filesystem folders without FOS_NODEREFERENCELINKS.");
         Require(NativeFileDialog.FiltersFor(NativeFileDialogPreset.Folder).Length == 0,
             "Folder preset must not specify file extension filters.");
+
+        var pictureFlags = NativeFileDialog.OptionsFor(NativeFileDialogPreset.Picture);
+        const NativeFileDialogOptions ExpectedPicture =
+            NativeFileDialogOptions.ForceFileSystem | NativeFileDialogOptions.FileMustExist | NativeFileDialogOptions.NoChangeDir;
+        Require(pictureFlags == ExpectedPicture && (uint)pictureFlags == (0x40u | 0x1000u | 0x8u) &&
+                !pictureFlags.HasFlag(NativeFileDialogOptions.AllowMultiselect) &&
+                !pictureFlags.HasFlag(NativeFileDialogOptions.NoDereferenceLinks) &&
+                !pictureFlags.HasFlag(NativeFileDialogOptions.PickFolders),
+            "Picture preset must pick one existing filesystem file, without multiselect or FOS_NODEREFERENCELINKS.");
+        var pictureFilters = NativeFileDialog.FiltersFor(NativeFileDialogPreset.Picture);
+        Require(pictureFilters.Length == 1 && pictureFilters[0].Spec == "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.ico;*.webp;*.tif;*.tiff" &&
+                pictureFilters[0].Name == "Images" && NativeFileDialog.FiltersFor(NativeFileDialogPreset.Picture, "Pictures")[0].Name == "Pictures",
+            "Picture preset must filter to the picture formats WIC reads, with a localized label.");
 
         Require(NativeFileDialog.IsCancelledHResult(unchecked((int)0x800704C7)),
             "ERROR_CANCELLED HRESULT (0x800704C7) must be recognized as cancellation.");

@@ -4,6 +4,10 @@
 #include "shell/shell_icon.h"
 #include "ui/launchpad_page_ids.h"
 
+#include <roapi.h>
+#include <wincodec.h>
+#include <winrt/base.h>
+
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -114,6 +118,70 @@ void CheckSquircleMask()
     Check(!IsFullBleedSquareIcon(xShape) && ApplySquircleMaskIfFullBleed(xShape).Bytes() == xShape.Bytes(), "#135: X-shaped bitmap left untouched");
 }
 
+// The Launchpad entry's own icon (settings.launchpadIcon): a picture file read as the bar draws it.
+std::vector<uint8_t> EncodePng(IWICImagingFactory* wic, UINT w, UINT h, const std::vector<uint8_t>& bgra)
+{
+    winrt::com_ptr<IStream> stream;
+    winrt::com_ptr<IWICBitmap> bitmap;
+    winrt::com_ptr<IWICBitmapEncoder> encoder;
+    winrt::com_ptr<IWICBitmapFrameEncode> frame;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, stream.put())) ||
+        FAILED(wic->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppPBGRA, w * 4, UINT(bgra.size()), const_cast<BYTE*>(bgra.data()), bitmap.put())) ||
+        FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.put())) || FAILED(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->CreateNewFrame(frame.put(), nullptr)) || FAILED(frame->Initialize(nullptr)) || FAILED(frame->SetSize(w, h)))
+        return {};
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppPBGRA;
+    if (FAILED(frame->SetPixelFormat(&format)) || FAILED(frame->WriteSource(bitmap.get(), nullptr)) || FAILED(frame->Commit()) || FAILED(encoder->Commit()))
+        return {};
+    STATSTG stat{};
+    LARGE_INTEGER start{};
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || FAILED(stream->Seek(start, STREAM_SEEK_SET, nullptr)))
+        return {};
+    std::vector<uint8_t> bytes(size_t(stat.cbSize.QuadPart));
+    ULONG read = 0;
+    return SUCCEEDED(stream->Read(bytes.data(), ULONG(bytes.size()), &read)) && read == bytes.size() ? bytes : std::vector<uint8_t>{};
+}
+
+void CheckLoadPictureIcon()
+{
+    using namespace atrium;
+    const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+    Check(SUCCEEDED(initialized) || initialized == RPC_E_CHANGED_MODE, "COM starts for LoadPictureIcon");
+    winrt::com_ptr<IWICImagingFactory> wic;
+    Check(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put()))) && wic,
+          "WIC factory starts for LoadPictureIcon");
+
+    // A wide picture (96 x 48, opaque red): fitted, it leaves transparent bands above and below.
+    constexpr UINT kWidth = 96, kHeight = 48;
+    std::vector<uint8_t> bgra(size_t(kWidth) * kHeight * 4);
+    for (size_t i = 0; i < bgra.size(); i += 4) {
+        bgra[i + 2] = 220;
+        bgra[i + 3] = 255;
+    }
+    const std::vector<uint8_t> png = EncodePng(wic.get(), kWidth, kHeight, bgra);
+    wchar_t temp[MAX_PATH] = {}, path[MAX_PATH] = {};
+    Check(!png.empty() && GetTempPathW(ARRAYSIZE(temp), temp) > 0 && GetTempFileNameW(temp, L"atr", 0, path) != 0, "a temporary picture file is created");
+    {
+        HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD written = 0;
+        const bool ok = file != INVALID_HANDLE_VALUE && WriteFile(file, png.data(), DWORD(png.size()), &written, nullptr) && written == png.size();
+        if (file != INVALID_HANDLE_VALUE)
+            CloseHandle(file);
+        Check(ok, "the picture file is written");
+    }
+
+    IconImage icon;
+    Check(LoadPictureIcon(path, 64, icon) && icon.width == 64 && icon.height == 64, "LoadPictureIcon fits a wide picture into a 64 x 64 icon");
+    Check(PixelAlpha(icon, 32, 2) == 0 && PixelAlpha(icon, 32, 61) == 0 && PixelAlpha(icon, 32, 32) == 255,
+          "LoadPictureIcon keeps the whole picture: transparent bands, opaque middle");
+    Check(IsPremultipliedBgra(icon), "LoadPictureIcon hands the painter premultiplied BGRA");
+    Check(!LoadPictureIcon(path, 0, icon), "LoadPictureIcon refuses a size of zero");
+    DeleteFileW(path);
+    IconImage missing;
+    Check(!LoadPictureIcon(path, 64, missing), "LoadPictureIcon fails when the file is gone");
+    Check(!LoadPictureIcon(L"", 64, missing), "LoadPictureIcon fails without a path");
+}
+
 } // namespace
 
 int main()
@@ -189,6 +257,7 @@ int main()
           "ExpandLaunchpadPageIds expands #system into its first 9 apps");
 
     CheckSquircleMask();
+    CheckLoadPictureIcon();
 
     return g_failures ? 1 : 0;
 }

@@ -219,7 +219,7 @@ public sealed partial class MainWindow
             }
             var clock = PreviewClock.Now;
             _notifyFace.SetClock(clock.ToString(CurrentSettings.ShowClockSeconds ? "H:mm:ss" : "H:mm"), clock.ToString("yyyy/M/d"));
-            _notifyFace.Layout(bar, dark, bar.N, running, 2, 1, 0, 0, StatusLook.Current());
+            _notifyFace.Layout(bar, dark, bar.N, running, 2, 1, 0, 0, StatusLook.Current(), CurrentSettings.LaunchpadIcon);
             // Its new size has come: it grows or shrinks there from the size it had, on the
             // compositor (one picture, scaled: nothing is drawn again meanwhile).
             if (_notifyBarScale > 0 && Math.Abs(_notifyBarScale - scale) > 0.001)

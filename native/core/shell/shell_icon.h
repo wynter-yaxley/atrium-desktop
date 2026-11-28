@@ -32,6 +32,10 @@ IconImage FitToSquare(const IconImage& src, int size);
 IconImage CropToSquare(const IconImage& src, int size);
 // Pull-decodes encoded image bytes into a centred square targetSize x targetSize premultiplied BGRA IconImage via WIC.
 bool DecodeWicSquareImage(IWICImagingFactory* wic, std::vector<uint8_t>& bytes, int targetSize, IconImage& out);
+// A picture file the user chose (PNG, JPEG, ICO, ...) as a square premultiplied icon: the whole picture,
+// turned upright (EXIF), scaled to fit and centred. "%VAR%" parts of `path` are expanded. False when the
+// file is missing or no decoder reads it.
+bool LoadPictureIcon(const std::wstring& path, int sizePx, IconImage& out);
 // True when `path` is a PE/icon file with at least one embedded icon resource.
 bool HasEmbeddedExeIcon(const std::wstring& path);
 // True when `img` is a square icon whose 4 corners and outer perimeter are opaque (alpha >= 240).

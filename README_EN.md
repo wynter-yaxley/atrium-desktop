@@ -86,6 +86,7 @@ A Launchpad entry sits next to the start button. As on macOS, it lists every app
 - Just start typing to search; the grid narrows with every letter.
 - Hold and drag an app to rearrange; a right-click shows the same menu as on the bar.
 - Show it as a window or across the whole screen, in the bar's glass or a darker tint.
+- The entry's own icon can be yours: Settings › Launchpad › Icon takes a picture (PNG, JPEG, ICO, …) and fits it.
 
 ### File Stacks
 

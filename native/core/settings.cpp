@@ -175,6 +175,7 @@ void ReadExtrasSettingsJson(const json::JsonObject& o, Settings& s)
     flag(L"showLaunchpad", s.showLaunchpad);
     str(L"launchpadMaterial", s.launchpadMaterial);
     str(L"launchpadLayout", s.launchpadLayout);
+    str(L"launchpadIcon", s.launchpadIcon);
     flag(L"showNowPlaying", s.showNowPlaying);
     flag(L"nowPlayingShowPaused", s.nowPlayingShowPaused);
     str(L"nowPlayingMotion", s.nowPlayingMotion);
@@ -328,6 +329,7 @@ void WriteExtrasJson(const json::JsonObject& o, const Settings& s)
     flag(L"showLaunchpad", s.showLaunchpad);
     str(L"launchpadMaterial", s.launchpadMaterial);
     str(L"launchpadLayout", s.launchpadLayout);
+    str(L"launchpadIcon", s.launchpadIcon);
     flag(L"showNowPlaying", s.showNowPlaying);
     flag(L"nowPlayingShowPaused", s.nowPlayingShowPaused);
     str(L"nowPlayingMotion", s.nowPlayingMotion);
@@ -488,6 +490,7 @@ void Settings::Clamp()
         launchpadMaterial = L"bar";
     if (launchpadLayout != L"fullscreen")
         launchpadLayout = L"window";
+    launchpadIcon = TrimAsciiWhitespace(launchpadIcon);
     if (nowPlayingRhythm != L"loop")
         nowPlayingRhythm = L"live";
     if (nowPlayingAppMode != L"allow" && nowPlayingAppMode != L"block")

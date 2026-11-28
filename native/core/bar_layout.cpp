@@ -4,7 +4,9 @@
 #include "bar_entries.h"
 
 #include "clock.h"
+#include "log.h"
 #include "render/ui_font.h"
+#include "shell/shell_icon.h"
 
 #include <shellscalingapi.h>
 
@@ -348,6 +350,29 @@ void Bar::ResolveTaskIcon(const TaskItem& t, int iconPx, std::map<std::wstring, 
     }
 }
 
+void Bar::ResolveLaunchpadIcon(SceneItem& it, int iconPx)
+{
+    const std::wstring& path = settings_.launchpadIcon;
+    if (path.empty())
+        return; // the built-in mark
+    if (launchpadIcon_.source != path || launchpadIcon_.px != iconPx) {
+        launchpadIcon_ = {};
+        launchpadIcon_.source = path;
+        launchpadIcon_.px = iconPx;
+        IconImage img;
+        if (LoadPictureIcon(path, iconPx, img)) {
+            launchpadIcon_.id = nextIconId_++;
+            launchpadIcon_.image = std::make_shared<const IconImage>(std::move(img));
+        } else {
+            Log(L"bar: the Launchpad icon %s could not be read; drawing the built-in mark", path.c_str());
+        }
+    }
+    if (launchpadIcon_.image) {
+        it.image = launchpadIcon_.image;
+        it.imageId = launchpadIcon_.id;
+    }
+}
+
 void Bar::BuildLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m)
 {
     int dragIndex = -1;
@@ -400,14 +425,16 @@ void Bar::BuildLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m)
     const int appsW = slots ? slots * m.plate + (slots - 1) * m.gap : 0;
     // Apps are centred in the space between the logo and the separator (matters when autoWidth is off).
     const int appsLeft = appsMin + std::max(0, (rightLeft - 2 * m.groupGap - appsMin - appsW) / 2);
+    // Icons are rendered for their magnified size, so they stay sharp when they grow.
+    const int iconPx = int(std::lround(float(m.icon) * m.mag));
     scene.extras.push_back(entry(kStartKey, startLeft, L""));
     hits_.push_back({kStartKey, RECT{m.insetX, hitTop, (settings_.showLaunchpad ? launchLeft : appsMin) - m.gap / 2, hitBottom}});
     if (settings_.showLaunchpad) {
-        scene.extras.push_back(entry(kLaunchpadKey, launchLeft, L""));
+        SceneItem launchpad = entry(kLaunchpadKey, launchLeft, L"");
+        ResolveLaunchpadIcon(launchpad, iconPx);
+        scene.extras.push_back(std::move(launchpad));
         hits_.push_back({kLaunchpadKey, RECT{launchLeft - m.gap / 2, hitTop, appsMin - m.gap / 2, hitBottom}});
     }
-    // Icons are rendered for their magnified size, so they stay sharp when they grow.
-    const int iconPx = int(std::lround(float(m.icon) * m.mag));
     std::map<std::wstring, CachedIcon> keep;
     for (int k = 0; k < m.shownApps; ++k) {
         const int i = order[size_t(k)];

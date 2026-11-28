@@ -203,13 +203,14 @@ internal sealed partial class BarFace
 
     // Lays everything out for layout l (hero DIP), seen at `zoom` from origin (ox, oy).
     public void Layout(MainWindow.BarGeometry l, bool darkInk, int shownApps, int runningIndex, double magnify, double zoom, double ox, double oy,
-                       StatusLook status)
+                       StatusLook status, string launchpadIcon)
     {
         // Material edits change the rendered glass, not the marks on it. Keep their geometries
         // and brushes until their layout, ink or status actually changes; clocks update separately.
         var layout = (l, darkInk, shownApps, runningIndex, magnify, zoom, ox, oy, status);
-        if (_layout == layout) return;
+        if (_layout == layout && _launchpadIcon == launchpadIcon) return;
         _layout = layout;
+        _launchpadIcon = launchpadIcon;
         var inkColor = darkInk ? DarkInk : LightInk;
         _inkBrush.Color = inkColor;
         var ink = _inkBrush;
@@ -317,7 +318,7 @@ internal sealed partial class BarFace
         }
         Entry(_tray, l.TrayX);
         Entry(_bell, l.BellX);
-        LayoutExtras(l, Item, inkColor);
+        LayoutExtras(l, Item, inkColor, launchpadIcon);
 
         _ime.Visibility = _imePrev.Visibility = _imePath.Visibility = _imePrevPath.Visibility = Visibility.Collapsed;
         _imeAt = null;

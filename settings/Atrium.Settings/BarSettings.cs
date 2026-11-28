@@ -63,6 +63,7 @@ internal sealed class BarSettings
     public bool ShowLaunchpad { get; set; } = true;
     public string LaunchpadMaterial { get; set; } = "bar"; // bar | tint
     public string LaunchpadLayout { get; set; } = "window"; // window | fullscreen
+    public string LaunchpadIcon { get; set; } = ""; // a picture file, or "" for the built-in mark
     public bool ShowNowPlaying { get; set; } = true;
     public bool NowPlayingShowPaused { get; set; } = true;
     public string NowPlayingMotion { get; set; } = "normal"; // off | subtle | normal | vivid
@@ -227,6 +228,7 @@ internal sealed class BarSettings
             ["showLaunchpad"] = ShowLaunchpad,
             ["launchpadMaterial"] = LaunchpadMaterial,
             ["launchpadLayout"] = LaunchpadLayout,
+            ["launchpadIcon"] = LaunchpadIcon,
             ["showNowPlaying"] = ShowNowPlaying,
             ["nowPlayingShowPaused"] = NowPlayingShowPaused,
             ["nowPlayingMotion"] = NowPlayingMotion,
@@ -535,6 +537,7 @@ internal sealed class BarSettings
         s.ShowLaunchpad = Flag("showLaunchpad", f.ShowLaunchpad);
         s.LaunchpadMaterial = Str("launchpadMaterial", f.LaunchpadMaterial) == "tint" ? "tint" : "bar";
         s.LaunchpadLayout = Str("launchpadLayout", f.LaunchpadLayout) == "fullscreen" ? "fullscreen" : "window";
+        s.LaunchpadIcon = Str("launchpadIcon", f.LaunchpadIcon).Trim(' ', '\t', '\r', '\n'); // as Settings::Clamp trims it
         s.ShowNowPlaying = Flag("showNowPlaying", f.ShowNowPlaying);
         s.NowPlayingShowPaused = Flag("nowPlayingShowPaused", f.NowPlayingShowPaused);
         string motion = Str("nowPlayingMotion", f.NowPlayingMotion);
@@ -562,7 +565,7 @@ internal sealed class BarSettings
         StartCentered == o.StartCentered && StartWithBar == o.StartWithBar && StartSize == o.StartSize && StartIcon == o.StartIcon &&
         ShowStatus == o.ShowStatus && ShowNotifications == o.ShowNotifications && ShowDesktop == o.ShowDesktop &&
         ShowRunning == o.ShowRunning && ShowLaunchpad == o.ShowLaunchpad &&
-        LaunchpadMaterial == o.LaunchpadMaterial && LaunchpadLayout == o.LaunchpadLayout &&
+        LaunchpadMaterial == o.LaunchpadMaterial && LaunchpadLayout == o.LaunchpadLayout && LaunchpadIcon == o.LaunchpadIcon &&
         ShowNowPlaying == o.ShowNowPlaying &&
         NowPlayingShowPaused == o.NowPlayingShowPaused && NowPlayingMotion == o.NowPlayingMotion && NowPlayingRhythm == o.NowPlayingRhythm &&
         NowPlayingAppMode == o.NowPlayingAppMode && NowPlayingApps.SequenceEqual(o.NowPlayingApps, StringComparer.OrdinalIgnoreCase) &&

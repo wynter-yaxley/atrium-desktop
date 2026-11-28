@@ -334,6 +334,81 @@ bool DecodeWicSquareImage(IWICImagingFactory* wic, std::vector<uint8_t>& bytes, 
     return !out.Empty();
 }
 
+bool LoadPictureIcon(const std::wstring& path, int sizePx, IconImage& out)
+{
+    if (path.empty() || sizePx <= 0)
+        return false;
+    std::wstring file = path;
+    if (file.find(L'%') != std::wstring::npos) {
+        std::wstring expanded(32768, L'\0');
+        const DWORD n = ExpandEnvironmentStringsW(path.c_str(), expanded.data(), DWORD(expanded.size()));
+        if (n > 0 && n <= expanded.size()) {
+            expanded.resize(n - 1); // the length includes the terminating NUL
+            file = std::move(expanded);
+        }
+    }
+    winrt::com_ptr<IWICImagingFactory> wic;
+    winrt::com_ptr<IWICBitmapDecoder> decoder;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put()))) || !wic ||
+        FAILED(wic->CreateDecoderFromFilename(file.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.put())) || !decoder)
+        return false;
+    // An icon file holds the same picture at several sizes: the largest is the one worth drawing.
+    UINT frames = 0;
+    if (FAILED(decoder->GetFrameCount(&frames)) || frames == 0)
+        return false;
+    winrt::com_ptr<IWICBitmapFrameDecode> best;
+    UINT bestW = 0, bestH = 0;
+    for (UINT i = 0; i < frames; ++i) {
+        winrt::com_ptr<IWICBitmapFrameDecode> frame;
+        UINT w = 0, h = 0;
+        if (FAILED(decoder->GetFrame(i, frame.put())) || !frame || FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0)
+            continue;
+        if (!best || size_t(w) * h > size_t(bestW) * bestH) {
+            best = frame;
+            bestW = w;
+            bestH = h;
+        }
+    }
+    if (!best || bestW > 16384 || bestH > 16384)
+        return false;
+    winrt::com_ptr<IWICBitmapSource> source = best;
+    // A camera's orientation (EXIF): pictures taken by a phone are often stored sideways.
+    WICBitmapTransformOptions turn = WICBitmapTransformRotate0;
+    winrt::com_ptr<IWICMetadataQueryReader> meta;
+    if (SUCCEEDED(best->GetMetadataQueryReader(meta.put())) && meta) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &v)) && v.vt == VT_UI2)
+            turn = v.uiVal == 3 ? WICBitmapTransformRotate180 :
+                   v.uiVal == 6 ? WICBitmapTransformRotate90 :
+                                  (v.uiVal == 8 ? WICBitmapTransformRotate270 : WICBitmapTransformRotate0);
+        PropVariantClear(&v);
+    }
+    if (turn != WICBitmapTransformRotate0) {
+        winrt::com_ptr<IWICBitmapFlipRotator> rotator;
+        if (SUCCEEDED(wic->CreateBitmapFlipRotator(rotator.put())) && SUCCEEDED(rotator->Initialize(source.get(), turn))) {
+            source = rotator;
+            if (turn == WICBitmapTransformRotate90 || turn == WICBitmapTransformRotate270)
+                std::swap(bestW, bestH);
+        }
+    }
+    // The whole picture, scaled to fit a square as large as the icon (never cropped); FitToSquare centres it.
+    const double k = double(sizePx) / double(std::max(bestW, bestH));
+    const UINT dw = std::max(1u, UINT(std::lround(bestW * k))), dh = std::max(1u, UINT(std::lround(bestH * k)));
+    winrt::com_ptr<IWICBitmapScaler> scaler;
+    winrt::com_ptr<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateBitmapScaler(scaler.put())) || FAILED(scaler->Initialize(source.get(), dw, dh, WICBitmapInterpolationModeFant)) ||
+        FAILED(wic->CreateFormatConverter(converter.put())) ||
+        FAILED(converter->Initialize(scaler.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        return false;
+    const UINT stride = dw * 4;
+    std::vector<uint8_t> px(size_t(stride) * dh);
+    if (FAILED(converter->CopyPixels(nullptr, stride, UINT(px.size()), px.data())))
+        return false;
+    out = FitToSquare(IconImage::FromBgra(int(dw), int(dh), std::move(px)), sizePx);
+    return !out.Empty();
+}
+
 std::wstring AppExecutable(const std::wstring& path)
 {
     std::wstring target = path;

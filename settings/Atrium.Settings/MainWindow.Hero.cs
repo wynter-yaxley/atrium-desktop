@@ -249,11 +249,12 @@ public sealed partial class MainWindow
         string time = clock.ToString(CurrentSettings.ShowClockSeconds ? "H:mm:ss" : "H:mm"), date = clock.ToString("yyyy/M/d");
         _face.SetClock(time, date);
         var status = StatusLook.Current();
-        _face.Layout(bar, DarkInk(), bar.N, running, CurrentSettings.Magnify, 1, 0, 0, status);
+        _face.Layout(bar, DarkInk(), bar.N, running, CurrentSettings.Magnify, 1, 0, 0, status, CurrentSettings.LaunchpadIcon);
         if (loupe)
         {
             _loupeFace.SetClock(time, date);
-            _loupeFace.Layout(bar, DarkInk(), bar.N, running, CurrentSettings.Magnify, LoupeZoom, bar.LoupeX0, bar.LoupeY0, status);
+            _loupeFace.Layout(bar, DarkInk(), bar.N, running, CurrentSettings.Magnify, LoupeZoom, bar.LoupeX0, bar.LoupeY0, status,
+                CurrentSettings.LaunchpadIcon);
         }
     }
 

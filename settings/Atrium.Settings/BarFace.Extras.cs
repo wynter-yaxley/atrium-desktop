@@ -21,6 +21,8 @@ internal sealed partial class BarFace
     private const string BackFolder = "F0 M0.30,0.12 L0.93,0.12 Q1,0.12 1,0.19 L1,0.84";
 
     private readonly Canvas _launchpad = new() { IsHitTestVisible = false, Width = 1, Height = 1 }, _music = new() { IsHitTestVisible = false };
+    private readonly Image _launchpadImage = new() { IsHitTestVisible = false, Stretch = Stretch.Uniform };
+    private string _launchpadIcon = ""; // the file the last layout drew (Layout)
     private readonly Rectangle[] _bars = new Rectangle[5];
     private readonly Path _folder = Folder(FrontFolder), _folderBack = Folder(BackFolder);
     private readonly Path _apps = new() { IsHitTestVisible = false };
@@ -42,22 +44,33 @@ internal sealed partial class BarFace
         }
         _folder.Stroke = _folderBrush;
         _folderBack.Stroke = _folderBackBrush;
-        foreach (var e in new UIElement[] { _launchpad, _music, _folderBack, _folder })
+        foreach (var e in new UIElement[] { _launchpad, _launchpadImage, _music, _folderBack, _folder })
             canvas.Children.Add(e);
     }
 
-    private void LayoutExtras(MainWindow.BarGeometry l, Func<double, (double X, double Y, double Size)> item, Color ink)
+    private void LayoutExtras(MainWindow.BarGeometry l, Func<double, (double X, double Y, double Size)> item, Color ink, string launchpadIcon)
     {
         _extrasInkBrush.Color = ink;
 
         _launchpad.Visibility = Visibility.Collapsed;
+        _launchpadImage.Visibility = Visibility.Collapsed;
         if (l.LaunchX >= 0)
         {
-            // 80 % of the icon square (the Windows logo's size), a stroke of 6.5 % of it.
+            // The icon square: the user's picture fills it as an app icon does, else the built-in mark at 80 %.
             var (x, y, size) = item(l.LaunchX);
             double s = size * 0.80;
-            if (s > 0)
+            var picture = size > 0 ? LaunchpadIcons.Preview(launchpadIcon) : null;
+            if (picture != null)
             {
+                _launchpadImage.Source = picture;
+                _launchpadImage.Width = _launchpadImage.Height = size;
+                Canvas.SetLeft(_launchpadImage, x);
+                Canvas.SetTop(_launchpadImage, y);
+                _launchpadImage.Visibility = Visibility.Visible;
+            }
+            else if (s > 0)
+            {
+                // A stroke of 6.5 % of the box.
                 _launchpad.Visibility = Visibility.Visible;
                 double thickness = Math.Max(1, s * 0.065) / s;
                 if (thickness != _appsStroke)

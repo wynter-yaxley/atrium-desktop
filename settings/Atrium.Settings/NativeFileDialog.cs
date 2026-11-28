@@ -9,6 +9,7 @@ internal enum NativeFileDialogPreset
     Program,
     Files,
     Folder,
+    Picture,
 }
 
 [Flags]
@@ -51,6 +52,9 @@ internal static class NativeFileDialog
             | NativeFileDialogOptions.ForceFileSystem
             | NativeFileDialogOptions.PathMustExist
             | NativeFileDialogOptions.NoChangeDir,
+        NativeFileDialogPreset.Picture => NativeFileDialogOptions.ForceFileSystem
+            | NativeFileDialogOptions.FileMustExist
+            | NativeFileDialogOptions.NoChangeDir,
         _ => throw new ArgumentOutOfRangeException(nameof(preset), preset, null),
     };
 
@@ -59,13 +63,25 @@ internal static class NativeFileDialog
         NativeFileDialogPreset.Program => [(string.IsNullOrWhiteSpace(filterLabel) ? "Apps" : filterLabel, "*.exe;*.lnk")],
         NativeFileDialogPreset.Files => [(string.IsNullOrWhiteSpace(filterLabel) ? "Files" : filterLabel, "*.*")],
         NativeFileDialogPreset.Folder => [],
+        NativeFileDialogPreset.Picture => [(string.IsNullOrWhiteSpace(filterLabel) ? "Images" : filterLabel, PictureSpec)],
         _ => throw new ArgumentOutOfRangeException(nameof(preset), preset, null),
     };
+
+    // The picture formats WIC reads out of the box (native/core/shell/shell_icon.cpp: LoadPictureIcon).
+    private const string PictureSpec = "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.ico;*.webp;*.tif;*.tiff";
 
     [SupportedOSPlatform("windows")]
     internal static string? PickProgram(IntPtr ownerHwnd, string? filterLabel = null, Action<Exception>? onError = null)
     {
         string[] paths = ShowDialog(ownerHwnd, NativeFileDialogPreset.Program, filterLabel, onError);
+        return paths.Length > 0 ? paths[0] : null;
+    }
+
+    // One picture file (the Launchpad entry's icon): null when cancelled.
+    [SupportedOSPlatform("windows")]
+    internal static string? PickPicture(IntPtr ownerHwnd, string? filterLabel = null, Action<Exception>? onError = null)
+    {
+        string[] paths = ShowDialog(ownerHwnd, NativeFileDialogPreset.Picture, filterLabel, onError);
         return paths.Length > 0 ? paths[0] : null;
     }
 

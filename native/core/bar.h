@@ -205,6 +205,7 @@ private:
         int px = 0;
         uint64_t id = 0;
         std::shared_ptr<const IconImage> image;
+        std::wstring source; // the file it was read from (the Launchpad entry's own icon)
     };
 
     enum class SessionEnd { Exit, Switch, Retry };
@@ -230,6 +231,9 @@ private:
     LayoutMetrics ComputeLayoutMetrics(const RelayoutTarget& target);
     BarScene InitLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m) const;
     void ResolveTaskIcon(const TaskItem& t, int iconPx, std::map<std::wstring, CachedIcon>& keep, SceneItem& it);
+    // The Launchpad entry's icon from settings.launchpadIcon; without one (or when the file cannot be
+    // read) the entry keeps drawing the built-in mark (render/bar_extras_painter.h).
+    void ResolveLaunchpadIcon(SceneItem& it, int iconPx);
     void BuildLayoutScene(const RelayoutTarget& target, const LayoutMetrics& m);
     void ApplyLayout(const RelayoutTarget& target, const LayoutMetrics& m);
     void Bounce(const std::wstring& key);
@@ -313,6 +317,7 @@ private:
     bool coverPending_ = false; // a look at what covers the monitor is due (kCoverTimer)
     ULONGLONG expectCoverUntil_ = 0; // ExpectCover
     std::map<std::wstring, CachedIcon> icons_;
+    CachedIcon launchpadIcon_; // the Launchpad entry's own icon, by file and size
     uint64_t nextIconId_ = 1;
     BarScene scene_;
     std::vector<Hit> hits_;

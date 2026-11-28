@@ -230,20 +230,22 @@ void CheckSettingsNormalization()
 void CheckExtrasSettings()
 {
     Settings defaults, parsed;
-    Require(defaults.showLaunchpad && defaults.launchpadMaterial == L"bar" && defaults.launchpadLayout == L"window" && defaults.showNowPlaying &&
-                defaults.nowPlayingShowPaused && defaults.nowPlayingMotion == L"normal" && defaults.nowPlayingAppMode == L"all" &&
+    Require(defaults.showLaunchpad && defaults.launchpadMaterial == L"bar" && defaults.launchpadLayout == L"window" && defaults.launchpadIcon.empty() &&
+                defaults.showNowPlaying && defaults.nowPlayingShowPaused && defaults.nowPlayingMotion == L"normal" && defaults.nowPlayingAppMode == L"all" &&
                 defaults.nowPlayingApps.empty() && !defaults.showFolderStacks && defaults.folderStackLayout == L"fan" && defaults.folderStackMax == 8 &&
                 defaults.folderStacks.empty() && defaults.folderStackFiles.empty(),
             "extras settings have expected defaults");
-    Require(Settings::FromJson(LR"({})", Settings{}, parsed) && parsed.showLaunchpad && parsed.showNowPlaying && parsed.nowPlayingShowPaused &&
-                parsed.nowPlayingMotion == L"normal" && parsed.nowPlayingAppMode == L"all" && parsed.nowPlayingApps.empty() && !parsed.showFolderStacks &&
-                parsed.folderStackLayout == L"fan" && parsed.folderStackMax == 8 && parsed.folderStacks.empty() && parsed.folderStackFiles.empty(),
+    Require(Settings::FromJson(LR"({})", Settings{}, parsed) && parsed.showLaunchpad && parsed.launchpadIcon.empty() && parsed.showNowPlaying &&
+                parsed.nowPlayingShowPaused && parsed.nowPlayingMotion == L"normal" && parsed.nowPlayingAppMode == L"all" && parsed.nowPlayingApps.empty() &&
+                !parsed.showFolderStacks && parsed.folderStackLayout == L"fan" && parsed.folderStackMax == 8 && parsed.folderStacks.empty() &&
+                parsed.folderStackFiles.empty(),
             "old settings receive extras defaults");
 
     Settings custom;
     custom.showLaunchpad = false;
     custom.launchpadMaterial = L"tint";
     custom.launchpadLayout = L"fullscreen";
+    custom.launchpadIcon = L"C:\\Users\\Demo\\Pictures\\launchpad.png";
     custom.showNowPlaying = false;
     custom.nowPlayingShowPaused = false;
     custom.nowPlayingMotion = L"vivid";
@@ -255,11 +257,20 @@ void CheckExtrasSettings()
     custom.folderStacks = {L"C:\\Users\\Demo\\Desktop", L"D:\\Projects"};
     custom.folderStackFiles = {L"C:\\Users\\Demo\\Notes.pdf", L"D:\\Deck.pptx"};
     Require(Settings::FromJson(custom.ToJson(), Settings{}, parsed) && !parsed.showLaunchpad && parsed.launchpadMaterial == L"tint" &&
-                parsed.launchpadLayout == L"fullscreen" && !parsed.showNowPlaying && !parsed.nowPlayingShowPaused && parsed.nowPlayingMotion == L"vivid" &&
-                parsed.nowPlayingAppMode == L"allow" && parsed.nowPlayingApps == custom.nowPlayingApps && parsed.showFolderStacks &&
-                parsed.folderStackLayout == L"column" && parsed.folderStackMax == 24 && parsed.folderStacks == custom.folderStacks &&
-                parsed.folderStackFiles == custom.folderStackFiles,
+                parsed.launchpadLayout == L"fullscreen" && parsed.launchpadIcon == custom.launchpadIcon && !parsed.showNowPlaying &&
+                !parsed.nowPlayingShowPaused && parsed.nowPlayingMotion == L"vivid" && parsed.nowPlayingAppMode == L"allow" &&
+                parsed.nowPlayingApps == custom.nowPlayingApps && parsed.showFolderStacks && parsed.folderStackLayout == L"column" &&
+                parsed.folderStackMax == 24 && parsed.folderStacks == custom.folderStacks && parsed.folderStackFiles == custom.folderStackFiles,
             "extras settings survive round trip");
+
+    // The Launchpad icon: trimmed like the settings app trims it, and kept when a patch leaves it out.
+    Require(Settings::FromJson(LR"({"launchpadIcon":" \tC:\\Icons\\orb.png\r\n "})", Settings{}, parsed) && parsed.launchpadIcon == L"C:\\Icons\\orb.png",
+            "launchpadIcon trims ASCII whitespace");
+    Require(Settings::FromJson(LR"({"launchpadIcon":""})", custom, parsed) && parsed.launchpadIcon.empty(),
+            "launchpadIcon can be cleared back to the built-in mark");
+    Require(Settings::FromJson(LR"({})", custom, parsed) && parsed.launchpadIcon == custom.launchpadIcon, "partial updates retain the Launchpad icon");
+    Require(Settings::FromJson(LR"({"launchpadIcon":false})", custom, parsed) && parsed.launchpadIcon == custom.launchpadIcon,
+            "a malformed launchpadIcon retains the fallback");
 
     Require(Settings::FromJson(
                 LR"({"launchpadLayout":"bad","launchpadMaterial":"bad","nowPlayingMotion":"bad","nowPlayingAppMode":"bad","folderStackLayout":"bad"})", custom,

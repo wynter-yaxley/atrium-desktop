@@ -113,6 +113,14 @@ void BarExtrasPainter::DrawLaunchpad(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, ID
     d2d->DrawGeometry(path.get(), brush, stroke);
 }
 
+void BarExtrasPainter::DrawLaunchpadImage(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, ID2D1Bitmap1* bitmap, float opacity)
+{
+    if (!bitmap)
+        return;
+    // The whole icon square, as an app's own icon beside it: the picture is the entry's icon, not the mark inside it.
+    d2d->DrawBitmap(bitmap, r, opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+}
+
 void BarExtrasPainter::DrawMusic(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, const MusicBars& bars, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink)
 {
     const D2D1_RECT_F box = Square(r, 0.80f);

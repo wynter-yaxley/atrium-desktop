@@ -25,6 +25,9 @@ public sealed partial class MainWindow
     private SegmentTrack? _lpLayout, _lpMaterial, _npMotion, _npRhythm, _stLayout, _stMax;
     private StackPanel? _stList, _stFileList;
     private TextBlock? _stCount, _stFileCount;
+    private Button? _lpIconClear;
+    private Image? _lpIconImage;
+    private TextBlock? _lpIconGlyph, _lpIconNote;
 
     private StackPanel ExtrasPage(int page)
     {
@@ -72,7 +75,7 @@ public sealed partial class MainWindow
             tag => CurrentSettings.LaunchpadMaterial = tag);
         _lpLayout = Segments("launchpadlayout", [("Windowed", "window"), ("Full-screen", "fullscreen")],
             tag => CurrentSettings.LaunchpadLayout = tag);
-        _lpSide = Side("Launchpad", _launchpadSwitch, Row("Display mode", _lpLayout), Row("Material", _lpMaterial));
+        _lpSide = Side("Launchpad", _launchpadSwitch, BuildLaunchpadIconRow(), Row("Display mode", _lpLayout), Row("Material", _lpMaterial));
         InspectorStack.Children.Add(_npSide);
         InspectorStack.Children.Add(_stSide);
         InspectorStack.Children.Add(_lpSide);
@@ -147,6 +150,79 @@ public sealed partial class MainWindow
         _stMax = Segments("stackmax", [.. StackMaxima.Select(n => (n.ToString(System.Globalization.CultureInfo.CurrentCulture), n.ToString(invariant)))],
             tag => CurrentSettings.FolderStackMax = int.Parse(tag, System.Globalization.CultureInfo.InvariantCulture));
         return Side("File Stacks", _stSwitch, Row("Opens as", _stLayout), Row("Shows at most", _stMax));
+    }
+
+    // The Launchpad entry's icon: the built-in mark, or a picture file of the user's.
+    private StackPanel BuildLaunchpadIconRow()
+    {
+        var res = Application.Current.Resources;
+        _lpIconGlyph = new TextBlock
+        {
+            Text = "\uF0E2",
+            FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"),
+            FontSize = 15,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        _lpIconImage = new Image { Stretch = Stretch.Uniform, Visibility = Visibility.Collapsed };
+        var preview = new Grid { Width = 28, Height = 28, Children = { _lpIconGlyph, _lpIconImage } };
+        var choose = new Button { Content = Loc.T("Choose image…") };
+        choose.Click += (_, _) => PickLaunchpadIcon();
+        _lpIconClear = new Button
+        {
+            Style = (Style)res["IconButtonStyle"],
+            Content = new FontIcon { Glyph = "\uE7A7", FontSize = 12 },
+            Visibility = Visibility.Collapsed,
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(_lpIconClear, Loc.T("Use the built-in icon"));
+        ToolTipService.SetToolTip(_lpIconClear, Loc.T("Use the built-in icon"));
+        _lpIconClear.Click += (_, _) =>
+        {
+            CurrentSettings.LaunchpadIcon = "";
+            ShowLaunchpadIcon("");
+            Changed();
+        };
+        _lpIconNote = new TextBlock
+        {
+            Style = (Style)res["FootnoteStyle"],
+            TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+        };
+        var row = new StackPanel { Style = (Style)res["FlatRowStyle"] };
+        row.Children.Add(new TextBlock { Text = Loc.T("Icon"), Style = (Style)res["RowTitleStyle"] });
+        row.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { preview, choose, _lpIconClear } });
+        row.Children.Add(_lpIconNote);
+        return row;
+    }
+
+    // The row's picture and note follow the setting; the bar previews follow with them (BarFace).
+    private void ShowLaunchpadIcon(string path)
+    {
+        if (_lpIconImage == null || _lpIconGlyph == null || _lpIconNote == null || _lpIconClear == null) return;
+        var bitmap = LaunchpadIcons.Preview(path);
+        _lpIconImage.Source = bitmap;
+        _lpIconImage.Visibility = bitmap != null ? Visibility.Visible : Visibility.Collapsed;
+        _lpIconGlyph.Visibility = bitmap == null ? Visibility.Visible : Visibility.Collapsed;
+        _lpIconClear.Visibility = path.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        string note = path.Length > 0 ? path : Loc.T("Built-in icon");
+        _lpIconNote.Text = note;
+        ToolTipService.SetToolTip(_lpIconNote, note);
+    }
+
+    private void PickLaunchpadIcon()
+    {
+        if (_updatesClosed) return;
+        nint hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        string? path = NativeFileDialog.PickPicture(hwnd, Loc.T("Images"), App.LogCrash);
+        if (path == null || _updatesClosed) return;
+        if (LaunchpadIcons.Preview(path) == null)
+        {
+            ShowMessage(InfoBarSeverity.Warning, Loc.T("That file could not be read as an image."), path);
+            return;
+        }
+        CurrentSettings.LaunchpadIcon = path;
+        ShowLaunchpadIcon(path);
+        Changed();
     }
 
     // The folders and files, under the picture as the taskbar's pinned apps are under theirs: a
@@ -265,6 +341,7 @@ public sealed partial class MainWindow
         _launchpadSwitch?.IsOn = s.ShowLaunchpad;
         Check(_lpLayout, s.LaunchpadLayout == "fullscreen" ? "fullscreen" : "window");
         Check(_lpMaterial, s.LaunchpadMaterial == "tint" ? "tint" : "bar");
+        ShowLaunchpadIcon(s.LaunchpadIcon);
         _npSwitch?.IsOn = s.ShowNowPlaying;
         _npPausedSwitch?.IsOn = s.NowPlayingShowPaused;
         Check(_npMotion, MotionTags.Contains(s.NowPlayingMotion) ? s.NowPlayingMotion : "normal");

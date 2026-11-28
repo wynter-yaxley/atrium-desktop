@@ -22,6 +22,8 @@ public:
     void DrawLogo(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, float opacity);
     // Launchpad: nine small apps, three by three, in outline, in the bar's ink.
     static void DrawLaunchpad(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink);
+    // Launchpad's own picture (settings.launchpadIcon): the whole icon square, as the apps' icons are.
+    static void DrawLaunchpadImage(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, ID2D1Bitmap1* bitmap, float opacity);
     // Now playing: five round-ended bars in the bar's ink, as tall as `bars` has them.
     static void DrawMusic(ID2D1DeviceContext2* d2d, D2D1_RECT_F r, const MusicBars& bars, ID2D1SolidColorBrush* brush, D2D1_COLOR_F ink);
     // Folder stacks: a folder drawn in outline with a second one behind it, in the bar's ink.
